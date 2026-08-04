@@ -210,6 +210,13 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--flash-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Maple only: use the approximate FlashHead output layer. Faster "
+        "decode, approximate token stream. Omit to follow the checkpoint config.",
+    )
     return parser
 
 
@@ -2102,11 +2109,14 @@ def main():
             )
     model_path = model_path or DEFAULT_MODEL
 
+    model_config = {"quantize_activations": args.quantize_activations}
+    if args.flash_head is not None:
+        model_config["use_flash_head"] = args.flash_head
     model, tokenizer = load(
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
-        model_config={"quantize_activations": args.quantize_activations},
+        model_config=model_config,
         trust_remote_code=args.trust_remote_code,
     )
     for eos_token in args.extra_eos_token:

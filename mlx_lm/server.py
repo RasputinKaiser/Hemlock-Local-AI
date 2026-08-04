@@ -327,10 +327,14 @@ class ModelProvider:
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
+            model_config = {}
+            if getattr(self.cli_args, "flash_head", None) is not None:
+                model_config["use_flash_head"] = self.cli_args.flash_head
             model, tokenizer = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                model_config=model_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -1849,6 +1853,13 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--flash-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Maple only: use the approximate FlashHead output layer. Faster "
+        "decode, approximate token stream. Omit to follow the checkpoint config.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():

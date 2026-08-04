@@ -85,6 +85,13 @@ def setup_arg_parser():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--flash-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Maple only: use the approximate FlashHead output layer. Faster "
+        "decode, approximate token stream. Omit to follow the checkpoint config.",
+    )
     return parser
 
 
@@ -109,10 +116,14 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
     else:
+        model_config = {}
+        if args.flash_head is not None:
+            model_config["use_flash_head"] = args.flash_head
         model, tokenizer = load(
             args.model,
             adapter_path=args.adapter_path,
             tokenizer_config={"trust_remote_code": args.trust_remote_code},
+            model_config=model_config,
             trust_remote_code=args.trust_remote_code,
         )
 

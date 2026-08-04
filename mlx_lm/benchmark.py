@@ -78,6 +78,13 @@ def setup_arg_parser():
         action="store_true",
         help="Enable trusting remote code for tokenizer/model loading.",
     )
+    parser.add_argument(
+        "--flash-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Maple only: use the approximate FlashHead output layer. Faster "
+        "decode, approximate token stream. Omit to follow the checkpoint config.",
+    )
     return parser
 
 
@@ -106,11 +113,14 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
     else:
+        model_config = {"quantize_activations": args.quantize_activations}
+        if args.flash_head is not None:
+            model_config["use_flash_head"] = args.flash_head
         model, tokenizer, config = load(
             model_path,
             return_config=True,
             tokenizer_config={"trust_remote_code": True},
-            model_config={"quantize_activations": args.quantize_activations},
+            model_config=model_config,
             trust_remote_code=args.trust_remote_code,
         )
 
