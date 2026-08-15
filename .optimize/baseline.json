@@ -49,6 +49,31 @@
         "ui-tests": true,
         "syntax": true
       }
+    },
+    {
+      "ts": "2026-08-15T19:53:27+00:00",
+      "git": {
+        "rev": "eebe390",
+        "dirty": true
+      },
+      "medians": {
+        "build": 0.403,
+        "agent-tests": 0.384,
+        "ui-tests": 0.243,
+        "syntax": 0.092
+      },
+      "output_tokens": {
+        "build": 758,
+        "agent-tests": 2386,
+        "ui-tests": 565,
+        "syntax": 0
+      },
+      "ok": {
+        "build": true,
+        "agent-tests": true,
+        "ui-tests": true,
+        "syntax": true
+      }
     }
   ]
 }
