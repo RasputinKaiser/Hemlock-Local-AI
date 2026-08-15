@@ -1,71 +1,54 @@
 {
-  "ts": "2026-08-15T19:45:39+00:00",
-  "cwd": "/Users/ianzvirbulis/Code/Hemlock",
-  "git": {
-    "rev": "93f104d",
-    "dirty": true
-  },
-  "output_estimator": "heuristic-chars/4",
-  "probes": {
-    "build": {
-      "cmd": "cd dream-chat && npm run build",
-      "runs": 3,
-      "samples_s": [
-        0.636,
-        0.409,
-        0.462
-      ],
-      "median_s": 0.462,
-      "exit": 0,
-      "ok": true,
-      "output_bytes": 3041,
-      "output_tokens": 758,
-      "output_tail": null
+  "runs": [
+    {
+      "ts": "2026-08-15T19:45:39+00:00",
+      "git": {
+        "rev": "93f104d",
+        "dirty": true
+      },
+      "medians": {
+        "build": 0.462,
+        "agent-tests": 0.389,
+        "ui-tests": 0.284,
+        "syntax": 0.111
+      },
+      "output_tokens": {
+        "build": 758,
+        "agent-tests": 2221,
+        "ui-tests": 566,
+        "syntax": 0
+      },
+      "ok": {
+        "build": true,
+        "agent-tests": true,
+        "ui-tests": true,
+        "syntax": true
+      }
     },
-    "agent-tests": {
-      "cmd": "cd dream-chat && npm run test:agent",
-      "runs": 3,
-      "samples_s": [
-        0.333,
-        0.389,
-        0.441
-      ],
-      "median_s": 0.389,
-      "exit": 0,
-      "ok": true,
-      "output_bytes": 8884,
-      "output_tokens": 2221,
-      "output_tail": null
-    },
-    "ui-tests": {
-      "cmd": "cd dream-chat && npm run test:ui",
-      "runs": 3,
-      "samples_s": [
-        0.286,
-        0.244,
-        0.284
-      ],
-      "median_s": 0.284,
-      "exit": 0,
-      "ok": true,
-      "output_bytes": 2262,
-      "output_tokens": 566,
-      "output_tail": null
-    },
-    "syntax": {
-      "cmd": "node --check dream-chat/electron/main.cjs && node --check dream-chat/electron/preload.cjs && node --check dream-chat/electron/provider_adapters.cjs",
-      "runs": 3,
-      "samples_s": [
-        0.111,
-        0.105,
-        0.129
-      ],
-      "median_s": 0.111,
-      "exit": 0,
-      "ok": true,
-      "output_bytes": 0,
-      "output_tokens": 0,
-      "output_tail": null
+    {
+      "ts": "2026-08-15T19:51:10+00:00",
+      "git": {
+        "rev": "fb8e262",
+        "dirty": true
+      },
+      "medians": {
+        "build": 0.478,
+        "agent-tests": 0.479,
+        "ui-tests": 0.274,
+        "syntax": 0.102
+      },
+      "output_tokens": {
+        "build": 758,
+        "agent-tests": 2331,
+        "ui-tests": 565,
+        "syntax": 0
+      },
+      "ok": {
+        "build": true,
+        "agent-tests": true,
+        "ui-tests": true,
+        "syntax": true
+      }
     }
-  }
+  ]
 }

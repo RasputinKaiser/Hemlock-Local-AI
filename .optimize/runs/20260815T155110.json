@@ -1,0 +1,71 @@
+{
+  "ts": "2026-08-15T19:51:10+00:00",
+  "cwd": "/Users/ianzvirbulis/Code/Hemlock",
+  "git": {
+    "rev": "fb8e262",
+    "dirty": true
+  },
+  "output_estimator": "heuristic-chars/4",
+  "probes": {
+    "build": {
+      "cmd": "cd dream-chat && npm run build",
+      "runs": 3,
+      "samples_s": [
+        0.709,
+        0.478,
+        0.47
+      ],
+      "median_s": 0.478,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 3041,
+      "output_tokens": 758,
+      "output_tail": null
+    },
+    "agent-tests": {
+      "cmd": "cd dream-chat && npm run test:agent",
+      "runs": 3,
+      "samples_s": [
+        0.479,
+        0.48,
+        0.401
+      ],
+      "median_s": 0.479,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 9323,
+      "output_tokens": 2331,
+      "output_tail": null
+    },
+    "ui-tests": {
+      "cmd": "cd dream-chat && npm run test:ui",
+      "runs": 3,
+      "samples_s": [
+        0.274,
+        0.271,
+        0.274
+      ],
+      "median_s": 0.274,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 2259,
+      "output_tokens": 565,
+      "output_tail": null
+    },
+    "syntax": {
+      "cmd": "node --check dream-chat/electron/main.cjs && node --check dream-chat/electron/preload.cjs && node --check dream-chat/electron/provider_adapters.cjs",
+      "runs": 3,
+      "samples_s": [
+        0.102,
+        0.103,
+        0.097
+      ],
+      "median_s": 0.102,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 0,
+      "output_tokens": 0,
+      "output_tail": null
+    }
+  }
+}
