@@ -251,9 +251,9 @@ live_workspace_v3:
     deterministic_artistic_fixture:
       command: "cd dream-chat && npm run test:e2e:artistic-fixture"
       status: passed
-      receipt: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/receipts/artistic-fixture-1786754771421.json"
-      desktop_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/screenshots/desktop.svg"
-      narrow_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/screenshots/narrow.svg"
+      receipt: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786757062581/receipts/artistic-fixture-1786757062612.json"
+      desktop_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786757062581/screenshots/desktop.svg"
+      narrow_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786757062581/screenshots/narrow.svg"
       proof: "three Maple channels, approved plan, artifact r1 -> repaired r2 -> failed r3, parent/new digests, preview interactions, hidden screenshot block, paused input, prose-surrounded action envelope, and late callback suppression"
     real_maple_artistic_lane:
       command: "cd dream-chat && npm run test:e2e:artistic-maple"
