@@ -179,6 +179,11 @@ class LoRASwitchLinear(nn.Module):
         self.num_experts = num_experts
 
     def __call__(self, x, indices, sorted_indices=False):
+        # Expert routing is discrete. Maple's sparse block does not stop the
+        # router indices itself, and MLX cannot form a VJP for gather_mm's
+        # rhs_indices argument. Keep routing fixed for the LoRA gradient while
+        # still differentiating through the low-rank matrices.
+        indices = mx.stop_gradient(indices)
         y = self.linear(x, indices, sorted_indices=sorted_indices)
         z = mx.gather_mm(
             self.dropout(x),

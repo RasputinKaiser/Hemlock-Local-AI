@@ -26,7 +26,9 @@ setup(
     install_requires=[
         f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
         "numpy",
-        "transformers>=5.7.0",
+        # 5.7 is the first compatible release and avoids the multi-minute
+        # import-structure scan introduced by later 5.x builds on this Mac.
+        "transformers>=5.7.0,<5.8.0",
         "sentencepiece",
         "protobuf",
         "pyyaml",

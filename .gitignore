@@ -107,6 +107,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-moved-backup-*/
 env/
 venv/
 ENV/
@@ -137,3 +138,12 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
+
+# Local Maple Dream artifacts and frontend dependencies
+maple-2bit-mlx/
+dream-runs/
+sips-runs/
+state.yaml-moved-backup-*
+adapters-*/
+dream-chat/node_modules/
+dream-chat/dist/

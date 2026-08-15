@@ -1,0 +1,298 @@
+# Goal Maker v2 state.yaml
+# Board truth lives here. goal.md is the editable charter; notes/ holds long receipts only.
+
+version: 2
+
+goal:
+  title: "Hemlock proper-app tranche"
+  slug: "maple-dream-proper-app"
+  kind: open_ended
+  tranche: "Rename the app to Hemlock, discover the current app, implement and verify the first SIPS-like workflow-panel tranche, harden Dream where directly required, and leave a reviewable handoff. Maple-Preview remains the model identity."
+  status: active
+
+rules:
+  pm_owns_state: true
+  one_active_task: true
+  max_write_workers: 1
+  named_roles_no_child_fanout: true
+  child_judges: false
+  pm_owns_acceptance: true
+  receipt_schema: goal-role-receipt.v1
+  no_implementation_without_worker_or_pm_task: true
+  no_completion_without_judge_or_pm_audit: true
+
+agents:
+  scout: installed
+  worker: installed
+  judge: installed_not_dispatched
+
+active_task: T004
+
+tasks:
+  - id: T001
+    type: scout
+    assignee: Scout
+    status: done
+    objective: "Map the current Hemlock GUI, Dream lifecycle, adapter serving, SIPS-like affordances, repo health, and the smallest high-leverage proper-app tranche."
+    inputs:
+      - README.md
+      - state.yaml
+      - dream-chat
+      - mlx_lm
+      - docs/goals/maple-dream-proper-app/goal.md
+    constraints:
+      - "Read-only; do not edit implementation files or board state."
+      - "Inspect current source and current running surface, not only earlier summaries."
+      - "Treat user-provided screenshots and DeepGrove references as product context, not implementation proof."
+      - "Treat Hemlock as the app name; preserve Maple-Preview as the underlying model name."
+    expected_output:
+      - "Repo and runtime map"
+      - "Current Dream and adapter evidence"
+      - "SIPS-like panel candidates with exact file ownership"
+      - "Verification commands and ambiguities"
+      - "Candidate next tasks"
+    receipt:
+      schema: goal-role-receipt.v1
+      role: Scout
+      task_id: T001
+      result: done
+      summary: "The current GUI has a React/Vite browser entry and Electron desktop entry with a real local MLX LoRA Dream lifecycle, timestamped adapter output, JSONL/trainer progress, heartbeat, server restart, readiness wait, and per-request adapter serving. The visible product is still Maple-branded and has no Hemlock/Maple-Preview naming or SIPS-like task/context/tool panel. Health and model-list probes were shallow; a fresh generic chat probe timed out while MLX loaded safetensors, and focused test collection stalled in the Transformers import scan, so inference readiness and tests need explicit follow-up."
+      evidence:
+        - "dream-chat/src/main.jsx"
+        - "dream-chat/src/styles.css"
+        - "dream-chat/electron/main.cjs"
+        - "dream-chat/electron/dream_train.py"
+        - "mlx_lm/server.py"
+        - "dream-runs/2026-08-14T05-05-25-128Z/"
+        - "node --check electron/main.cjs && node --check electron/preload.cjs: pass"
+        - "Python AST and package JSON checks: pass"
+        - "pytest/unittest collection: stalled/interrupted during Transformers import scan"
+      note: null
+      candidate_tasks:
+        - "T002: implement the local SIPS-like workflow-panel contract"
+        - "T003: refine visible Hemlock branding and logo fidelity"
+        - "T004: harden Dream readiness, stale-adapter recovery, and inference verification"
+        - "T005: diagnose environment/test import stall"
+      ambiguity: "PM must decide whether internal MAPLE_* bridge/storage names remain compatible while visible branding becomes Hemlock, and whether the SIPS panel is strictly renderer-local. Current inference readiness after safetensors loading remains unresolved."
+      configured_model: gpt-5.6-luna
+      delegation_path: native-multi-agent-v1
+      runtime_model_slug: unverified
+  - id: T002
+    type: worker
+    assignee: Worker
+    status: done
+    objective: "Implement the first Hemlock proper-app slice: visible Hemlock branding, Maple-Preview model identity, supplied logo, and a renderer-local SIPS-like task/context/live-progress/receipts panel that reflects real Dream state without inventing capabilities."
+    inputs:
+      - dream-chat/src/main.jsx
+      - dream-chat/src/styles.css
+      - dream-chat/index.html
+      - dream-chat/electron/main.cjs
+      - DeepGrove reference screenshots supplied in the conversation
+      - "/Users/ianzvirbulis/.codex/generated_images/019ffebd-4d91-7cd0-a73f-0ead3ff20d6a/exec-e08cd44e-29d0-4468-9370-aa8e6745058f.png"
+      - "/Users/ianzvirbulis/.codex/generated_images/019ffe48-8a6a-7d43-bec6-a7b4393da112/exec-3c7e472f-835d-4402-9aba-06c6bde7d1b3.png"
+    allowed_files:
+      - dream-chat/src/main.jsx
+      - dream-chat/src/styles.css
+      - dream-chat/index.html
+      - dream-chat/package.json
+      - dream-chat/electron/main.cjs
+      - dream-chat/public/hemlock-logo.png
+    constraints:
+      - "Use the supplied Hemlock logo as the brand anchor; if its checkerboard is baked into the RGB asset, preserve fidelity and record the limitation for T003 rather than fabricating transparency."
+      - "Do not invent external tools, cloud sync, or unsupported model behavior."
+      - "Use Hemlock consistently in the app surface; Maple-Preview is the model label."
+      - "Align the visual language to Eastern Hemlock and Pennsylvania: deep evergreen, warm gold, quiet forest-night Dream state, restrained botanical detail."
+      - "Do not copy the invented trail-stewardship sample text from the concept image into the product."
+      - "Preserve existing Dream/server contracts and base model weights; do not delete or replace any adapter."
+    expected_output:
+      - "Implemented renderer-local panel and visible Hemlock/Maple-Preview shell"
+      - "Build and syntax verification"
+      - "Desktop/browser verification notes and remaining limitations"
+    verify:
+      - "npm run build"
+      - "node --check electron/main.cjs && node --check electron/preload.cjs"
+      - "git diff --check"
+      - "Run the desktop/browser surface and verify Hemlock title, Maple-Preview label, panel state changes, and local-only copy without claiming Dream success unless the server reports it."
+    stop_if:
+      - "Need to edit files outside allowed_files."
+      - "Cloud behavior, credentials, unsupported model behavior, or external publication is required."
+      - "The change would mutate base weights or delete/replace an existing adapter."
+      - "Verification fails twice."
+    receipt:
+      schema: goal-role-receipt.v1
+      role: Worker
+      task_id: T002
+      result: done
+      changed_files:
+        - dream-chat/src/main.jsx
+        - dream-chat/src/styles.css
+        - dream-chat/index.html
+        - dream-chat/electron/main.cjs
+        - dream-chat/public/hemlock-logo.png
+      commands:
+        - cmd: "npm run build"
+          status: pass
+          note: "Vite production build passed: 15 modules transformed and production assets emitted. The first invocation remained in CSS transformation beyond the tool window; the rerun completed successfully in 75.6s."
+        - cmd: "node --check electron/main.cjs && node --check electron/preload.cjs"
+          status: pass
+          note: "Both Electron bridge files parsed successfully; final syntax check also passed."
+        - cmd: "git diff --check"
+          status: pass
+          note: "No whitespace errors reported by the required repository check."
+        - cmd: "npm run dev plus in-app browser verification at http://127.0.0.1:5173"
+          status: pass
+          note: "Verified Hemlock title and branding, Maple-Preview header/panel identity, hide/show panel interaction, renderer-local task/context/receipt updates after adding a fact, and browser Dream live-progress labeling. Browser preview completed without an adapter path or inference-success claim."
+      summary: "Implemented the first Hemlock proper-app slice with visible Hemlock branding, unchanged supplied RGB logo, Maple-Preview model identity, Eastern Hemlock forest-night styling, and a truthful renderer-local SIPS-like current-task, local-context, live-progress, and receipts panel. The baked checkerboard limitation is recorded in the panel for T003 refinement; Dream/server contracts and model assets were not changed."
+      remaining_blockers: []
+      needs_judge: false
+      configured_model: gpt-5.6-luna
+      delegation_path: native-multi-agent-v1
+      runtime_model_slug: unverified
+  - id: T003
+    type: worker
+    assignee: Worker
+    status: done
+    objective: "Refine Hemlock branding and responsive visual polish after T002, including a faithful transparent logo derivative only if it can be produced without altering the supplied artwork."
+    inputs:
+      - "T001 receipt"
+      - "T002 Worker receipt"
+      - "/Users/ianzvirbulis/.codex/generated_images/019ffebd-4d91-7cd0-a73f-0ead3ff20d6a/exec-e08cd44e-29d0-4468-9370-aa8e6745058f.png"
+      - "/Users/ianzvirbulis/.codex/generated_images/019ffe48-8a6a-7d43-bec6-a7b4393da112/exec-3c7e472f-835d-4402-9aba-06c6bde7d1b3.png"
+    allowed_files:
+      - dream-chat/public/hemlock-logo.png
+      - dream-chat/src/main.jsx
+      - dream-chat/src/styles.css
+    constraints:
+      - "Do not redraw or replace the supplied tree/wordmark."
+      - "Keep Maple-Preview as the model identity and Hemlock as the app identity."
+      - "Do not copy the concept image's invented sample content."
+      - "Do not touch Dream/server or model files."
+    expected_output:
+      - "Visual polish and logo inspection"
+      - "Responsive/accessibility verification"
+      - "Remaining handoff items"
+    verify:
+      - "Inspect hemlock-logo.png with file/sips and view_image; confirm alpha behavior and visual fidelity."
+      - "npm run build"
+      - "Verify desktop and narrow browser layouts do not clip the panel or composer."
+      - "git diff --check"
+    stop_if:
+      - "T002 is incomplete or its receipt is missing."
+      - "Need to edit files outside allowed_files."
+      - "Logo fidelity or transparency cannot be achieved without destructive image alteration."
+      - "Verification fails twice."
+    receipt:
+      schema: goal-role-receipt.v1
+      role: Worker
+      task_id: T003
+      result: done
+      changed_files:
+        - dream-chat/src/main.jsx
+        - dream-chat/src/styles.css
+      commands:
+        - cmd: "file supplied-logo dream-chat/public/hemlock-logo.png && sips -g pixelWidth -g pixelHeight -g format -g hasAlpha -g space dream-chat/public/hemlock-logo.png && cmp -s supplied dream-chat/public/hemlock-logo.png"
+          status: pass
+          note: "Both assets are 1942x809 RGB PNGs with hasAlpha: no; cmp confirmed the current logo is byte-identical to the supplied artwork."
+        - cmd: "view_image current and supplied Hemlock logo"
+          status: pass
+          note: "The tree and wordmark match visually; the checkerboard is visibly baked into the RGB source. No transparent derivative was created because background removal could damage anti-aliased artwork."
+        - cmd: "npm run build"
+          status: pass
+          note: "Vite production build passed; 15 modules transformed and production assets emitted."
+        - cmd: "rg -n 'focus-visible|header-height|panel-width|work-panel|composer-dock|@media|brand-lockup|model-pill|aria-expanded|aria-controls|aria-describedby|checkerboard' dream-chat/src/main.jsx dream-chat/src/styles.css"
+          status: pass
+          note: "Direct source inspection confirmed responsive header compression, 700px and 380px breakpoints, panel/composer viewport-safe sizing, narrow control sizing, scroll containment, and focus-visible accessibility coverage."
+        - cmd: "git diff --check"
+          status: pass
+          note: "No whitespace errors reported from the repository-root check."
+        - cmd: "desktop and narrow browser layout verification"
+          status: blocked
+          note: "The combined browser check was not completed: the native Electron window enforces a 760px minimum width, existing Chrome resize control did not produce a deterministic narrow Hemlock viewport, and a disposable narrow Chrome launch opened an unrelated pre-existing GitHub surface. A desktop Hemlock capture was observed, but no narrow rendered result is claimed."
+      summary: "Refined Hemlock responsive branding and work-surface polish in main.jsx and styles.css, including compressed narrow headers, non-clipping mobile composer controls, dynamic viewport and safe-area sizing, scroll-safe work panels, explicit panel/composer accessibility relationships, and visible keyboard focus states. Preserved the supplied logo byte-for-byte and documented the baked RGB checkerboard limitation instead of altering the artwork."
+      remaining_blockers:
+        - "Narrow rendered browser verification remains blocked because a deterministic narrow Hemlock browser surface could not be controlled; no narrow-layout pass is claimed."
+      needs_judge: false
+      configured_model: gpt-5.6-luna
+      delegation_path: native-multi-agent-v1
+      runtime_model_slug: unverified
+  - id: T004
+    type: worker
+    assignee: Worker
+    status: active
+    objective: "Harden Dream readiness, stale-adapter recovery, and live inference verification after the UI tranche, preserving the base model and existing adapters."
+    allowed_files:
+      - dream-chat/src/main.jsx
+      - dream-chat/electron/main.cjs
+      - dream-chat/electron/dream_train.py
+      - tests/test_server.py
+      - tests/test_dream_train.py
+    verify:
+      - "Run focused Dream/server tests or the narrowest available test probes and report collection/import failures honestly."
+      - "Exercise controlled Dream failure/recovery without deleting or replacing an existing adapter."
+      - "Verify server readiness is distinguished from inference readiness."
+      - "git diff --check"
+    stop_if:
+      - "T003 is incomplete or has not been PM-audited."
+      - "Need files outside allowed_files, external credentials, or destructive cleanup."
+      - "Verification fails twice."
+      - "The change would mutate or replace the base model."
+    receipt: null
+  - id: T005
+    type: worker
+    assignee: Worker
+    status: queued
+    objective: "Diagnose the Transformers import/test collection stall and leave a bounded, evidence-backed recovery note or narrowly scoped fix."
+    allowed_files:
+      - setup.py
+      - dream-chat/README.md
+    verify:
+      - "Run import and test-collection probes with bounded timeouts and capture the exact failing or stalled surface."
+      - "Run npm run build if GUI dependency/docs changes are made."
+      - "git diff --check"
+    stop_if:
+      - "T004 has not been audited."
+      - "Need files outside allowed_files or a broad dependency upgrade."
+      - "Verification fails twice."
+    receipt: null
+  - id: T999
+    type: pm
+    assignee: PM
+    status: queued
+    objective: "PM-owned acceptance audit: decide whether the current tranche is complete from current receipts and verification, or record the missing evidence and next handoff."
+    inputs:
+      - "All completed task receipts"
+      - "Last build, desktop, browser, Dream, and adapter verification"
+      - "Current dirty diff"
+    constraints:
+      - "PM may update control files and board state, but must not call the tranche complete without current evidence."
+      - "No child Judge is dispatched; the PM is the acceptance judge."
+    expected_output:
+      - "complete | not_complete"
+      - "Missing evidence"
+      - "Next task if not complete"
+    receipt: null
+
+checks:
+  dirty_fingerprint: unknown
+  strong_agent_tranche:
+    status: in_progress
+    note: "Host-orchestrated action-loop implementation is present in the shared worktree; PM acceptance remains separate from this handoff."
+    evidence:
+      - dream-chat/electron/agent_contracts.cjs
+      - dream-chat/electron/agent_orchestrator.cjs
+      - dream-chat/electron/agent_orchestrator.test.cjs
+      - dream-chat/evals/tool-use/benchmark.json
+      - "npm run verify:agent: passed"
+      - "Actual MLX LoRA tool-use smoke passed with unchanged base digest; receipt is under ~/Library/Application Support/Hemlock/workspace-runtime/dream-runs/strong-agent-tool-use-smoke-20260814/"
+      - "Live candidate structured-action probes reached a healthy Maple server but did not produce a valid action envelope: one hit the token limit in reasoning/prose and a no-thinking retry invented list_directory; candidate remains training_completed_candidate_pending"
+      - "20 focused agent contract/orchestrator/queue/context/evaluation tests passed; renderer build, main syntax, and git diff check passed"
+      - "Live Electron + Maple casual conversation smoke completed with a natural response; Chat/Code displayed the exchange, Maple work notes, host trace, and inference telemetry"
+      - "Live queue and steering receipts were observed; steering is accepted for the next bounded decision and does not rewrite an in-flight inference"
+      - "Artistic HTML coding request reached plan approval, then blocked honestly on empty structured action output without source mutation or false completion"
+    remaining:
+      - "Run a live Maple structured-action trace against the fixed benchmark."
+      - "Run the full measured candidate inference and actual 11-task tool-use Dream/SIPS evaluation before activation."
+  last_verification:
+    result: unknown
+    task: null
+    commands: []

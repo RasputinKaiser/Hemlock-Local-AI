@@ -1,0 +1,280 @@
+project: Hemlock
+repository: https://github.com/deepgrove-ai/mlx-lm-deepgrove.git
+branch: main
+commit: eba96c16158f032821b0bf374ea1421cfddef0a9
+workspace:
+  folder: /Users/ianzvirbulis/Code/Hemlock
+  synced_source: /Users/ianzvirbulis/Documents/ChatGPT/Hemlock
+  migrated_from: /Users/ianzvirbulis/Documents/Codex/2026-08-13/https-github-com-deepgrove-ai-mlx/mlx-lm-deepgrove
+setup:
+  status: local_worktree_relocated
+  environment: /Users/ianzvirbulis/Models/Hemlock/runtime
+  python: "3.13 system-site-packages with local Transformers 5.7.0"
+  model: deepgrove/maple-2bit-mlx
+  model_directory: /Users/ianzvirbulis/Models/Hemlock/maple-2bit-mlx
+  model_manifest: "16 files verified with hf cache verify"
+  storage_policy:
+    active_worktree: /Users/ianzvirbulis/Code/Hemlock
+    lfs_concurrent_transfers: 1
+    lfs_recent_remote_hydration: disabled
+    lfs_objects: cleared_from_synced_source
+    lfs_tmp: cleared_from_synced_source
+    dream_min_free_bytes: 10737418240
+  backup_environment: .venv-moved-backup-20260814
+  simulator_cleanup:
+    deleted_devices: true
+    deleted_runtimes: ["iOS 18.0", "iOS 18.5"]
+    retained_runtime: "iOS 26.5"
+verification:
+  repository: migrated_into_project_folder
+  environment: fresh_venv_installed
+  model: complete
+  smoke_test: complete
+  kernel_tests: "3 passed existing durable-kernel suite"
+  strong_agent_tests: "32 passed via npm run test:agent"
+  strong_agent_build: "npm run verify:agent passed"
+  tool_use_benchmark: "11 fixed tasks under dream-chat/evals/tool-use/benchmark.json"
+  tool_use_baseline: "empty-trace fixture baseline: 0% completion, 0 forbidden commands; not a Maple quality score"
+  strong_agent_memory_records: ["mem_86860145079c433", "mem_9dba0ce54fbb4843", "mem_0682d6f371414a99"]
+  generation: "24 tokens generated; peak memory 6.680 GB"
+  lora_training_smoke: passed
+  relocated_lora_training_smoke: passed
+  relocated_lora_training_receipt: dream-runs/storage-relocated-training-smoke-verified-20260814/training-receipt.json
+  relocated_lora_optimizer_steps: 1
+  relocated_lora_train_loss: 4.891
+  relocated_lora_validation_loss: 4.914
+  relocated_lora_trainable_parameters: "11.608M/20214.030M (0.057%)"
+  relocated_lora_adapter_bytes: 46433213
+  relocated_lora_base_digest_unchanged: true
+  agent_loop_lora_training_smoke: passed
+  agent_loop_lora_training_receipt: "~/Library/Application Support/Hemlock/workspace-runtime/dream-runs/agent-loop-training-smoke-20260814/training-receipt.json"
+  agent_loop_lora_optimizer_steps: 1
+  agent_loop_lora_train_loss: 7.457
+  agent_loop_lora_validation_loss: 7.121
+  agent_loop_lora_adapter_bytes: 46433213
+  agent_loop_lora_base_digest_unchanged: true
+  agent_loop_training_worker_environment: "-S child trainer now receives venv and configured system site-packages, including MLX"
+  strong_agent_tool_use_dream_smoke: passed
+  strong_agent_tool_use_dream_receipt: "~/Library/Application Support/Hemlock/workspace-runtime/dream-runs/strong-agent-tool-use-smoke-20260814/training-receipt.json"
+  strong_agent_tool_use_dream_metrics: "1 optimizer step; train loss 6.882; validation loss 6.502; 11.608M trainable parameters"
+  strong_agent_tool_use_dream_base_digest_unchanged: true
+  strong_agent_tool_use_dream_candidate_status: training_completed_candidate_pending
+  strong_agent_candidate_inference_probe: blocked
+  strong_agent_candidate_inference_reason: "The trained adapter server was healthy, but the structured-action probes did not yield a valid hemlock.agent.action.v1 envelope: the first spent its completion on reasoning/prose and hit the token limit; a no-thinking retry returned an invented list_directory action. No candidate quality or activation claim made."
+  hemlock_sips_dataset_smoke: passed
+  transformers_pin: "5.7.0 (avoids slow 5.x import scan on this Mac)"
+server:
+  status: passed_after_local_relocation
+  pid: null
+  host: 127.0.0.1
+  port: 8080
+  model: /Users/ianzvirbulis/Models/Hemlock/maple-2bit-mlx
+  trust_remote_code: true
+  flash_head: true
+  defaults:
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 20
+    max_tokens: 512
+  health:
+    models_endpoint: not_asserted
+    chat_completions: passed_with_usage_telemetry
+  note: Maple chat template emits reasoning in a separate reasoning field; final content is returned normally.
+gui:
+  status: hemlock_os_shell_and_agent_spine_built
+  directory: dream-chat
+  stack: React + Vite + Electron
+  ui_overhaul:
+    status: agent_cockpit_v2_implemented
+    default_surface: "AI-first cockpit with workstream rail, lifecycle workbench, context/evidence ledger, command console, event spine, Dream/SIPS panel, heartbeat, and dock"
+    concept_reference: "/Users/ianzvirbulis/.codex/generated_images/019ffefe-8478-7dc3-be68-9b66a12548ca/exec-596a0ed2-5d56-4017-ac7e-b311f24e2331.png"
+    desktop_viewport: "1240x820 checked in Electron; cockpit readable with real event/context projections"
+    narrow_viewport: "760x800 checked in Electron; workstreams and secondary surfaces stack without page-level horizontal overflow"
+    visual_repairs: "removed raster logo card from dark chrome; added deterministic narrow stacking at <=800px"
+  browser_url: http://127.0.0.1:5173/
+  desktop_title: Hemlock · local dream
+  local_api: http://127.0.0.1:8080
+  build: passed
+  desktop_render: passed
+  sips_desktop_bridge: passed
+  sips_status_command: passed
+  sips_repo_map_command: passed
+  sips_selfloop_start_complete: passed
+  real_local_chat: passed_after_local_relocation
+  thinking_display: "Maple-emitted reasoning/work channels are preserved and visible as Maple output; no host channel suppression is configured"
+  dream_overlay: passed
+  responsive_mobile_layout: passed
+  facts_storage: browser_local_storage
+  dream_behavior: real_local_lora_adapter
+  dream_training_entrypoint: dream-chat/electron/dream_train.py
+  dream_server_lifecycle: stop_train_restart_wait_ready
+  dream_adapter_serving: per_request_adapters
+  dream_live_debug: stage_elapsed_log_heartbeat
+  dream_training_smoke: passed
+  dream_training_smoke_receipt: dream-runs/storage-relocated-training-smoke-verified-20260814/training-receipt.json
+  dream_candidate_inference: passed_with_usage_telemetry
+  sips_control_center: implemented
+  sips_control_runtime: dream-chat/electron/sips_runtime.py
+  sips_routes: "status, repo-map, verify, recall, selfloop, cycle"
+  sips_cycle: "baseline -> dataset -> Dream LoRA -> base/candidate comparison -> verification -> candidate receipt"
+  sips_receipts: "~/Library/Application Support/Hemlock/workspace-runtime/sips-runs/"
+  hemlock_os_shell: "system bar -> desktop canvas -> internal windows -> Understory dock -> command palette"
+  hemlock_logo: "dedicated full Eastern Hemlock tree mark with trunk, roots, and layered boughs; leaf remains a semantic secondary icon"
+  internal_window_manager: "open, close, focus, drag, resize, minimize, maximize, restore, snap, persisted geometry"
+  os_surfaces: "Command Center, Chat/Code, SIPS Control, Memory Garden, Dream Lab, Activity, Receipts, Project Map, Settings"
+  command_palette: "Cmd/Ctrl-K plus visible system-bar and dock entry; allowlisted commands only"
+  agent_event_contract: hemlock.agent.event.v1
+  task_state_contract: hemlock.agent.task.v1
+  window_state_contract: hemlock.window.state.v1
+  agent_event_spine: "Electron-owned append-only JSONL events with bounded replay projection and renderer subscription"
+  session_recovery: "last durable session events are replayed; unfinished running/blocked task resumes as blocked for explicit inspection"
+  lifecycle_events: "session, prompt, inference, command, verification, Dream, dataset, SIPS cycle, memory, closeout"
+  capability_registry: "read, verify, train, memory commands with auto-run metadata, explicit training gates, and cancellation"
+  agent_bridge: "mapleDesktop.agent and hemlockAgent compatibility surfaces; existing Dream/SIPS wrappers preserved"
+  memory_policy: "candidate-first project lessons; explicit evidence-backed promotion gate; verify-before-use; demote/rollback append transition receipts"
+  memory_transition_smoke: "candidate -> demote transition passed with relation target preserved"
+  native_event_smoke: "session.started and session.closed receipts verified after controlled Electron launch"
+  desktop_ui_smoke: "palette filtering, dock surface routing, minimize/restore, maximize/restore, title-bar drag verified"
+  responsive_ui_smoke: "640x800 stack verified with main composer visible and no page-level horizontal overflow"
+  sips_browser_boundary: rendered_only_no_local_commands
+  sips_runtime_smoke: passed
+  context_broker: dream-chat/electron/context_broker.cjs
+  context_refresh_smoke: "fresh Computer History + available OpenChronicle; 13 redacted observations; source coverage 1.0"
+  context_command_registry: "context.refresh and context.search through Electron agent:command"
+  agent_kernel: "Electron-owned durable projection, task/operation queue, budgets, cancellation, replay journal, source policies, candidates, episodes, and training state"
+  agent_projection: "hemlock.agent.projection.v1 persisted per repository workspace under Hemlock application data"
+  personal_context: "Computer History, local project state, and OpenChronicle are explicit source lanes; notes, calendar, and mail remain disabled until user opt-in"
+  ambient_inbox: "observations become provenance-bearing candidates; accept, dismiss, snooze, correct, and convert are separate transitions"
+  coding_operator_loop: "intent -> recall -> inspect -> prepare change set -> verify -> approval -> apply -> verify -> remember"
+  change_set_boundary: "prepared patches are isolated and approval-gated; source mutation is never automatic"
+  runtime_storage_root: "~/Library/Application Support/Hemlock/{models,adapters,datasets,receipts,events,context,caches,workspaces}"
+  runtime_storage_migration: "Dream/SIPS runtime defaults outside the Git worktree; legacy sips-runs is copied forward without destructive deletion"
+  runtime_health: "process_exists, server_ready, inference_ready, training_ready, and storage_ready are tracked separately"
+  agent_kernel_tests: "3 passed: projection persistence, budgets, malformed structured-context repair"
+  agent_contracts: "hemlock.agent.action.v1, hemlock.agent.observation.v1, hemlock.agent.plan.v1"
+  agent_orchestrator: "Electron-owned plan approval -> action validation -> registered command -> compact observation -> retry/block/complete"
+  agent_budgets: "maxAgentSteps 8, maxCommands 12, maxRetriesPerOperation 2, maxMutationSets 1, maxTrainingCycles 0, maxWallClockMs 600000"
+  agent_action_loop_tests: "32 focused contract, orchestrator, queue, context, artifact, preview, stream, and evaluation tests; all passed"
+  agent_queue: "FIFO intent queue is durable and serial; steering bypasses the queue; queued cancellation leaves the active task untouched"
+  agent_conversation_smoke: "Live Electron + Maple smoke passed: hey how are ya? produced a normal local response with durable task, queue, recall, inference, and completion events"
+  agent_steering_smoke: "Live steering receipt passed; steering is recorded for the next bounded decision and does not rewrite an inference already in flight"
+  agent_chat_trace: "Chat/Code keeps Maple model output primary: every emitted string channel is labeled and visible by default, while host telemetry, structured action envelopes, raw-output references, repairs, fallbacks, observations, and receipts remain separate"
+  model_output_fidelity:
+    stream_contract: "hemlock.agent.stream.v1 model_text frames preserve channel names, ordered sequence, delta, terminal, usage, and stop reason"
+    suppression_removed: "enable_thinking:false removed from ordinary and structured-action inference bodies"
+    durable_raw_output: "raw SSE/buffered payloads and channel digests persist under ~/Library/Application Support/Hemlock/events/model-output/"
+    conversation_response: "hemlock.agent.conversation.response.v1 includes channels, rawOutputRef, traceRefs, and displayMode=model-verbatim"
+    structured_action: "validated actions retain rawModelOutputRef, modelChannels, parseStatus, and fallbackMode without replacing raw Maple prose"
+    adaptive_budgets: "320 tokens for short greetings, 512 normal, 768 detail-oriented requests"
+    local_inference_timeout: "runInference and structured-action inference allow up to six minutes by default (HEMLOCK_INFERENCE_TIMEOUT_MS overrides); cancellation and steering remain immediate"
+  agent_artistic_coding_smoke: "Live Electron proof: casual opener completed as conversation without a plan; approved five-step animation plan completed repo-map, artifact.create, artifact.author, preview.open, and preview.inspect using an explicitly recorded host fallback when Maple structured output was unavailable; artifact revision is previewable with digest and evidence; the pre-terminal live process blocked on Maple's malformed final envelope before the terminal fallback patch was reloaded, while the evidence-backed terminal fallback is covered by a passing unit test"
+  agent_read_tools: "repo.inspect, file.read, file.search, git.status, git.diff, test.discover, verification.list, receipt.inspect"
+  agent_plan_gate: "intent acceptance creates a durable waiting_for_approval plan; no action runs before explicit approval"
+  agent_observation_projection: "actions and observations persist in the workspace projection and append-only projection journal"
+  context_source_registry: "common adapter health/query/redaction contract; personal lanes remain opt-in and provenance-bearing"
+  tool_use_evaluation: "11 fixtures; reports completion, valid actions, evidence coverage, false success, and forbidden commands"
+  storage_guard: "Dream blocks below 10 GiB free and emits dream.blocked"
+  electron_model_resolution: "HEMLOCK_MODEL_PATH/MAPLE_MODEL_PATH, then ~/Models/Hemlock/maple-2bit-mlx, then repo fallback"
+  full_repo_pytest: "not green in current test environment: .venv has no pytest; system pytest lacks mlx/transformers and collected 9 import errors before interruption"
+  note: Electron accepts MAPLE_DEV_URL for development when port 5173 is occupied; packaged mode loads the built dist/index.html.
+
+live_workspace_v3:
+  status: implemented_with_previewability_audit_passed
+  tranche: "Hemlock OS Live Workspace"
+  implementation_truth:
+    window_manager:
+      schema: hemlock.window.state.v2
+      module: dream-chat/src/windowManager.js
+      behavior: "deterministic bounds, all-edge/corner resize, canvas clamp, 16px snap, Option bypass, cascade open, compact z-order, exact restore, keyboard placement, v2 migration, narrow CSS stack"
+      tests: "dream-chat/src/windowManager.test.js"
+    renderer_boundaries:
+      stream_store: dream-chat/src/streamStore.js
+      window_frame: dream-chat/src/components/WindowFrame.jsx
+      artifact_studio: dream-chat/src/main.jsx
+      fonts: "@fontsource/dm-sans, @fontsource/dm-mono, @fontsource/newsreader bundled through Vite"
+    chat_readability:
+      behavior: "darker moss hierarchy for task metadata, labeled Maple channels, host telemetry, timestamps, trace summaries, status, and composer placeholder"
+      contrast_detail: "supporting text is no longer dependent on pale gray alone; readable size and structural grouping remain paired with color"
+    electron_authority:
+      stream_protocol: dream-chat/electron/stream_protocol.cjs
+      artifact_registry: dream-chat/electron/artifact_registry.cjs
+      preview_policy: dream-chat/electron/preview_policy.cjs
+      renderer_sandbox: true
+      context_isolation: true
+      node_integration: false
+      public_interfaces: "agent.artifacts(action,input), agent.preview(action,input), agent.subscribeStream(callback)"
+    stream_contract:
+      schema: hemlock.agent.stream.v1
+      kinds: [model_text, artifact_source, stdout, stderr, preview_console, training_log]
+      behavior: "ordered sequence frames, UTF-8/SSE boundary parser, buffered fallback label, cancellation/steering abort, durable checkpoints and terminal digests"
+    artifact_contract:
+      schema: hemlock.agent.artifact.v1
+      storage: "~/Library/Application Support/Hemlock/workspaces/<workspaceId>/tasks/<taskId>/artifacts/<artifactId>/"
+      statuses: [drafting, previewable, ready, failed, superseded, exported_to_change_set]
+      commands: [artifact.create, artifact.author, artifact.update, artifact.inspect, artifact.compare, artifact.freeze, artifact.export, artifact.preview.open, artifact.preview.inspect, artifact.preview.interact, artifact.preview.stop]
+    artifact_panel_layout:
+      behavior: "scrollable complete workspace with persistent local layout"
+      resizers: "Source/Diff, Diff/Preview, and Output/Inspection dividers; pointer drag plus arrow-key control"
+      storage_key: hemlock-artifact-layout-v1
+      narrow_behavior: "single-pane tabs remain scrollable; desktop dividers are hidden when tabs are active"
+  preview_contract:
+    sandbox: "allow-scripts allow-forms iframe; no same-origin, popups, downloads, network, host APIs, file URLs, or arbitrary eval"
+    budgets: "24 actions, 2 retries/action, 8 screenshots, 300000ms"
+    harness: "typed DOM/accessibility/console/resize/click/type/key/scroll/hover/focus/wait messages"
+    live_artistic_task:
+      task_id: "task-2026-08-14T23-47-54-633Z-d9bd7"
+      artifact_id: artifact-1786751403630
+      revision: 1
+      digest: "sha256:386531ba96892b3787c15658154888908aee20fcb970a24c125c21488a5d9bc5"
+      status: previewable
+      evidence: "authoring.host_fallback, artifact.preview.ready, artifact.inspection.completed"
+      screenshot_a: "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-2026-08-14T23-47-54-633Z-d9bd7/receipts/eastern-hemlock-night-garden-stable-a.jpg"
+      screenshot_b: "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-2026-08-14T23-47-54-633Z-d9bd7/receipts/eastern-hemlock-night-garden-stable-b.jpg"
+  conversational_routing:
+    casual_opener: "Hey Maple, how are you holding up? I want to make something beautiful together."
+    result: "conversation complete; no plan proposed; 7.2s SSE response with durable digest"
+    follow_up: "That garden has a lovely hush. I am back for a moment—what detail do you like best about it?"
+    result_follow_up: "conversation complete; 17s SSE response with durable digest"
+    mixed_revision: "I love the hush so far. One small revision: could you make the animation feel a little more alive without turning it busy—soften the mist, let two fireflies arrive later, and give the title a bit more breathing room on narrow screens? Keep the slow nocturnal mood."
+    result_revision: "five-step plan proposed and approved; repo-map completed; subsequent local structured-action inference was stopped after extended model latency before revision completion; no false completion claimed"
+  validation:
+    node_syntax: "passed in final focused run before handoff"
+    agent_contract_tests: "36 passed in latest run"
+    ui_unit_tests: "9 passed in latest run"
+    vite_build: "passed in latest run"
+    electron_smoke: "passed fresh Electron host; artifact.create/author/preview.open/inspect/compare/export receipts observed"
+    electron_launch_reload: "paired npm run dev + npm run electron loaded the production renderer path for 5s with no renderer console error; stopped intentionally after launch smoke, no interaction replay in this final pass"
+    responsive_visual: "preview-first layout visually checked in Electron and browser at wide and narrow sizes; full-panel scroll and resizer pass checked in fresh Electron"
+    chat_readability_visual: "paper Chat/Code surface checked after contrast and metadata sizing pass"
+    renderer_dynamic_text_guard: "displayText now normalizes event, receipt, context, candidate, map, memory, stream, and status payloads before React renders them; focused tests and production build passed; paired Electron launch loaded the renderer after the fidelity patch with no console error, but no action-driven UI replay was run in the final pass"
+    artistic_artifact_proof: "prior real Electron starter artifact authored, previewed, inspected, compared, and exported to an approval-gated change set; deterministic full lifecycle fixture now passed with revision repair, desktop/narrow snapshots, cancellation, and last-known-good proof"
+    deterministic_artistic_fixture:
+      command: "cd dream-chat && npm run test:e2e:artistic-fixture"
+      status: passed
+      receipt: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/receipts/artistic-fixture-1786754771421.json"
+      desktop_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/screenshots/desktop.svg"
+      narrow_snapshot: "~/Library/Application Support/Hemlock/e2e/fixture/run-1786754771389/screenshots/narrow.svg"
+      proof: "three Maple channels, approved plan, artifact r1 -> repaired r2 -> failed r3, parent/new digests, preview interactions, hidden screenshot block, paused input, prose-surrounded action envelope, and late callback suppression"
+    real_maple_artistic_lane:
+      command: "cd dream-chat && npm run test:e2e:artistic-maple"
+      status: blocked
+      endpoint: "http://127.0.0.1:8080"
+      receipt: "~/Library/Application Support/Hemlock/e2e/maple/artistic-maple-1786756175215.json"
+      result: "endpoint was healthy; real Maple completed a streamed casual response with role/reasoning/content channels and a parsed structured artifact.create envelope after 364548ms; the runner still stops before host artifact execution and keeps the lane blocked rather than claiming completion"
+    performance_gates: pending
+    previewability_receipts:
+      screenshots:
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-00-16-253Z-86158/receipts/electron-artifact-preview-first.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-00-16-253Z-86158/receipts/browser-artifact-preview-first.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-00-16-253Z-86158/receipts/browser-narrow-stacked.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-25-22-180Z-96852/receipts/artifact-studio-scroll-top.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-25-22-180Z-96852/receipts/artifact-studio-scroll-evidence.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-25-22-180Z-96852/receipts/artifact-studio-keyboard-resize.jpg"
+        - "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-25-22-180Z-96852/receipts/chat-readability.jpg"
+      artifact_manifest: "~/Library/Application Support/Hemlock/workspaces/workspace-e10fcf1345df2de3/tasks/task-session-2026-08-14T22-00-16-253Z-86158/artifacts/artifact-1786744977948/manifest.json"
+      change_set_manifest: "~/Library/Application Support/Hemlock/workspace-runtime/workspaces/changesets/artifact-artifact-1786744977948-r1/manifest.json"
+  unmet_acceptance:
+    - "The real Maple endpoint is now reachable and slow local inference is no longer cut off at 180 seconds, but the real lane remains blocked before host artifact execution because the current runner intentionally does not drive the Electron bridge."
+    - "Full Maple-backed streaming/steering runtime proof still needs a live Electron replay with the extended timeout; the direct real lane now proves Maple channel preservation and parsed structured output."
+    - "Target-M1 pointer/paint, delta-to-paint, artifact-refresh, long-task, and ten-minute buffer timing gates were not measured in this pass."
+    - "A full ambitious multi-revision Maple-authored garden and bounded repair remain unproven in the real Maple lane; the deterministic fixture proves host behavior with an artistic fixture source."

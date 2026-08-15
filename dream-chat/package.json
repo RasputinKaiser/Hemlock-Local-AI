@@ -1,0 +1,31 @@
+{
+  "name": "maple-dream-chat",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test:agent": "node --test electron/agent_kernel.test.cjs electron/agent_contracts.test.cjs electron/agent_orchestrator.test.cjs electron/agent_queue.test.cjs electron/context_sources.test.cjs electron/tool_use_eval.test.cjs electron/stream_protocol.test.cjs electron/response_budget.test.cjs electron/artifact_registry.test.cjs electron/preview_policy.test.cjs",
+    "test:ui": "node --test src/windowManager.test.js src/streamStore.test.js",
+    "eval:agent": "node electron/tool_use_eval.cjs",
+    "verify:agent": "npm run test:agent && npm run test:ui && npm run build",
+    "test:e2e:artistic-fixture": "node electron/e2e_artistic_fixture.cjs",
+    "test:e2e:artistic-maple": "node electron/e2e_artistic_maple.cjs",
+    "preview": "vite preview --host 127.0.0.1",
+    "electron": "electron electron/main.cjs",
+    "desktop": "concurrently -k \"npm run dev\" \"npm run electron\""
+  },
+  "dependencies": {
+    "@fontsource/dm-mono": "^5.2.6",
+    "@fontsource/dm-sans": "^5.2.6",
+    "@fontsource/newsreader": "^5.2.6",
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "electron": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {}
+}
