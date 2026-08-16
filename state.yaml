@@ -706,7 +706,7 @@ github_repo_publish_2026_08_15:
   visibility: private
   default_branch: main
   published_commit: "8a936194912fd4eacbe83cc3ca4839ecc650b254"
-  follow_up_receipt_commit: pending
+  follow_up_receipt_commit: "f3194fb Record Hemlock-Local-AI publish receipt"
   verification: "GitHub API reports the repository exists, is private, defaults to main, and main contains Add Hemlock-native Maple agent workflow."
   excluded_dirty_roots:
     - .media/
