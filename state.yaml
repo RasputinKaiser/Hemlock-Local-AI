@@ -740,3 +740,16 @@ chat_transcript_and_collapsible_plan_dock_2026_08_16:
     syntax: "electron/main.cjs passed syntax check"
     diff_check: passed
   claim_boundary: "This verifies the renderer layout and scroll ownership contract. It does not claim a live artifact result; artifact completion still requires host receipts and verification."
+
+chat_conversation_visibility_2026_08_16:
+  status: implemented_verified
+  conversation_restore: "On desktop state hydration, Hemlock switches to the active durable thread and restores its persisted user/model conversation into Chat without overwriting messages already present in the window."
+  host_detail_priority: "Exact validated action envelopes and raw provider output references are collapsed by default in Chat so the readable user/model transcript remains primary; host evidence stays available on demand."
+  verification:
+    ui_tests: "16 passed"
+    agent_tests: "81 passed"
+    build: passed
+    syntax: "electron/main.cjs passed syntax check"
+    diff_check: passed
+    maple_health: "GET http://127.0.0.1:8080/health returned {status: ok}"
+  claim_boundary: "This improves Chat visibility and restores durable conversation rendering. It does not alter host action identity or artifact completion gates."

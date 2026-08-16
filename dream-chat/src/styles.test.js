@@ -38,6 +38,13 @@ test("Chat keeps the task hero compact so the transcript gets the viewport", () 
   assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*max-width:\s*min\(900px, 80vw\);/s);
 });
 
+test("Chat restores the active thread conversation and keeps host JSON secondary", () => {
+  assert.match(mainSource, /agent\.runCommand\("thread\.switch", \{ threadId: activeThreadId \}\)/);
+  assert.match(mainSource, /setMessages\(\(current\) => current\.length \? current : result\.conversation\.map/);
+  assert.match(mainSource, /<details><summary>Exact validated action envelope/);
+  assert.match(mainSource, /<details><summary>Raw provider output reference/);
+});
+
 test("Chat keeps live model output visible and does not call stale evidence passed while approval is pending", () => {
   assert.match(mainSource, /className="chat-live-stream"/);
   assert.match(mainSource, /LIVE MODEL STREAM/);
