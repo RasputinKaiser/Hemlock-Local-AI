@@ -753,3 +753,16 @@ chat_conversation_visibility_2026_08_16:
     diff_check: passed
     maple_health: "GET http://127.0.0.1:8080/health returned {status: ok}"
   claim_boundary: "This improves Chat visibility and restores durable conversation rendering. It does not alter host action identity or artifact completion gates."
+
+chat_conversation_first_layout_2026_08_16:
+  status: implemented_verified
+  hierarchy: "The transcript is now the only auto-following scroll surface. Host action/evidence detail is rendered in a separate compact rail beneath the transcript, followed by the collapsed plan control, work mode, and composer."
+  progressive_disclosure: "Host activity is a collapsed summary by default and expands only on request. The plan remains a compact collapsed status/control surface after approval and expands for steps, rationale, and approval controls when needed."
+  readability: "The task hero and live model stream have bounded compact heights, while the readable user/model conversation keeps the available central viewport."
+  verification:
+    ui_tests: "17 passed"
+    agent_tests: "81 passed"
+    build: passed
+    syntax: "electron/main.cjs passed syntax check"
+    diff_check: passed
+  claim_boundary: "This addresses the recorded Chat/Build placement and hierarchy problem. It does not claim a new Maple inference or artifact-quality result."

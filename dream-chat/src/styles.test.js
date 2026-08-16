@@ -28,12 +28,22 @@ test("Chat keeps the transcript above a collapsible plan dock", () => {
   assert.match(mainSource, /aria-controls="hemlock-plan-body"/);
   assert.match(mainSource, /hidden=\{planCollapsed\}/);
   assert.match(styles, /\.chat-surface > \.chat-scroll\s*\{[^}]*order:\s*5;/s);
-  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*order:\s*6;[^}]*flex:\s*0 0 auto;/s);
+  assert.match(styles, /\.chat-surface > \.chat-host-rail\s*\{[^}]*order:\s*6;[^}]*flex:\s*0 0 auto;/s);
+  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*order:\s*7;[^}]*flex:\s*0 0 auto;/s);
   assert.match(styles, /\.plan-collapse-toggle\.is-collapsed svg/);
 });
 
+test("Chat keeps host activity out of the transcript and collapsed by default", () => {
+  assert.match(mainSource, /const hostActivity = <section className="chat-host-rail"/);
+  assert.match(mainSource, /<details className="chat-host-details">/);
+  assert.match(mainSource, /<\/div>\{hostActivity\}<div className="interaction-mode-bar"/);
+  assert.match(styles, /\.chat-host-rail\s*\{[^}]*max-height:\s*min\(24vh, 240px\);/s);
+  assert.match(styles, /\.chat-host-details\s*\{[^}]*background:\s*#f4f8ef;/s);
+  assert.match(styles, /\.chat-host-details > \.live-task-surface\s*\{[^}]*border-top:/s);
+});
+
 test("Chat keeps the task hero compact so the transcript gets the viewport", () => {
-  assert.match(styles, /\.chat-surface > \.chat-task-header\s*\{[^}]*max-height:\s*min\(17vh, 175px\);/s);
+  assert.match(styles, /\.chat-surface > \.chat-task-header\s*\{[^}]*max-height:\s*min\(13vh, 135px\);/s);
   assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*-webkit-line-clamp:\s*2;/s);
   assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*max-width:\s*min\(900px, 80vw\);/s);
 });
