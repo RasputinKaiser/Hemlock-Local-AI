@@ -35,17 +35,21 @@ test("Chat keeps the transcript above a collapsible plan dock", () => {
 
 test("Chat keeps host activity out of the transcript and collapsed by default", () => {
   assert.match(mainSource, /const hostActivity = <section className="chat-host-rail"/);
-  assert.match(mainSource, /<details className="chat-host-details">/);
+  assert.match(mainSource, /<details className="chat-host-details" open={hostActivityOpen}/);
   assert.match(mainSource, /<\/div>\{hostActivity\}<div className="interaction-mode-bar"/);
-  assert.match(styles, /\.chat-host-rail\s*\{[^}]*max-height:\s*min\(24vh, 240px\);/s);
+  assert.match(styles, /\.chat-host-rail\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
   assert.match(styles, /\.chat-host-details\s*\{[^}]*background:\s*#f4f8ef;/s);
-  assert.match(styles, /\.chat-host-details > \.live-task-surface\s*\{[^}]*border-top:/s);
+  assert.match(styles, /\.chat-host-details\[open\]\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
+  assert.match(styles, /\.chat-host-details > \.live-task-surface\s*\{[^}]*overflow:\s*auto;[^}]*border-top:/s);
 });
 
 test("Chat keeps the task hero compact so the transcript gets the viewport", () => {
-  assert.match(styles, /\.chat-surface > \.chat-task-header\s*\{[^}]*max-height:\s*min\(13vh, 135px\);/s);
-  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*-webkit-line-clamp:\s*2;/s);
-  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*max-width:\s*min\(900px, 80vw\);/s);
+  assert.match(styles, /\.chat-surface > \.chat-task-header\s*\{[^}]*max-height:\s*min\(8vh, 70px\);/s);
+  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*-webkit-line-clamp:\s*1;/s);
+  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*max-width:\s*min\(980px, 78vw\);/s);
+  assert.match(mainSource, /className="chat-context-summary"/);
+  assert.match(styles, /\.chat-context-summary > span:last-child\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+  assert.match(styles, /\.work-message\.assistant \.maple-output-card\s*\{[^}]*border:\s*0;[^}]*box-shadow:\s*none;/s);
 });
 
 test("Chat restores the active thread conversation and keeps host JSON secondary", () => {

@@ -766,3 +766,19 @@ chat_conversation_first_layout_2026_08_16:
     syntax: "electron/main.cjs passed syntax check"
     diff_check: passed
   claim_boundary: "This addresses the recorded Chat/Build placement and hierarchy problem. It does not claim a new Maple inference or artifact-quality result."
+
+chat_fullscreen_visual_polish_2026_08_16:
+  status: implemented_verified
+  design_reference: "/var/folders/70/37y2xd0n6vbf04fw178_zy9h0000gn/T/codex-clipboard-ceb2cc55-62fe-4518-b104-6f24131442e7.png"
+  implementation_capture: "/tmp/hemlock-chat-polish-final-state.png"
+  hierarchy: "The Chat/Code transcript is the visual center. The repeated objective is a one-line context disclosure, host activity and full trace are collapsed below the transcript, and the approved plan is a compact expandable dock above Work mode and the composer."
+  readability: "User messages use a bounded centered measure and assistant output drops dashboard-card chrome while preserving visible reasoning channels and live model streaming. The compact task/context bands reclaim vertical space, and expanded host detail is bounded with internal scrolling so it cannot cover the transcript."
+  privacy: "The live capture renders ~/Code/Hemlock rather than the user's macOS account name."
+  verification:
+    ui_tests: "17 passed"
+    agent_tests: "81 passed"
+    build: passed
+    syntax: "electron/main.cjs passed syntax check"
+    diff_check: passed
+    design_qa: "design-qa.md result passed"
+  claim_boundary: "This is a renderer/layout polish pass validated against the supplied screenshot and a live Electron capture. It does not claim a new Maple inference or artifact-quality result."
