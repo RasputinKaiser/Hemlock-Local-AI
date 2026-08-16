@@ -726,3 +726,17 @@ chat_plan_scroll_and_path_privacy_2026_08_16:
     maple_health: "GET http://127.0.0.1:8080/health returned {status: ok} after the live Vite/Electron session reloaded the UI."
     diff_check: passed
   claim_boundary: "This fixes the Chat/build presentation and display privacy boundary. It does not claim that Maple has run until a live inference stream or host receipt is present."
+
+chat_transcript_and_collapsible_plan_dock_2026_08_16:
+  status: implemented_verified
+  layout: "Chat now keeps the conversation, Maple model/reasoning output, and host activity in the upper scrollable transcript. The approved or awaiting plan is docked below that transcript and immediately above Work mode and the composer."
+  plan_controls: "The plan remains full-sized within a bounded dock, can be collapsed to its heading, and keeps Approve plan, Reject, or Refresh task state available when those controls are required."
+  hero: "The task/objective hero is bounded to a compact two-line summary with a wider readable measure, leaving more vertical space for the transcript while retaining the full objective disclosure."
+  stream_behavior: "The transcript follows new messages and streamed model channels only while the reader is already near the bottom. Scrolling upward to inspect prior user text, Maple prose/reasoning, actions, or evidence is preserved across subsequent stream updates."
+  verification:
+    ui_tests: "14 passed"
+    agent_tests: "81 passed"
+    build: passed
+    syntax: "electron/main.cjs passed syntax check"
+    diff_check: passed
+  claim_boundary: "This verifies the renderer layout and scroll ownership contract. It does not claim a live artifact result; artifact completion still requires host receipts and verification."
