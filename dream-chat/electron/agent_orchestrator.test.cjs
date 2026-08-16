@@ -74,7 +74,7 @@ test("repairs one invalid Maple action and continues with the corrected trace", 
     const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
     const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
     assert.equal(result.status, "completed");
-    assert.equal(mock.source.calls.length, 3);
+    assert.equal(mock.source.calls.length, 2);
     assert.equal(harness.events.some((event) => event.type === "action.parse.failed"), true);
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
@@ -146,6 +146,189 @@ test("gives placeholder Maple action ids a fresh host-owned identity", async () 
   }
 });
 
+test("host owns the planned command and normalizes malformed evidence metadata", async () => {
+  const harness = makeHarness({ inferAction: async () => JSON.stringify({
+    schema: ACTION_SCHEMA,
+    id: "model-action",
+    taskId: "wrong-task",
+    step: 91,
+    kind: "tool",
+    commandId: "none",
+    input: {},
+    shortRationale: "Inspect the artifact preview.",
+    expectedEvidence: { "preview://inspection": true },
+    approval: "explicit",
+    status: "proposed",
+  }), commandRegistry: { "artifact.preview.inspect": { capability: "preview" } } });
+  try {
+    const proposed = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.preview.inspect", label: "Inspect preview", expectedEvidence: ["preview://inspection"] }] });
+    const result = await harness.orchestrator.approvePlan(harness.task.id, proposed.plan.id);
+    assert.equal(result.status, "completed");
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "artifact.preview.inspect");
+    assert.deepEqual(action.expectedEvidence, ["preview://inspection"]);
+    assert.equal(action.taskId, harness.task.id);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("executes planned preview open and inspect steps without another Maple action turn", async () => {
+  let inferenceCalls = 0;
+  const commands = [];
+  const harness = makeHarness({
+    inferAction: async () => {
+      inferenceCalls += 1;
+      throw new Error("Maple should not be called for host-owned preview steps");
+    },
+    commandRegistry: {
+      "artifact.preview.open": { capability: "preview" },
+      "artifact.preview.inspect": { capability: "preview" },
+    },
+    executeCommand: async (command) => {
+      commands.push(command);
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const proposed = harness.orchestrator.proposePlan(harness.task, {
+      steps: [
+        { commandId: "artifact.preview.open", label: "Open preview", expectedEvidence: ["preview://session"] },
+        { commandId: "artifact.preview.inspect", label: "Inspect preview", expectedEvidence: ["preview://inspection"] },
+      ],
+    });
+    const result = await harness.orchestrator.approvePlan(harness.task.id, proposed.plan.id);
+    assert.equal(result.status, "completed");
+    assert.deepEqual(commands, ["artifact.preview.open", "artifact.preview.inspect"]);
+    assert.equal(inferenceCalls, 0);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("lets Maple adapt the approved plan with an additional safe inspection", async () => {
+  let calls = 0;
+  const commands = [];
+  const harness = makeHarness({
+    commandRegistry: {
+      "repo-map": { capability: "read" },
+      "file.search": { capability: "read", auto: true, label: "Search relevant files" },
+    },
+    executeCommand: async (command) => {
+      commands.push(command);
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+    inferAction: async () => {
+      calls += 1;
+      return JSON.stringify(createAction({
+        taskId: "model-task",
+        step: calls,
+        commandId: calls === 1 ? "file.search" : "repo-map",
+        input: calls === 1 ? { query: "animation" } : {},
+        shortRationale: calls === 1 ? "Search for the relevant animation surface before mapping it." : "Map the repository after the focused search.",
+      }));
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.deepEqual(commands, ["file.search", "repo-map"]);
+    assert.deepEqual(harness.kernel.getProjection().plans[0].steps.map((step) => step.commandId), ["file.search", "repo-map"]);
+    assert.equal(harness.kernel.getProjection().plans[0].adaptiveDecisions[0].commandId, "file.search");
+    assert.equal(harness.events.some((event) => event.type === "plan.adapted"), true);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("recovers an unavailable model command into the current approved step", async () => {
+  const harness = makeHarness({
+    inferAction: async () => JSON.stringify(createAction({
+      taskId: "model-task",
+      step: 99,
+      commandId: "invented.shell.command",
+      shortRationale: "Inspect the project with the most useful available operation.",
+    })),
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.hostSelection.mode, "recovered");
+    assert.equal(harness.events.some((event) => event.type === "action.command.recovered"), true);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("lets Maple pause for a user decision instead of forcing the next tool", async () => {
+  const harness = makeHarness({
+    inferAction: async () => JSON.stringify({
+      schema: ACTION_SCHEMA,
+      id: "maple-question",
+      taskId: "model-task",
+      step: 1,
+      kind: "ask_user",
+      commandId: null,
+      input: { question: "Which project surface should I inspect first?" },
+      shortRationale: "I need the target surface before choosing a useful inspection.",
+      expectedEvidence: [],
+      approval: "none",
+      status: "proposed",
+    }),
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "waiting_for_user");
+    assert.equal(harness.kernel.getProjection().actions[0].kind, "ask_user");
+    assert.equal(harness.kernel.getProjection().actions[0].commandId, null);
+    assert.equal(harness.kernel.getProjection().observations.length, 0);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("accepts a truncated Maple envelope only through host recovery and records the recovery mode", async () => {
+  const harness = makeHarness({
+    commandRegistry: { "artifact.create": { capability: "artifact" } },
+    inferAction: async () => `{
+      "kind": "tool",
+      "commandId": "artifact.create",
+      "approval": "plan",
+      "status": "proposed",
+      "data": {"html": "${"x".repeat(2200)}`,
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.create", label: "Create artifact", expectedEvidence: ["artifact://manifest"] }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(harness.kernel.getProjection().actions[0].parseStatus, "recovered-truncated");
+    assert.equal(harness.kernel.getProjection().actions[0].commandId, "artifact.create");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("wraps a bare Maple artifact metadata payload without forcing a fixed visual template", async () => {
+  const harness = makeHarness({
+    commandRegistry: { "artifact.create": { capability: "artifact" } },
+    inferAction: async () => JSON.stringify({ title: "A different moving scene", mime: "text/html" }),
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.create", label: "Create variation", expectedEvidence: ["artifact://manifest"] }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(harness.kernel.getProjection().actions[0].parseStatus, "coerced-payload");
+    assert.equal(harness.kernel.getProjection().actions[0].input.title, "A different moving scene");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
 test("falls back to the next approved artifact step when Maple action output is unavailable", async () => {
   let calls = 0;
   const harness = makeHarness({
@@ -168,15 +351,16 @@ test("falls back to the next approved artifact step when Maple action output is 
   }
 });
 
-test("falls back to an evidence-backed terminal action after the approved plan is complete", async () => {
+test("generates an evidence-backed terminal action without another Maple turn after the plan is complete", async () => {
   const valid = createAction({ taskId: "task-loop", step: 1, commandId: "repo-map", shortRationale: "Map repo" });
-  const mock = createMockMapleActionSource([JSON.stringify(valid), "not json", "still not json"]);
+  const mock = createMockMapleActionSource([JSON.stringify(valid)]);
   const harness = makeHarness({ inferAction: mock.inferAction });
   try {
     const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
     const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
     assert.equal(result.status, "completed");
-    assert.equal(harness.events.some((event) => event.type === "action.inference.fallback" && event.payload.mode === "evidence-backed-terminal-step"), true);
+    assert.equal(harness.events.some((event) => event.type === "action.inference.fallback" && event.payload.mode === "evidence-backed-terminal-step"), false);
+    assert.equal(mock.source.calls.length, 1);
     assert.equal(harness.kernel.getProjection().task.status, "completed");
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
@@ -196,7 +380,7 @@ test("repairs an empty Maple action response once before continuing", async () =
     const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
     const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
     assert.equal(result.status, "completed");
-    assert.equal(calls, 3);
+    assert.equal(calls, 2);
     assert.equal(harness.events.some((event) => event.type === "action.inference.failed"), true);
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
@@ -212,6 +396,38 @@ test("blocks after a second invalid Maple action envelope", async () => {
     assert.equal(result.status, "blocked");
     assert.match(result.reason, /two invalid action envelopes/i);
     assert.equal(mock.source.calls.length, 2);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("completes a general coding fixture after one plan approval with host-owned verification gates", async () => {
+  const commands = ["context.refresh", "repo-map", "repo.inspect", "git.status", "code.apply", "verify", "git.diff"];
+  const commandRegistry = Object.fromEntries(commands.map((command) => [command, { capability: command === "code.apply" ? "write" : command === "verify" ? "verify" : "read", approval: command === "code.apply" ? "plan" : "none" }]));
+  const harness = makeHarness({ commandRegistry, inferAction: null, executeCommand: async (command) => {
+    if (command === "code.apply") return { schema: "hemlock.agent.change-set.v1", status: "applied", id: "changeset-fixture", evidenceRefs: ["changeset://fixture"] };
+    if (command === "verify") return { schema: "hemlock.agent.verification.v1", status: "passed", receiptPath: "receipt://verification-fixture", evidenceRefs: ["receipt://verification-fixture"] };
+    return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+  } });
+  harness.orchestrator.updateTask({ intent: "coding", objective: "Make a verified local coding change" });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: commands.map((command) => ({ commandId: command, label: command, approval: command === "code.apply" ? "plan" : "none", expectedEvidence: [`receipt://${command}`] })) }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(harness.task.status, "completed");
+    assert.equal(harness.kernel.getProjection().actions.filter((item) => item.taskId === harness.task.id && item.kind === "tool").length, commands.length);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("does not complete a coding task from prose or verification alone", async () => {
+  const harness = makeHarness({ executeCommand: async () => ({ schema: "hemlock.agent.verification.v1", status: "passed", evidenceRefs: ["receipt://verification-only"] }) });
+  harness.orchestrator.updateTask({ intent: "coding", objective: "A coding task without a source change" });
+  try {
+    const result = harness.orchestrator.completeTask(harness.task.id, "attempted completion");
+    assert.equal(result.status, "blocked");
+    assert.match(result.reason, /applied source change-set and verification receipt/i);
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
   }

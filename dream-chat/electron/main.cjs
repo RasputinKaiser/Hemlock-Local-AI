@@ -9,11 +9,35 @@ const { AgentKernel } = require("./agent_kernel.cjs");
 const { AgentOrchestrator } = require("./agent_orchestrator.cjs");
 const { AgentIntentQueue, isActiveTask } = require("./agent_queue.cjs");
 const { DEFAULT_BUDGET, mergeBudget, compactObservation } = require("./agent_contracts.cjs");
+const { ThreadManager, DEFAULT_PROVIDER_CAPS, workspaceFingerprint } = require("./thread_manager.cjs");
+const { CodingWorkspace } = require("./coding_workspace.cjs");
+const { CodingAutopilot } = require("./coding_autopilot.cjs");
 const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
-const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
-const { responseBudget } = require("./response_budget.cjs");
+const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
+const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
+const {
+  PROVIDER_DEFINITIONS,
+  normalizeSelection,
+  parseProviderLine,
+} = require("./provider_adapters.cjs");
+const { createMapleLaunchResult } = require("./maple_runtime.cjs");
+const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
+const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const [window] = BrowserWindow.getAllWindows();
+    if (!window) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  });
+}
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const pythonCandidates = [
@@ -24,6 +48,25 @@ const pythonCandidates = [
 ].filter(Boolean).map((candidate) => path.resolve(candidate));
 const python = pythonCandidates.find((candidate) => fs.existsSync(candidate)) || pythonCandidates[0];
 const pythonFlags = ["-S"];
+const pythonArchitecture = (() => {
+  const requested = String(process.env.HEMLOCK_PYTHON_ARCH || "").trim().toLowerCase();
+  if (requested === "arm64" || requested === "x86_64") return requested;
+  if (process.platform !== "darwin") return null;
+  return process.arch === "arm64" ? "arm64" : "x86_64";
+})();
+const pythonLaunch = pythonArchitecture && fs.existsSync("/usr/bin/arch")
+  ? { command: "/usr/bin/arch", args: [`-${pythonArchitecture}`, python] }
+  : { command: python, args: [] };
+
+function resolveChildInvocation(command, args) {
+  if (command !== python || pythonLaunch.command === python) return { command, args };
+  return { command: pythonLaunch.command, args: [...pythonLaunch.args, ...args] };
+}
+
+function spawnPython(args, options = {}) {
+  return spawn(pythonLaunch.command, [...pythonLaunch.args, ...args], options);
+}
+
 const legacySipsDir = path.join(repoRoot, "sips-runs");
 const runtimeDataRoot = path.resolve(
   process.env.HEMLOCK_DATA_DIR || path.join(os.homedir(), "Library", "Application Support", "Hemlock"),
@@ -87,20 +130,20 @@ function digestText(value) {
   return `sha256:${crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`;
 }
 
-function modelChannelRecords(channels = {}) {
+function modelChannelRecords(channels = {}, source = "maple") {
   return Object.entries(channels)
-    .filter(([, text]) => typeof text === "string")
-    .map(([name, text]) => ({ name, text, digest: digestText(text), visible: true, source: "maple" }));
+    .filter(([name, text]) => name !== "role" && typeof text === "string")
+    .map(([name, text]) => ({ name, text, digest: digestText(text), visible: true, source }));
 }
 
 function streamChannelRecords(stream) {
-  if (stream?.kind === "model_text") return modelChannelRecords(stream.channels);
+  if (stream?.kind === "model_text") return modelChannelRecords(stream.channels, stream.provider || "maple");
   return Object.entries(stream?.channels || {})
     .filter(([, text]) => typeof text === "string")
     .map(([name, text]) => ({ name, text, digest: digestText(text), visible: true, source: stream?.kind || "stream" }));
 }
 
-function persistModelOutput({ taskId, operationId = null, streamId = null, mode = "conversation", channels = {}, rawPayload = null } = {}) {
+function persistModelOutput({ taskId, operationId = null, streamId = null, mode = "conversation", channels = {}, rawPayload = null, provider = "maple" } = {}) {
   const root = path.join(runtimeDataRoot, "events", "model-output");
   fs.mkdirSync(root, { recursive: true });
   const safeId = String(streamId || `model-${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -111,7 +154,8 @@ function persistModelOutput({ taskId, operationId = null, streamId = null, mode 
     operationId,
     streamId,
     mode,
-    channels: modelChannelRecords(channels),
+    provider,
+    channels: modelChannelRecords(channels, provider),
     outputDigest: digestText(JSON.stringify(channels)),
     rawPayload,
     createdAt: new Date().toISOString(),
@@ -177,6 +221,14 @@ function assertDreamStorage(runDir) {
   return storage;
 }
 const serverScript = "-m";
+// This is a ceiling, not a reasoning budget. Maple is allowed to stop when it
+// is done; the default is intentionally high so a long reasoning trace is not
+// cut off before the visible response. Lower it only when explicitly tuning a
+// constrained machine with HEMLOCK_MAPLE_MAX_TOKENS.
+const requestedMapleMaxTokens = Number(process.env.HEMLOCK_MAPLE_MAX_TOKENS);
+const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
+  ? Math.max(4096, requestedMapleMaxTokens)
+  : 16384;
 const serverArgs = [
   "mlx_lm",
   "server",
@@ -195,7 +247,7 @@ const serverArgs = [
   "--top-k",
   "20",
   "--max-tokens",
-  "512",
+  String(mapleMaxTokens),
   "--log-level",
   "INFO",
 ];
@@ -229,6 +281,11 @@ function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
     },
   });
+  mainWindow = window;
+
+  window.on("closed", () => {
+    if (mainWindow === window) mainWindow = null;
+  });
 
   const url = isDev
     ? process.env.MAPLE_DEV_URL || "http://127.0.0.1:5173"
@@ -244,15 +301,188 @@ function createWindow() {
 }
 
 let serverProcess = null;
+let mainWindow = null;
+let serverProcessError = null;
 let dreamProcess = null;
 let sipsCycleActive = false;
 const activeChildren = new Set();
 let serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
+let serverLaunchPromise = null;
 let agentInferenceEndpoint = serverUrl;
+const providerStatusCache = new Map();
 const activeStreams = new Map();
 const streamRing = new Map();
 const STREAM_RING_LIMIT = 240;
 let activeArtifactId = null;
+
+const providerCommandCandidates = {
+  codex: [
+    process.env.HEMLOCK_CODEX_BIN,
+    path.join(os.homedir(), ".hermes", "node", "bin", "codex"),
+    path.join(os.homedir(), ".local", "bin", "codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+  ],
+  claude: [
+    process.env.HEMLOCK_CLAUDE_BIN,
+    path.join(os.homedir(), ".npm-global", "bin", "claude"),
+    path.join(os.homedir(), ".local", "bin", "claude"),
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+  ],
+};
+
+function executableFile(candidate) {
+  if (!candidate) return false;
+  try {
+    return fs.statSync(candidate).isFile() && (process.platform === "win32" || (fs.constants && (fs.statSync(candidate).mode & 0o111)));
+  } catch {
+    return false;
+  }
+}
+
+function resolveProviderExecutable(provider) {
+  const candidates = [...(providerCommandCandidates[provider] || [])];
+  const pathEntries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const entry of pathEntries) candidates.push(path.join(entry, provider));
+  return candidates.filter(Boolean).map((candidate) => path.resolve(candidate)).find(executableFile) || null;
+}
+
+function runProcess(command, args = [], { cwd = repoRoot, timeoutMs = 15000, input = null } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      resolve({ exitCode: null, signal: null, stdout: "", stderr: error.message, error });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (exitCode, signal, error = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ exitCode, signal, stdout, stderr, error });
+    };
+    timer = setTimeout(() => {
+      if (!child.killed) child.kill("SIGTERM");
+      finish(null, "SIGTERM");
+    }, timeoutMs);
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    child.once("error", (error) => finish(null, null, error));
+    child.once("close", (exitCode, signal) => finish(exitCode, signal));
+    if (input != null) child.stdin?.end(String(input));
+    else child.stdin?.end();
+  });
+}
+
+function providerStatusRecord(provider, patch = {}) {
+  const definition = PROVIDER_DEFINITIONS[provider];
+  return {
+    provider,
+    label: definition.label,
+    shortLabel: definition.shortLabel,
+    kind: definition.kind,
+    status: "not_checked",
+    installed: provider === "maple",
+    authenticated: provider === "maple",
+    executable: null,
+    accountLabel: provider === "maple" ? "local MLX" : null,
+    checkedAt: null,
+    ...patch,
+  };
+}
+
+function providerStatusSnapshot() {
+  return ["maple", "codex", "claude"].map((provider) => providerStatusCache.get(provider) || providerStatusRecord(provider));
+}
+
+function parseClaudeAuthStatus(stdout) {
+  const lines = String(stdout || "").trim().split(/\r?\n/).filter(Boolean);
+  for (const line of lines.reverse()) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      // Claude may print a small diagnostic before its JSON status object.
+    }
+  }
+  return null;
+}
+
+async function inspectProvider(provider) {
+  if (provider === "maple") {
+    const record = providerStatusRecord("maple", {
+      status: serverState.inferenceReady ? "ready" : serverState.processReady ? "process_ready" : "local",
+      checkedAt: new Date().toISOString(),
+      accountLabel: "local MLX",
+    });
+    providerStatusCache.set(provider, record);
+    return record;
+  }
+  const executable = resolveProviderExecutable(provider);
+  if (!executable) {
+    const record = providerStatusRecord(provider, { status: "unavailable", installed: false, authenticated: false, checkedAt: new Date().toISOString() });
+    providerStatusCache.set(provider, record);
+    return record;
+  }
+  const args = provider === "codex" ? ["login", "status"] : ["auth", "status", "--json"];
+  const result = await runProcess(executable, args, { timeoutMs: 20000 });
+  const claudeAuth = provider === "claude" ? parseClaudeAuthStatus(result.stdout) : null;
+  const authenticated = provider === "codex"
+    ? result.exitCode === 0 && /logged in|authenticated/i.test(`${result.stdout}\n${result.stderr}`)
+    : result.exitCode === 0 && claudeAuth?.loggedIn === true;
+  const record = providerStatusRecord(provider, {
+    status: authenticated ? "authenticated" : "login_required",
+    installed: true,
+    authenticated,
+    executable,
+    accountLabel: authenticated ? (provider === "codex" ? "ChatGPT subscription" : `${claudeAuth?.subscriptionType || "Claude"} subscription`) : null,
+    checkedAt: new Date().toISOString(),
+    detail: authenticated ? null : String(result.stderr || result.stdout || "Login status was not confirmed.").trim().slice(-320),
+  });
+  providerStatusCache.set(provider, record);
+  return record;
+}
+
+async function inspectProviders() {
+  const providers = await Promise.all(["maple", "codex", "claude"].map((provider) => inspectProvider(provider)));
+  return { schema: "hemlock.provider.status.v1", providers, checkedAt: new Date().toISOString(), claimBoundary: "Subscription status is inferred from the provider CLI's local login status; Hemlock never reads or stores provider credentials." };
+}
+
+function appleScriptString(value) {
+  return String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("\n", "\\n");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function openProviderLogin(provider, action = "login") {
+  if (!(provider === "codex" || provider === "claude")) throw new Error("Only Codex and Claude have subscription login flows.");
+  const executable = resolveProviderExecutable(provider);
+  if (!executable) throw new Error(`${PROVIDER_DEFINITIONS[provider].label} CLI was not found. Install it first, then retry.`);
+  const commandArgs = provider === "codex"
+    ? [action === "logout" ? "logout" : "login"]
+    : ["auth", action === "logout" ? "logout" : "login"];
+  const command = [shellQuote(executable), ...commandArgs.map(shellQuote)].join(" ");
+  if (process.platform === "darwin") {
+    const script = `tell application "Terminal" to do script "${appleScriptString(command)}"`;
+    const terminal = spawn("osascript", ["-e", script], { detached: true, stdio: "ignore" });
+    terminal.unref();
+  } else {
+    const child = spawn(executable, commandArgs, { cwd: repoRoot, detached: true, stdio: "ignore" });
+    child.unref();
+  }
+  appendAgentEvent(`provider.${action}.opened`, "accepted", { provider, action, executable: path.basename(executable), claimBoundary: "The provider's own interactive terminal flow was opened; authentication completion must be checked from the provider status control." }, { reversible: true });
+  return { schema: "hemlock.provider.auth.v1", status: "opened", provider, action, executable: path.basename(executable), claimBoundary: "Hemlock opened the provider CLI's own login flow; it does not claim that authentication completed." };
+}
 
 const sessionsDir = path.join(sipsDir, "sessions");
 fs.mkdirSync(sessionsDir, { recursive: true });
@@ -277,6 +507,9 @@ const readEventLog = (filePath) => {
 };
 const previousTask = previousStatePath ? readJsonFile(previousStatePath, {}).task : null;
 const shouldResumeTask = previousTask && ["accepted", "planning", "running", "waiting_for_approval", "verifying", "blocked"].includes(previousTask.status);
+const threadManager = new ThreadManager({ root: runtimeDataRoot, defaultWorkspaceRoot: previousTask?.workspaceRoot || repoRoot, providerCaps: DEFAULT_PROVIDER_CAPS });
+const restoredThread = previousTask?.threadId ? threadManager.thread(previousTask.threadId) : null;
+const defaultThread = restoredThread || threadManager.ensureDefaultThread({ workspaceRoot: previousTask?.workspaceRoot || repoRoot, task: previousTask });
 const sessionId = `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
 const sessionDir = path.join(sessionsDir, sessionId);
 const sessionEventsPath = path.join(sessionDir, "events.jsonl");
@@ -289,6 +522,11 @@ let agentTask = {
   id: shouldResumeTask ? previousTask.id : `task-${sessionId}`,
   objective: shouldResumeTask ? previousTask.objective : "Explore the Hemlock workspace",
   intent: shouldResumeTask ? previousTask.intent : "conversation",
+  interactionMode: shouldResumeTask ? (previousTask.interactionMode || "explore") : "explore",
+  threadId: shouldResumeTask ? (previousTask.threadId || defaultThread?.id || null) : (defaultThread?.id || null),
+  projectId: shouldResumeTask ? (previousTask.projectId || defaultThread?.projectId || null) : (defaultThread?.projectId || null),
+  workspaceRoot: shouldResumeTask ? (previousTask.workspaceRoot || defaultThread?.workspaceRoot || repoRoot) : (defaultThread?.workspaceRoot || repoRoot),
+  autonomy: shouldResumeTask ? (previousTask.autonomy || "bounded-local") : "bounded-local",
   phase: shouldResumeTask ? "resume" : "ready",
   status: shouldResumeTask ? "blocked" : "ready",
   foregroundStep: shouldResumeTask ? "Recovered unfinished task; inspect and resume" : "Waiting for a local task",
@@ -296,6 +534,9 @@ let agentTask = {
   steering: shouldResumeTask ? (previousTask.steering || []) : [],
   evidenceRefs: shouldResumeTask ? (previousTask.evidenceRefs || []) : [],
   blockedReason: shouldResumeTask ? `Hemlock restarted during the previous ${previousSessionId} session; no operation was resumed automatically.` : null,
+  artifactRepair: shouldResumeTask ? (previousTask.artifactRepair || { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
+  codeRepair: shouldResumeTask ? (previousTask.codeRepair || { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
+  metrics: shouldResumeTask ? (previousTask.metrics || { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 }) : { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 },
   startedAt: shouldResumeTask ? (previousTask.startedAt || new Date().toISOString()) : new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };
@@ -321,6 +562,81 @@ const artifactRegistry = new ArtifactRegistry({
 const previewSessions = new PreviewSessionManager({
   emit: (type, status, payload) => appendAgentEvent(type, status, payload, { reversible: true }),
 });
+const previewReportCache = new Map();
+const previewReportWaiters = new Map();
+
+function previewReportKey({ taskId, artifactId, revision, sessionId } = {}) {
+  return [taskId, artifactId, Number(revision), sessionId].join("|");
+}
+
+function previewReceiptPath(session) {
+  return path.join(artifactRegistry.artifactRoot(session.taskId, session.artifactId), "verification-receipts", `${session.id}.json`);
+}
+
+function recordPreviewReport(report = {}) {
+  const session = previewSessions.get(report.sessionId);
+  const artifact = artifactRegistry.read(session.taskId, session.artifactId);
+  const hasDomSummary = Boolean(report?.inspection?.dom || report?.inspection?.elements || typeof report?.inspection?.bodyText === "string");
+  if (!hasDomSummary) {
+    return { schema: "hemlock.agent.artifact.verification.v1", status: "pending", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, sessionId: session.id, issues: [{ code: "preview_report_incomplete", message: "The renderer report is waiting for its DOM summary." }], evidenceRefs: [artifactRegistry.manifestPath(session.taskId, session.artifactId)] };
+  }
+  const verification = verifyPreviewReport({ artifact, session, report });
+  const receipt = {
+    schema: "hemlock.agent.artifact.preview.receipt.v1",
+    createdAt: new Date().toISOString(),
+    report,
+    verification,
+  };
+  const receiptPath = previewReceiptPath(session);
+  fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
+  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+  const stored = { ...verification, receiptPath, evidenceRefs: [artifactRegistry.manifestPath(session.taskId, session.artifactId), receiptPath] };
+  previewReportCache.set(previewReportKey(session), stored);
+  previewSessions.recordReport(session.id, stored);
+  appendAgentEvent("artifact.verification.completed", stored.status, { verification: stored, artifactId: session.artifactId, revision: session.revision, sessionId: session.id }, { evidenceRefs: stored.evidenceRefs, reversible: true });
+  const waiter = previewReportWaiters.get(session.id);
+  if (waiter) {
+    clearTimeout(waiter.timer);
+    previewReportWaiters.delete(session.id);
+    bumpAgentMetrics({ previewWaitMs: Date.now() - waiter.startedAt });
+    waiter.resolve(stored);
+  }
+  return stored;
+}
+
+function awaitPreviewReport(session, timeoutMs = 8000) {
+  const cached = previewReportCache.get(previewReportKey(session));
+  if (cached) return Promise.resolve(cached);
+  const existing = previewReportWaiters.get(session.id);
+  if (existing) return existing.promise;
+  const startedAt = Date.now();
+  let resolveReport;
+  const promise = new Promise((resolve) => { resolveReport = resolve; });
+  const timer = setTimeout(() => {
+    previewReportWaiters.delete(session.id);
+    bumpAgentMetrics({ previewWaitMs: Date.now() - startedAt });
+    resolveReport({ schema: "hemlock.agent.artifact.verification.v1", status: "failed", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, sessionId: session.id, issues: [{ code: "preview_unavailable", message: "The renderer did not return a preview report before the bounded inspection timeout." }], consoleErrors: [], evidenceRefs: [] });
+  }, timeoutMs);
+  previewReportWaiters.set(session.id, { resolve: resolveReport, promise, timer, startedAt });
+  return promise;
+}
+
+function artifactCommandReceipt(result, command) {
+  if (!result || typeof result !== "object" || result.schema !== "hemlock.agent.artifact.v1") return result;
+  const manifestPath = artifactRegistry.manifestPath(result.taskId, result.id);
+  const revision = Number(result.revision || 0);
+  const revisionPath = revision ? path.join(artifactRegistry.artifactRoot(result.taskId, result.id), "revisions", `r${revision}`) : null;
+  if (revision) bumpAgentMetrics({ artifactRevisionCount: 1 });
+  return {
+    ...result,
+    manifestPath,
+    revisionPath,
+    artifactId: result.id,
+    sourceDigest: result.digest || null,
+    evidenceRefs: [manifestPath, ...(revisionPath ? [revisionPath] : [])],
+    summary: command === "artifact.create" ? `Created scratch artifact ${result.id}.` : `${command} recorded revision ${revision} for ${result.id}.`,
+  };
+}
 
 function writeAgentState() {
   const tempPath = `${sessionStatePath}.tmp`;
@@ -349,11 +665,28 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
   if (agentEvents.length > 160) agentEvents.shift();
   fs.appendFileSync(sessionEventsPath, `${JSON.stringify(event)}\n`, "utf-8");
   agentKernel?.ingestEvent(event);
+  if (agentTask.threadId && ["plan.proposed", "plan.approved", "inference.started", "inference.completed", "command.started", "command.completed", "artifact.repair.started", "artifact.repair.completed", "task.blocked", "task.completed", "thread.switched"].includes(type)) {
+    try {
+      threadManager.checkpoint(agentTask.threadId, {
+        taskId: agentTask.id,
+        phase: agentTask.phase,
+        status: agentTask.status,
+        activePlanStep: agentTask.activePlanId || null,
+        pendingAction: agentTask.activeActionId || null,
+        evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(event.evidenceRefs || [])])],
+        artifactRepair: agentTask.artifactRepair || null,
+        verificationIssues: agentTask.artifactRepair?.issues || agentTask.codeRepair?.issues || [],
+        reason: type,
+      });
+    } catch (checkpointError) {
+      console.warn(`[hemlock] checkpoint skipped: ${checkpointError.message}`);
+    }
+  }
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send("agent:event", event);
   return event;
 }
 
-function publishStreamFrame(stream, { delta = "", channel = "content", terminal = false, status = "running", usage = null, stopReason = null } = {}) {
+function emitStreamFrame(stream, { delta = "", channel = "content", terminal = false, status = "running", usage = null, stopReason = null, time = null } = {}) {
   if (!stream || stream.terminal) return;
   const frame = {
     schema: "hemlock.agent.stream.v1",
@@ -361,18 +694,16 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
     taskId: stream.taskId,
     operationId: stream.operationId,
     kind: stream.kind,
+    provider: stream.provider || "maple",
     channel: channel || "content",
     sequence: stream.sequence++,
     delta: String(delta || ""),
-    time: new Date().toISOString(),
+    time: time || new Date().toISOString(),
     terminal,
     status,
     usage,
     stopReason,
   };
-  if (!stream.channels[frame.channel]) stream.channels[frame.channel] = "";
-  stream.channels[frame.channel] += frame.delta;
-  if (frame.channel === "content") stream.text += frame.delta;
   if (terminal) stream.terminal = true;
   const ring = streamRing.get(stream.streamId) || [];
   ring.push(frame);
@@ -380,6 +711,25 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
   streamRing.set(stream.streamId, ring);
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send("agent:stream", frame);
   return frame;
+}
+
+function publishStreamFrame(stream, { delta = "", channel = "content", terminal = false, status = "running", usage = null, stopReason = null } = {}) {
+  if (!stream || stream.terminal) return;
+  const normalizedChannel = channel || "content";
+  const normalizedDelta = String(delta || "");
+  if (!stream.channels[normalizedChannel]) stream.channels[normalizedChannel] = "";
+  stream.channels[normalizedChannel] += normalizedDelta;
+  if (normalizedChannel === "content") stream.text += normalizedDelta;
+  const frame = { channel: normalizedChannel, delta: normalizedDelta, terminal, status, usage, stopReason, time: new Date().toISOString() };
+  if (terminal) {
+    stream.frameCoalescer?.flush();
+    return emitStreamFrame(stream, frame);
+  }
+  if (stream.frameCoalescer) {
+    stream.frameCoalescer.push(frame);
+    return null;
+  }
+  return emitStreamFrame(stream, frame);
 }
 
 function checkpointStream(stream, { force = false } = {}) {
@@ -400,10 +750,11 @@ function checkpointStream(stream, { force = false } = {}) {
   }, { reversible: true });
 }
 
-function startStream({ taskId = agentTask.id, operationId = null, kind = "model_text" } = {}) {
-  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, controller: null, abortReason: null };
+function startStream({ taskId = agentTask.id, operationId = null, kind = "model_text", provider = "maple" } = {}) {
+  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, provider, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, controller: null, abortReason: null, frameCoalescer: null };
+  stream.frameCoalescer = createStreamFrameCoalescer({ emit: (frame) => emitStreamFrame(stream, frame) });
   activeStreams.set(stream.streamId, stream);
-  appendAgentEvent(kind === "model_text" ? "inference.stream.started" : "operation.output.started", "running", { streamId: stream.streamId, taskId, operationId, kind });
+  appendAgentEvent(kind === "model_text" ? "inference.stream.started" : "operation.output.started", "running", { streamId: stream.streamId, taskId, operationId, kind, provider });
   return stream;
 }
 
@@ -457,13 +808,45 @@ const contextBroker = new ContextBroker({
 });
 contextBroker.state.sources = agentKernel.getSources();
 const contextSources = new ContextSourceRegistry({ repoRoot, kernel: agentKernel, broker: contextBroker });
+const codingWorkspace = new CodingWorkspace({
+  runtimeRoot: runtimeDataRoot,
+  threadManager,
+  emit: (type, status, payload, options) => appendAgentEvent(type, status, payload, options),
+});
 
 function updateAgentTask(patch, { emit = true } = {}) {
   agentTask = { ...agentTask, ...patch, updatedAt: new Date().toISOString() };
   writeAgentState();
   agentKernel?.syncTask(agentTask);
+  const activeThread = agentTask.threadId ? threadManager.thread(agentTask.threadId) : null;
+  if (activeThread) {
+    threadManager.updateThread(agentTask.threadId, {
+      title: agentTask.objective || activeThread.title,
+      provider: agentTask.provider,
+      model: agentTask.model,
+      reasoning: agentTask.reasoning,
+      autonomy: agentTask.autonomy,
+      status: agentTask.status,
+      phase: agentTask.phase,
+      taskId: agentTask.id,
+      activePlanId: agentTask.activePlanId || null,
+      activeActionId: agentTask.activeActionId || null,
+      taskSnapshot: agentTask,
+      blockedReason: agentTask.blockedReason || null,
+      evidenceRefs: agentTask.evidenceRefs || [],
+      metrics: agentTask.metrics || {},
+    });
+  }
   if (emit) appendAgentEvent("task.updated", agentTask.status, { task: agentTask });
   return agentTask;
+}
+
+function bumpAgentMetrics(patch = {}) {
+  const current = agentTask.metrics || { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 };
+  const metrics = { ...current };
+  for (const [key, value] of Object.entries(patch)) metrics[key] = Number(metrics[key] || 0) + Number(value || 0);
+  updateAgentTask({ metrics }, { emit: false });
+  return metrics;
 }
 
 function getAgentState() {
@@ -487,12 +870,15 @@ function getAgentState() {
         ...projection,
         artifacts,
         activeArtifactId,
-        activeStreams: [...activeStreams.values()].map((stream) => ({ ...stream, controller: undefined })),
+        activeStreams: [...activeStreams.values()].map((stream) => streamStateSnapshot(stream)),
         previewSession: [...previewSessions.sessions.values()].at(-1) || null,
         steering: agentTask.steering || [],
       } : null,
     },
     storageInventory: runtimeStorageInventory(),
+    providers: providerStatusSnapshot(),
+    threads: threadManager.snapshot(),
+    suggestions: threadManager.listSuggestions({ threadId: agentTask.threadId }),
     context: contextBroker.getState(),
     contextSources: contextSources.getState(),
     queue: agentIntentQueue?.snapshot() || { schema: "hemlock.agent.queue.v1", active: null, pending: [], count: 0 },
@@ -526,42 +912,111 @@ async function recordAgentMemory(payload = {}) {
 }
 
 function classifyIntent(text) {
-  const value = String(text || "").toLowerCase();
-  // Do not turn ordinary relational language into a work plan merely because
-  // it contains “make”, “create”, or “write”. Require a concrete software or
-  // artifact signal before routing into the bounded coding loop.
-  const codingRequest = /\b(code|implement|fix|bug|function|component|refactor|develop|artifact|animation|animated|html|css|javascript|typescript|canvas|svg|website|webpage|app|site|page|feature)\b/.test(value)
-    || /\b(create|make|write|design|build)\b[\s\S]*\b(code|artifact|animation|animated|html|css|javascript|typescript|canvas|svg|website|webpage|app|site|page|feature|component|function)\b/.test(value)
-    || /\b(build|design)\b[\s\S]*\b(site|app|page|html|css|javascript|component|feature|animation)\b/.test(value);
-  if (codingRequest) return "coding";
-  if (/\b(verify|test|check|lint|prove|run (?:the )?build)\b/.test(value)) return "verify";
-  if (/\b(improve|self.?improve|sips|train|dream|learn)\b/.test(value)) return "improve";
-  if (/\b(inspect|map|repo|files|codebase|status)\b/.test(value)) return "inspect";
-  if (/\b(remember|memory|recall|lesson)\b/.test(value)) return "memory";
-  return "conversation";
+  return classifyScopedIntent(text);
+}
+
+function resolveThreadForIntent(payload = {}, selection = {}) {
+  if (payload.threadId) {
+    const thread = threadManager.switchThread(String(payload.threadId));
+    if (payload.workspaceRoot && path.resolve(payload.workspaceRoot) !== path.resolve(thread.workspaceRoot || "")) {
+      throw new Error("The selected thread already has a different workspace directory.");
+    }
+    return thread;
+  }
+  if (payload.workspaceRoot && path.resolve(payload.workspaceRoot) !== path.resolve(agentTask.workspaceRoot || repoRoot)) {
+    return threadManager.createThread({
+      workspaceRoot: payload.workspaceRoot,
+      title: payload.title || payload.text || payload.objective || "New Hemlock thread",
+      provider: selection.provider,
+      model: selection.model,
+      reasoning: selection.reasoning,
+      autonomy: payload.autonomy || "bounded-local",
+    });
+  }
+  return threadManager.thread(agentTask.threadId) || threadManager.ensureDefaultThread({ workspaceRoot: payload.workspaceRoot || repoRoot, task: agentTask });
+}
+
+function compileThreadContext(threadId = agentTask.threadId, options = {}) {
+  const thread = threadManager.thread(threadId);
+  if (!thread) throw new Error(`Hemlock thread was not found: ${threadId}`);
+  const project = threadManager.project(thread.projectId);
+  const checkpoint = threadManager.latestCheckpoint(thread.id);
+  const compact = options.compact === true;
+  const checkpointSummary = checkpoint && compact ? {
+    schema: checkpoint.schema,
+    id: checkpoint.id,
+    threadId: checkpoint.threadId,
+    taskId: checkpoint.taskId,
+    projectId: checkpoint.projectId,
+    phase: checkpoint.phase,
+    status: checkpoint.status,
+    activePlanStep: checkpoint.activePlanStep,
+    pendingAction: checkpoint.pendingAction ? {
+      id: checkpoint.pendingAction.id || null,
+      step: checkpoint.pendingAction.step || null,
+      kind: checkpoint.pendingAction.kind || null,
+      commandId: checkpoint.pendingAction.commandId || null,
+      status: checkpoint.pendingAction.status || null,
+    } : null,
+    completedCommandSummaries: checkpoint.completedCommandSummaries || [],
+    evidenceRefs: checkpoint.evidenceRefs || [],
+    currentWorkspaceDigest: checkpoint.currentWorkspaceDigest || null,
+    lastGoodRevision: checkpoint.lastGoodRevision ?? null,
+    artifactRepair: checkpoint.artifactRepair || null,
+    verificationIssues: checkpoint.verificationIssues || [],
+    autonomyPolicy: checkpoint.autonomyPolicy || thread.autonomy,
+    reason: checkpoint.reason || null,
+  } : checkpoint;
+  return {
+    schema: "hemlock.agent.context.v1",
+    thread: { id: thread.id, title: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase, status: thread.status },
+    project: project ? { id: project.id, displayName: project.displayName, workspaceRoot: project.workspaceRoot, rootDigest: project.rootDigest, projectBrief: project.projectBrief || null } : null,
+    checkpoint: checkpointSummary ? { ...checkpointSummary, pendingAction: checkpointSummary.pendingAction || null, completedCommandSummaries: checkpointSummary.completedCommandSummaries || [], evidenceRefs: checkpointSummary.evidenceRefs || [] } : null,
+    workspace: thread.workspaceRoot ? { root: thread.workspaceRoot, digest: workspaceFingerprint(thread.workspaceRoot) } : null,
+    conversation: compact ? [] : threadManager.readConversation(thread.id),
+    suggestions: threadManager.listSuggestions({ threadId: thread.id, status: "unread" }).slice(-8).map((item) => compact ? ({ suggestionId: item.suggestionId, kind: item.kind, title: item.title, summary: item.summary, evidenceRefs: item.evidenceRefs }) : item),
+    claimBoundary: "This is compact host-owned context. It contains scoped task state and receipts, not an assertion that any unrecorded work occurred.",
+  };
 }
 
 async function processAgentIntent(payload = {}) {
-  const text = String(payload.text || payload.objective || "").trim();
+  const resolved = resolveInteraction(payload);
+  const text = resolved.text;
   if (!text) throw new Error("Hemlock needs an intent before it can create a task.");
-  const intent = String(payload.intent || classifyIntent(text));
+  const intent = String(payload.intent || resolved.intent);
+  const interactionMode = resolved.interactionMode;
+  const selection = normalizeSelection({ provider: payload.provider || payload.modelProvider, model: payload.model, reasoning: payload.reasoning });
+  const thread = resolveThreadForIntent(payload, selection);
   if (payload.apiBase) agentInferenceEndpoint = String(payload.apiBase).replace(/\/$/, "");
   const taskId = `task-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 7)}`;
   updateAgentTask({
     id: taskId,
     objective: text.slice(0, 1000),
     intent,
+    interactionMode,
+    threadId: thread?.id || null,
+    projectId: thread?.projectId || null,
+    workspaceRoot: thread?.workspaceRoot || repoRoot,
+    autonomy: payload.autonomy || thread?.autonomy || "bounded-local",
     phase: "recall",
     status: "accepted",
     foregroundStep: "Recall scoped context and prepare a bounded plan",
     budget: mergeBudget(DEFAULT_BUDGET),
     steering: [],
+    provider: selection.provider,
+    model: selection.model || null,
+    reasoning: selection.reasoning,
     evidenceRefs: [],
     blockedReason: null,
+    artifactRepair: { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
+    codeRepair: { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
+    metrics: { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 },
     startedAt: new Date().toISOString(),
   });
+  threadManager.checkpoint(agentTask.threadId, { taskId: taskId, phase: "conversation", status: "accepted", reason: "intent-accepted", provider: selection.provider, model: selection.model, reasoning: selection.reasoning, autonomyPolicy: agentTask.autonomy });
   appendAgentEvent("task.created", "accepted", { task: agentTask, source: payload.source || "command-center" });
-  appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 500), intent, source: payload.source || "command-center" });
+  appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 500), intent, interactionMode, source: payload.source || "command-center" });
+  threadManager.appendConversation(agentTask.threadId, { role: "user", content: text, provider: selection.provider, model: selection.model, reasoning: selection.reasoning });
 
   let context = null;
   try {
@@ -581,7 +1036,7 @@ async function processAgentIntent(payload = {}) {
   updateAgentTask({
     phase: intent === "conversation" ? "work" : "plan",
     status: intent === "conversation" ? "running" : "planning",
-    foregroundStep: intent === "conversation" ? "Maple-Preview is answering from the local conversation" : "Choose the next bounded action from context and evidence",
+    foregroundStep: intent === "conversation" ? `${selection.label} is answering from the selected Hemlock lane` : "Choose the next bounded action from context and evidence",
     evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(context?.evidenceRefs || []), ...(recall?.evidenceRefs || [])])],
   });
 
@@ -595,13 +1050,18 @@ async function processAgentIntent(payload = {}) {
     const inference = await runInference({
       apiBase: payload.apiBase,
       adapterPath: payload.adapterPath,
+      provider: selection.provider,
+      model: selection.model,
+      reasoning: selection.reasoning,
       messages,
       taskId: agentTask.id,
+      threadId: agentTask.threadId,
+      workspaceRoot: agentTask.workspaceRoot,
       operationId: payload.operationId || null,
       temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
       top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
       top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
-      max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : responseBudget(text),
+      max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
     });
     const choice = inference.payload?.choices?.[0]?.message || {};
     // Streaming responses carry text in ordered deltas, not in the final SSE
@@ -621,7 +1081,11 @@ async function processAgentIntent(payload = {}) {
       recovered: inference.recovered === true,
       usage: inference.payload?.usage || null,
       telemetry: inference.telemetry || null,
+      provider: selection.provider,
+      model: selection.model || null,
+      reasoning: selection.reasoning,
     };
+    threadManager.appendConversation(agentTask.threadId, { role: "assistant", content: answer, channels: conversation.channels, provider: selection.provider, model: selection.model, reasoning: selection.reasoning, rawOutputRef: conversation.rawOutputRef });
     appendAgentEvent("conversation.response", "passed", { conversation }, { reversible: true });
     return {
       schema: "hemlock.agent.intent.result.v1",
@@ -630,7 +1094,7 @@ async function processAgentIntent(payload = {}) {
       answer,
       conversation,
       inference,
-      claimBoundary: "This is a local Maple-Preview response backed by the inference operation; it is not a source mutation or general model-improvement claim.",
+      claimBoundary: `${selection.label} response backed by the selected provider inference operation; it is not a source mutation or general model-improvement claim.`,
     };
   }
 
@@ -676,14 +1140,284 @@ async function submitAgentIntent(payload = {}) {
   return agentIntentQueue.submit(payload);
 }
 
+function providerPrompt(messages, selection, { structured = false } = {}) {
+  const transcript = (Array.isArray(messages) ? messages : [])
+    .filter((message) => ["system", "user", "assistant"].includes(message?.role) && String(message?.content || "").trim())
+    .map((message) => `${String(message.role).toUpperCase()}: ${String(message.content).trim()}`)
+    .join("\n\n");
+  const taskInstruction = structured
+    ? "Return exactly one JSON object in the requested Hemlock action envelope. Do not wrap it in Markdown or add prose. If the action cannot be supported, return a JSON error object rather than pretending it happened."
+    : "Answer the user's latest message directly. Keep the response useful and concise. Do not claim that a file, command, tool, deployment, login, or model operation happened unless the Hemlock host supplied that evidence.";
+  return [
+    `You are the ${selection.label} lane inside Hemlock.`,
+    "Hemlock's Electron host owns all local actions, approvals, files, and receipts.",
+    "Do not run commands, edit files, use tools, or expose private chain-of-thought in this response lane.",
+    taskInstruction,
+    "Conversation context:",
+    transcript || "No prior context was provided.",
+  ].join("\n\n");
+}
+
+function recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, rawOutputRef = null, streamId = null, channels = {} } = {}) {
+  const detail = String(error?.message || error || "no usable provider output");
+  if (mode === "conversation" && taskId === agentTask.id) {
+    updateAgentTask({
+      phase: "blocked",
+      status: "blocked",
+      blockedReason: detail,
+      foregroundStep: "Provider inference blocked; inspect the command trace",
+      provider: selection.provider,
+      model: selection.model || null,
+      reasoning: selection.reasoning,
+    });
+  }
+  appendAgentEvent("inference.failed", "failed", {
+    taskId,
+    provider: selection.provider,
+    model: selection.model || null,
+    reasoning: selection.reasoning,
+    mode,
+    error: detail,
+    elapsedMs: startedAt ? Date.now() - startedAt : null,
+    streamId,
+    rawOutputRef,
+    channels: modelChannelRecords(channels, selection.provider),
+  });
+  if (selection.provider === "maple" && taskId === agentTask.id && agentTask.threadId) {
+    const existing = threadManager.listSuggestions({ threadId: agentTask.threadId, status: "unread" }).find((item) => item.kind === "provider-escalation");
+    if (!existing) {
+      const suggestion = threadManager.createSuggestion({
+        threadId: agentTask.threadId,
+        projectId: agentTask.projectId,
+        kind: "provider-escalation",
+        title: "Maple-Preview needs a provider decision",
+        summary: "The selected local Maple lane did not produce a usable response.",
+        reason: detail,
+        evidenceRefs: rawOutputRef ? [rawOutputRef] : [],
+        recommendedAction: { command: "task.escalate-provider", providers: ["codex", "claude"], requiresUserAction: true },
+      });
+      appendAgentEvent("suggestion.created", "candidate", { suggestion }, { evidenceRefs: suggestion.evidenceRefs, reversible: true });
+    }
+  }
+}
+
+function providerCommand(provider, selection, prompt, structured = false, cwd = repoRoot) {
+  const executable = resolveProviderExecutable(provider);
+  if (!executable) throw new Error(`${selection.label} CLI was not found. Open Settings to check installation and login.`);
+  if (provider === "codex") {
+    const args = [
+      "exec",
+      "--json",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "-C",
+      cwd,
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(selection.reasoning)}`,
+    ];
+    if (selection.model) args.push("-m", selection.model);
+    args.push(prompt);
+    return { executable, args };
+  }
+  const args = [
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--include-partial-messages",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--tools",
+    "",
+    "--effort",
+    selection.reasoning,
+    "--system-prompt",
+    providerPrompt([], selection, { structured }),
+  ];
+  if (selection.model) args.push("--model", selection.model);
+  args.push(prompt);
+  return { executable, args };
+}
+
+async function runCliInference(payload = {}, selection, { mode = "conversation", structured = false } = {}) {
+  if (!payload.__providerLease) {
+    return threadManager.withProvider(selection.provider, payload.threadId || payload.taskId || agentTask.threadId || agentTask.id, (lease) => runCliInference({ ...payload, __providerLease: true }, selection, { mode, structured }).then((result) => {
+      if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
+      return result;
+    }));
+  }
+  const taskId = payload.taskId || agentTask.id;
+  const taskRoot = payload.workspaceRoot || agentTask.workspaceRoot || repoRoot;
+  const startedAt = Date.now();
+  let command;
+  try {
+    command = providerCommand(selection.provider, selection, providerPrompt(payload.messages, selection, { structured }), structured, taskRoot);
+  } catch (error) {
+    recordCliInferenceFailure(error, { taskId, selection, mode, startedAt });
+    throw error;
+  }
+  const { executable, args } = command;
+  const stream = startStream({ taskId, operationId: payload.operationId || null, kind: "model_text", provider: selection.provider });
+  const parserState = { text: "" };
+  let stdoutBuffer = "";
+  let stderr = "";
+  let usage = null;
+  let lastError = null;
+  let timeoutHandle = null;
+  let child;
+  try {
+    child = spawn(executable, args, {
+      cwd: taskRoot,
+      env: { ...process.env, HEMLOCK_PROVIDER_LANE: selection.provider },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const startError = new Error(`${selection.label} could not start: ${error.message}`);
+    recordCliInferenceFailure(startError, { taskId, selection, mode, startedAt, streamId: stream.streamId, channels: stream.channels });
+    throw startError;
+  }
+  activeChildren.add(child);
+  stream.controller = {
+    abort(reason = "cancelled") {
+      stream.abortReason = reason;
+      if (!child.killed) child.kill("SIGTERM");
+    },
+  };
+
+  const processResult = await new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      activeChildren.delete(child);
+      callback(value);
+    };
+    const consume = (chunk) => {
+      stdoutBuffer += String(chunk || "");
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || "";
+      for (const line of lines) {
+        const parsed = parseProviderLine(selection.provider, line, parserState);
+        if (parsed.error) { lastError = parsed.error; continue; }
+        if (parsed.usage) usage = parsed.usage;
+        if (parsed.delta) publishStreamFrame(stream, { channel: "content", delta: parsed.delta, usage });
+      }
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", consume);
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk || ""); });
+    child.once("error", (error) => settle(resolve, { exitCode: null, signal: null, error }));
+    child.once("close", (exitCode, signal) => {
+      if (stdoutBuffer.trim()) consume("\n");
+      settle(resolve, { exitCode, signal });
+    });
+    timeoutHandle = setTimeout(() => {
+      stream.abortReason = "timeout";
+      if (!child.killed) child.kill("SIGTERM");
+    }, inferenceTimeoutMs);
+  });
+
+  const interrupted = stream.abortReason;
+  if (interrupted) {
+    finishStream(stream, { status: interrupted === "steering" ? "interrupted_by_steering" : "cancelled", stopReason: interrupted });
+    if (interrupted === "steering" && mode === "conversation") {
+      const steeringStart = Number.isInteger(payload.__steeringCount) ? payload.__steeringCount : 0;
+      const steering = (agentTask.steering || []).slice(steeringStart);
+      if (steering.length) {
+        appendAgentEvent("task.steering.restarted", "running", {
+          taskId,
+          provider: selection.provider,
+          model: selection.model || null,
+          steeringCount: steering.length,
+        }, { reversible: true });
+        return runCliInference({
+          ...payload,
+          __steeringCount: steeringStart + steering.length,
+          messages: [
+            ...(Array.isArray(payload.messages) ? payload.messages : []),
+            ...steering.map((item) => ({ role: "user", content: `Steering update: ${item.content}` })),
+          ],
+        }, selection, { mode, structured });
+      }
+    }
+    const error = new Error(`${selection.label} inference was ${interrupted}.`);
+    error.code = "CANCELLED";
+    throw error;
+  }
+  if (processResult.error || lastError || processResult.exitCode !== 0) {
+    const detail = lastError || processResult.error?.message || stderr.trim().slice(-600) || `${selection.label} exited with code ${processResult.exitCode ?? "-"}.`;
+    const error = new Error(`${selection.label} inference failed: ${detail}`);
+    const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-failed`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
+    finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
+    error.rawOutputRef = rawOutputRef;
+    recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, rawOutputRef, streamId: stream.streamId, channels: stream.channels });
+    throw error;
+  }
+  if (!stream.text.trim()) {
+    const error = new Error(`${selection.label} returned no final response.`);
+    const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-empty`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
+    finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
+    error.rawOutputRef = rawOutputRef;
+    recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, rawOutputRef, streamId: stream.streamId, channels: stream.channels });
+    throw error;
+  }
+  const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode, usage } });
+  finishStream(stream, { status: "completed", stopReason: "provider_cli_completed", usage, rawOutputRef });
+  const answer = stream.text.trim();
+  const channels = modelChannelRecords(stream.channels, selection.provider);
+  const telemetry = {
+    provider: selection.provider,
+    model: selection.model || "provider-default",
+    reasoning: selection.reasoning,
+    elapsedMs: Date.now() - startedAt,
+    finishReason: "provider_cli_completed",
+    promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null,
+    completionTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null,
+    outputDigest: streamDigest(JSON.stringify(stream.channels)),
+    contentDigest: digestText(answer),
+    streamId: stream.streamId,
+    streaming: true,
+    bufferedFallback: false,
+    modelChannels: channels.map(({ name, digest }) => ({ name, digest })),
+  };
+  appendAgentEvent("inference.completed", "passed", { provider: selection.provider, model: selection.model || null, reasoning: selection.reasoning, rawOutputRef, channels, telemetry, mode });
+  if (mode === "conversation") updateAgentTask({ phase: "complete", status: "completed", foregroundStep: "Ready for the next local task", blockedReason: null, provider: selection.provider, model: selection.model || null, reasoning: selection.reasoning });
+  return {
+    schema: "hemlock.agent.inference.result.v1",
+    status: "passed",
+    provider: selection.provider,
+    model: selection.model,
+    reasoning: selection.reasoning,
+    answer,
+    channels,
+    rawOutputRef,
+    telemetry,
+    processReady: true,
+    inferenceReady: true,
+    payload: { choices: [{ message: { role: "assistant", content: answer }, finish_reason: "provider_cli_completed" }], usage },
+  };
+}
+
 async function runInference(payload = {}) {
   const initialMessages = Array.isArray(payload.messages) ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })) : [];
+  const selection = normalizeSelection({ provider: payload.provider || payload.modelProvider || agentTask.provider, model: payload.model || agentTask.model, reasoning: payload.reasoning || agentTask.reasoning });
+  if (!payload.__providerLease) {
+    return threadManager.withProvider(selection.provider, payload.threadId || payload.taskId || agentTask.threadId || agentTask.id, (lease) => runInference({ ...payload, __providerLease: true }, { __providerLease: true }).then((result) => {
+      if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
+      return result;
+    }));
+  }
+  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: initialMessages }, selection, { mode: "conversation" });
   const requestedAdapter = String(payload.adapterPath || "");
   const endpoint = String(payload.apiBase || serverUrl).replace(/\/$/, "");
   const startedAt = Date.now();
   let messages = initialMessages;
   let recovered = false;
-  let stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text" });
+  let stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
   let responsePayload = {};
   let rawPayloads = [];
   let finishReason = null;
@@ -701,8 +1435,9 @@ async function runInference(payload = {}) {
         temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
         top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
         top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
-        max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : responseBudget(initialMessages.at(-1)?.content || ""),
+        max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
         stream: true,
+        chat_template_kwargs: { enable_thinking: true },
       };
       let response = await fetch(`${endpoint}/v1/chat/completions`, {
         method: "POST",
@@ -749,7 +1484,7 @@ async function runInference(payload = {}) {
             if (parsed.done) { done = true; break; }
             if (!parsed.payload) continue;
             const delta = extractModelDelta(parsed.payload);
-            rawPayloads.push(parsed.payload);
+            rawPayloads.push(compactModelPayload(parsed.payload));
             if (delta.channels.length) {
               for (const channel of delta.channels) publishStreamFrame(stream, { channel: channel.name, delta: channel.text, usage: delta.usage, stopReason: delta.finishReason });
               checkpointStream(stream);
@@ -793,6 +1528,9 @@ async function runInference(payload = {}) {
       const rawOutputRef = persistModelOutput({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId || null, streamId: stream.streamId, mode: "conversation", channels: stream.channels, rawPayload: rawPayloads.length ? rawPayloads : responsePayload });
       finishStream(stream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
       const telemetry = {
+        provider: "maple",
+        model: "default_model",
+        reasoning: "native",
         elapsedMs: Date.now() - startedAt,
         finishReason,
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
@@ -821,7 +1559,7 @@ async function runInference(payload = {}) {
       appendAgentEvent("conversation.episode.completed", "passed", { episode }, { reversible: true });
       updateAgentTask({ phase: "complete", status: "completed", foregroundStep: "Ready for the next local task", blockedReason: null });
       appendAgentEvent("inference.completed", "passed", { adapterPath: recovered ? null : requestedAdapter || null, recovered, usage: usage || responsePayload.usage || null, telemetry, channels, rawOutputRef });
-      return { schema: "hemlock.agent.inference.result.v1", status: "passed", payload: responsePayload, recovered, adapterPath: recovered ? "" : requestedAdapter, processReady: true, inferenceReady: true, telemetry, answer: answerText, channels, rawOutputRef };
+      return { schema: "hemlock.agent.inference.result.v1", status: "passed", provider: "maple", model: "default_model", reasoning: "native", payload: responsePayload, recovered, adapterPath: recovered ? "" : requestedAdapter, processReady: true, inferenceReady: true, telemetry, answer: answerText, channels, rawOutputRef };
     } catch (error) {
       const reason = stream.abortReason;
       const interruptedRawOutputRef = persistModelOutput({
@@ -1025,11 +1763,12 @@ function prepareTrainingDataset(payload = {}) {
   return manifest;
 }
 
-function scopedRepoPath(inputPath = ".") {
-  const candidate = path.resolve(repoRoot, String(inputPath || "."));
-  const relative = path.relative(repoRoot, candidate);
+function scopedRepoPath(inputPath = ".", root = agentTask.workspaceRoot || repoRoot) {
+  const workspaceRoot = path.resolve(root || repoRoot);
+  const candidate = path.resolve(workspaceRoot, String(inputPath || "."));
+  const relative = path.relative(workspaceRoot, candidate);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    const error = new Error(`Path is outside the current Hemlock repository: ${inputPath}`);
+    const error = new Error(`Path is outside the current Hemlock workspace: ${inputPath}`);
     error.code = "SCOPE_OUTSIDE_REPO";
     throw error;
   }
@@ -1037,55 +1776,60 @@ function scopedRepoPath(inputPath = ".") {
 }
 
 function repoInspect(payload = {}) {
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
   const requested = Array.isArray(payload.paths) && payload.paths.length ? payload.paths : ["dream-chat", "docs", "README.md", "state.yaml"];
   const files = requested.flatMap((item) => {
-    const absolute = scopedRepoPath(item);
+    const absolute = scopedRepoPath(item, workspaceRoot);
     if (!fs.existsSync(absolute)) return [];
-    if (fs.statSync(absolute).isFile()) return [path.relative(repoRoot, absolute)];
-    return walkFiles(absolute, () => true).slice(0, 80).map((filePath) => path.relative(repoRoot, filePath));
+    if (fs.statSync(absolute).isFile()) return [path.relative(workspaceRoot, absolute)];
+    return walkFiles(absolute, () => true).slice(0, 80).map((filePath) => path.relative(workspaceRoot, filePath));
   }).slice(0, 160);
   return {
     schema: "hemlock.agent.repo.inspection.v1",
     status: "passed",
-    root: repoRoot,
+    root: workspaceRoot,
     requested,
     files,
     fileCount: files.length,
     summary: `Inspected ${files.length} scoped repository paths.`,
-    evidenceRefs: [`repo://${repoRoot}`],
+    evidenceRefs: [`repo://${workspaceRoot}`],
   };
 }
 
 function readFileTool(payload = {}) {
-  const absolute = scopedRepoPath(payload.path || "README.md");
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
+  const absolute = scopedRepoPath(payload.path || "README.md", workspaceRoot);
   if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) throw new Error(`Scoped file was not found: ${payload.path}`);
   const maxBytes = Math.min(Math.max(Number(payload.maxBytes || 20000), 256), 50000);
   const content = fs.readFileSync(absolute, "utf-8");
   const truncated = Buffer.byteLength(content) > maxBytes;
   const excerpt = truncated ? content.slice(0, maxBytes) : content;
-  return { schema: "hemlock.agent.file.read.v1", status: "passed", path: path.relative(repoRoot, absolute), content: excerpt, truncated, bytes: Buffer.byteLength(content), summary: `Read ${path.relative(repoRoot, absolute)}${truncated ? " (bounded excerpt)" : ""}.`, evidenceRefs: [`file://${absolute}`] };
+  return { schema: "hemlock.agent.file.read.v1", status: "passed", path: path.relative(workspaceRoot, absolute), content: excerpt, truncated, bytes: Buffer.byteLength(content), summary: `Read ${path.relative(workspaceRoot, absolute)}${truncated ? " (bounded excerpt)" : ""}.`, evidenceRefs: [`file://${absolute}`] };
 }
 
 async function searchFilesTool(payload = {}) {
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
   const query = String(payload.query || payload.pattern || "").trim();
   if (!query) throw new Error("file.search needs a query.");
-  const target = scopedRepoPath(payload.path || ".");
-  const result = await runChild("rg", ["--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "40", query, target], { cwd: repoRoot, timeoutMs: 30000 });
+  const target = scopedRepoPath(payload.path || ".", workspaceRoot);
+  const result = await runChild("rg", ["--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "40", query, target], { cwd: workspaceRoot, timeoutMs: 30000 });
   if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error(result.stderr || `file.search failed with exit code ${result.exitCode}`);
-  return { schema: "hemlock.agent.file.search.v1", status: "passed", query, path: path.relative(repoRoot, target) || ".", matches: result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 120), matchCount: result.stdout.split(/\r?\n/).filter(Boolean).length, summary: `Search completed for ${JSON.stringify(query)}.`, evidenceRefs: [`repo://${repoRoot}`] };
+  return { schema: "hemlock.agent.file.search.v1", status: "passed", query, path: path.relative(workspaceRoot, target) || ".", matches: result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 120), matchCount: result.stdout.split(/\r?\n/).filter(Boolean).length, summary: `Search completed for ${JSON.stringify(query)}.`, evidenceRefs: [`repo://${workspaceRoot}`] };
 }
 
-async function gitStatusTool() {
-  const result = await runChild("git", ["status", "--short", "--branch"], { cwd: repoRoot, timeoutMs: 30000 });
-  return { schema: "hemlock.agent.git.status.v1", status: result.exitCode === 0 ? "passed" : "failed", branch: result.stdout.split(/\r?\n/)[0] || "", statusShort: result.stdout.trim(), exitCode: result.exitCode, summary: result.exitCode === 0 ? "The worktree status was read." : result.stderr || "Git status failed.", evidenceRefs: [`git://${repoRoot}/status`] };
+async function gitStatusTool(payload = {}) {
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
+  const result = await runChild("git", ["status", "--short", "--branch"], { cwd: workspaceRoot, timeoutMs: 30000 });
+  return { schema: "hemlock.agent.git.status.v1", status: result.exitCode === 0 ? "passed" : "failed", branch: result.stdout.split(/\r?\n/)[0] || "", statusShort: result.stdout.trim(), exitCode: result.exitCode, summary: result.exitCode === 0 ? "The worktree status was read." : result.stderr || "Git status failed.", evidenceRefs: [`git://${workspaceRoot}/status`] };
 }
 
 async function gitDiffTool(payload = {}) {
-  const paths = Array.isArray(payload.paths) ? payload.paths.map((item) => path.relative(repoRoot, scopedRepoPath(item))) : [];
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
+  const paths = Array.isArray(payload.paths) ? payload.paths.map((item) => path.relative(workspaceRoot, scopedRepoPath(item, workspaceRoot))) : [];
   const args = ["diff", "--no-ext-diff", "--binary"];
   if (paths.length) args.push("--", ...paths);
-  const result = await runChild("git", args, { cwd: repoRoot, timeoutMs: 30000 });
-  return { schema: "hemlock.agent.git.diff.v1", status: result.exitCode === 0 ? "passed" : "failed", diff: result.stdout.slice(0, 30000), truncated: result.stdout.length > 30000, paths, exitCode: result.exitCode, summary: result.exitCode === 0 ? "The scoped diff was read without mutation." : result.stderr || "Git diff failed.", evidenceRefs: [`git://${repoRoot}/diff`] };
+  const result = await runChild("git", args, { cwd: workspaceRoot, timeoutMs: 30000 });
+  return { schema: "hemlock.agent.git.diff.v1", status: result.exitCode === 0 ? "passed" : "failed", diff: result.stdout.slice(0, 30000), truncated: result.stdout.length > 30000, paths, exitCode: result.exitCode, summary: result.exitCode === 0 ? "The scoped diff was read without mutation." : result.stderr || "Git diff failed.", evidenceRefs: [`git://${workspaceRoot}/diff`] };
 }
 
 function testDiscover() {
@@ -1133,7 +1877,26 @@ const agentCommands = {
   recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false },
-  "inference.respond": { label: "Run local inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
+  "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "thread.rename": { label: "Rename Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.pause": { label: "Pause Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.resume": { label: "Resume Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "context.compile": { label: "Compile compact thread context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "task.checkpoint": { label: "Record task checkpoint", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "task.escalate-provider": { label: "Escalate task provider", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "suggestion.list": { label: "List Hemlock suggestions", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "suggestion.accept": { label: "Accept Hemlock suggestion", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "suggestion.snooze": { label: "Snooze Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "inference.respond": { label: "Run selected provider inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
   "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -1145,8 +1908,12 @@ const agentCommands = {
   "task.block": { label: "Block task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "training.prepare": { label: "Prepare Dream dataset", capability: "training-preparation", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "training.start": { label: "Start explicit Dream training", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000 },
+  "maple.launch": { label: "Launch Maple/Dream runtime", capability: "runtime", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true },
   verify: { label: "Run verification", capability: "verify", auto: true, approval: "none", timeoutMs: 300000 },
   "change.prepare": { label: "Prepare isolated change set", capability: "write-preparation", auto: true, approval: "none", timeoutMs: 30000, reversible: true },
+  "code.inspect": { label: "Inspect assigned coding workspace", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
+  "code.apply": { label: "Apply scoped coding edit", capability: "write", auto: true, approval: "plan", timeoutMs: 30000, reversible: true },
+  "code.rollback": { label: "Roll back coding change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true },
   "change.apply": { label: "Apply plan-approved change set", capability: "write", auto: false, approval: "plan", timeoutMs: 30000, reversible: true },
   "change.approve": { label: "Apply approved change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true },
   "change.reject": { label: "Reject prepared change set", capability: "write-preparation", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -1167,6 +1934,9 @@ const agentCommands = {
   "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
   "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
+  "artifact.restore": { label: "Restore a verified artifact revision", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
+  "artifact.repair.retry": { label: "Retry artifact repair", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: false },
+  "artifact.repair.use-last-good": { label: "Use last good artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.inspect": { label: "Inspect task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.compare": { label: "Compare artifact revisions", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.freeze": { label: "Freeze artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
@@ -1198,9 +1968,65 @@ async function runAgentCommand(action, payload = {}) {
   try {
     let result;
     if (command === "intent.submit") result = await submitAgentIntent({ ...payload, operationId: payload.operationId || operation.id });
+    else if (command === "thread.list") result = threadManager.snapshot();
+    else if (command === "provider.capacity") result = { schema: "hemlock.agent.provider.capacity.v1", status: "updated", providerCaps: threadManager.setProviderCaps(payload.caps || payload) };
+    else if (command === "thread.create") {
+      const thread = threadManager.createThread(payload);
+      result = { schema: "hemlock.agent.thread.result.v1", status: "created", thread, threads: threadManager.snapshot().threads };
+    }
+    else if (command === "thread.switch") {
+      const thread = threadManager.switchThread(String(payload.threadId || ""));
+      if (thread.taskSnapshot && typeof thread.taskSnapshot === "object") {
+        agentTask = { ...thread.taskSnapshot, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy };
+      } else {
+        agentTask = { ...agentTask, id: thread.taskId || `task-${thread.id}`, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, objective: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase || "conversation", status: thread.status || "ready", blockedReason: thread.blockedReason || null };
+      }
+      writeAgentState();
+      agentKernel.syncTask(agentTask);
+      appendAgentEvent("thread.switched", "accepted", { threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot }, { reversible: true });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "switched", thread, task: agentTask, context: compileThreadContext(thread.id), conversation: threadManager.readConversation(thread.id) };
+    }
+    else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
+    else if (command === "thread.pause") {
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const checkpoint = threadManager.checkpoint(threadId, { taskId: agentTask.id, phase: "paused", status: "paused", reason: payload.reason || "paused-by-user", evidenceRefs: agentTask.evidenceRefs, artifactRepair: agentTask.artifactRepair, verificationIssues: agentTask.artifactRepair?.issues || [] });
+      abortStreamsForTask(agentTask.id, "paused");
+      updateAgentTask({ status: "paused", phase: "paused", foregroundStep: "Thread paused; resume explicitly to continue" });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "paused", thread: threadManager.pauseThread(threadId, payload.reason || "Paused by user"), checkpoint };
+    }
+    else if (command === "thread.resume") {
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const thread = threadManager.resumeThread(threadId);
+      result = { schema: "hemlock.agent.thread.result.v1", status: "resumable", thread, checkpoint: threadManager.latestCheckpoint(threadId), context: compileThreadContext(threadId) };
+    }
+    else if (command === "thread.archive") result = { schema: "hemlock.agent.thread.result.v1", status: "archived", thread: threadManager.archiveThread(String(payload.threadId || agentTask.threadId)) };
+    else if (command === "thread.cancel") result = { schema: "hemlock.agent.thread.result.v1", status: "cancelled", thread: threadManager.cancelThread(String(payload.threadId || agentTask.threadId)) };
+    else if (command === "project.list") result = { schema: "hemlock.agent.project.result.v1", status: "ready", projects: threadManager.snapshot().projects };
+    else if (command === "project.register") result = { schema: "hemlock.agent.project.result.v1", status: "registered", project: threadManager.registerProject(payload) };
+    else if (command === "project.select") {
+      const project = threadManager.project(String(payload.projectId || "")) || threadManager.registerProject(payload);
+      result = { schema: "hemlock.agent.project.result.v1", status: "selected", project, threads: threadManager.snapshot().threads.filter((item) => item.projectId === project.id) };
+    }
+    else if (command === "context.compile") result = compileThreadContext(String(payload.threadId || agentTask.threadId));
+    else if (command === "task.checkpoint") result = threadManager.checkpoint(String(payload.threadId || agentTask.threadId), { ...payload, taskId: payload.taskId || agentTask.id, phase: payload.phase || agentTask.phase, status: payload.status || agentTask.status, evidenceRefs: payload.evidenceRefs || agentTask.evidenceRefs, artifactRepair: payload.artifactRepair || agentTask.artifactRepair, autonomyPolicy: payload.autonomy || agentTask.autonomy });
+    else if (command === "task.escalate-provider") {
+      const provider = String(payload.provider || "");
+      if (!["maple", "codex", "claude"].includes(provider)) throw new Error(`Unsupported provider escalation target: ${provider}`);
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const thread = threadManager.updateThread(threadId, { provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", blockedReason: null });
+      updateAgentTask({ provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", foregroundStep: `Provider changed to ${provider}; resume explicitly to continue` });
+      result = { schema: "hemlock.agent.provider.escalation.v1", status: "escalated", provider, thread };
+    }
+    else if (command === "suggestion.list") result = { schema: "hemlock.agent.suggestion.result.v1", status: "ready", suggestions: threadManager.listSuggestions({ threadId: payload.threadId || agentTask.threadId, status: payload.status }) };
+    else if (["suggestion.accept", "suggestion.dismiss", "suggestion.snooze"].includes(command)) {
+      const status = command.split(".")[1] === "accept" ? "accepted" : command.split(".")[1] === "dismiss" ? "dismissed" : "snoozed";
+      const suggestion = threadManager.transitionSuggestion(String(payload.suggestionId || ""), status);
+      result = { schema: "hemlock.agent.suggestion.result.v1", status, suggestion };
+    }
     else if (command === "inference.respond") result = await runInference(payload);
     else if (command === "training.prepare") result = prepareTrainingDataset(payload);
     else if (command === "training.start") result = await runDream(payload);
+    else if (command === "maple.launch") result = await launchMapleRuntime();
     else if (command === "status") result = await runSipsRuntime({ action: "status" });
     else if (command === "context.refresh") result = await contextBroker.refresh({ reason: payload.reason || "command" });
     else if (command === "context.search") result = contextBroker.search(payload.query || "");
@@ -1212,19 +2038,27 @@ async function runAgentCommand(action, payload = {}) {
       appendAgentEvent("context.source.policy.updated", "passed", result, { reversible: true });
     }
     else if (command === "routes") result = await runSipsRuntime({ action: "routes" });
-    else if (command === "repo-map") result = await repoMap();
+    else if (command === "repo-map") result = await repoMap(payload);
     else if (command === "repo.inspect") result = repoInspect(payload);
     else if (command === "file.read") result = readFileTool(payload);
     else if (command === "file.search") result = await searchFilesTool(payload);
-    else if (command === "git.status") result = await gitStatusTool();
+    else if (command === "code.inspect") result = codingWorkspace.inspect({ threadId: payload.threadId || agentTask.threadId });
+    else if (command === "code.apply") {
+      if (payload.__fromAgentAction && !approvedPlanAction) throw new Error("Applying a coding edit requires an approved Hemlock plan action.");
+      result = codingWorkspace.apply({ threadId: payload.threadId || agentTask.threadId, source: payload.source, patches: payload.patches, baseDigests: payload.baseDigests, reason: payload.reason || agentTask.objective });
+      updateAgentTask({ evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(result.evidenceRefs || [])])], foregroundStep: "Scoped coding edit applied; verification is next" });
+    }
+    else if (command === "code.rollback") result = codingWorkspace.rollback({ threadId: payload.threadId || agentTask.threadId, changeSetId: payload.changeSetId });
+    else if (command === "git.status") result = await gitStatusTool(payload);
     else if (command === "git.diff") result = await gitDiffTool(payload);
     else if (command === "test.discover") result = testDiscover();
     else if (command === "verification.list") result = verificationList();
     else if (command === "receipt.inspect") result = inspectReceipt(payload);
     else if (command === "receipts.query") result = queryReceipts(payload);
-    else if (command === "artifact.create") result = artifactRegistry.create({ ...payload, taskId: payload.taskId || agentTask.id });
-    else if (command === "artifact.author") result = artifactRegistry.author({ ...payload, taskId: payload.taskId || agentTask.id });
-    else if (command === "artifact.update") result = artifactRegistry.update({ ...payload, taskId: payload.taskId || agentTask.id });
+    else if (command === "artifact.create") result = artifactCommandReceipt(artifactRegistry.create({ ...payload, taskId: payload.taskId || agentTask.id }), command);
+    else if (command === "artifact.author") result = artifactCommandReceipt(artifactRegistry.author({ ...payload, taskId: payload.taskId || agentTask.id }), command);
+    else if (command === "artifact.update") result = artifactCommandReceipt(artifactRegistry.update({ ...payload, taskId: payload.taskId || agentTask.id }), command);
+    else if (command === "artifact.restore") result = artifactRegistry.restore({ ...payload, taskId: payload.taskId || agentTask.id });
     else if (command === "artifact.inspect") result = artifactRegistry.inspect({ ...payload, taskId: payload.taskId || agentTask.id });
     else if (command === "artifact.compare") result = artifactRegistry.compare({ ...payload, taskId: payload.taskId || agentTask.id });
     else if (command === "artifact.freeze") result = artifactRegistry.freeze({ ...payload, taskId: payload.taskId || agentTask.id });
@@ -1232,13 +2066,22 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "artifact.preview.open") {
       const artifact = artifactRegistry.read(payload.taskId || agentTask.id, payload.artifactId);
       const session = previewSessions.open({ taskId: artifact.taskId, artifactId: artifact.id, revision: payload.revision || artifact.revision });
-      appendAgentEvent("artifact.preview.ready", "ready", { session, artifactId: artifact.id, revision: session.revision }, { evidenceRefs: [artifactRegistry.manifestPath(artifact.taskId, artifact.id)], reversible: true });
-      result = { schema: "hemlock.agent.preview.open.v1", status: "ready", session, artifact };
+      const evidenceRefs = [artifactRegistry.manifestPath(artifact.taskId, artifact.id)];
+      appendAgentEvent("artifact.preview.ready", "ready", { session, artifactId: artifact.id, revision: session.revision }, { evidenceRefs, reversible: true });
+      appendAgentEvent("artifact.preview.inspection.requested", "running", { taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, sessionId: session.id, checks: ["ready", "dom", "accessibility", "consoleErrors"] }, { evidenceRefs, reversible: true });
+      result = { schema: "hemlock.agent.preview.open.v1", status: "ready", session, artifact, evidenceRefs, summary: `Opened preview session ${session.id} for revision ${session.revision}.` };
     }
     else if (command === "artifact.preview.inspect") {
-      const session = previewSessions.inspect(payload.sessionId, { digest: payload.digest, inspection: payload.inspection });
-      appendAgentEvent("artifact.inspection.completed", "passed", { session, inspection: payload.inspection || null, digest: payload.digest || null }, { reversible: true });
-      result = { schema: "hemlock.agent.preview.inspect.v1", status: "passed", session };
+      const session = previewSessions.get(payload.sessionId);
+      const artifact = artifactRegistry.read(session.taskId, session.artifactId);
+      const staticVerification = verifyArtifactSource(artifact);
+      const report = payload.report?.schema === "hemlock.agent.artifact.preview.report.v1" ? recordPreviewReport(payload.report) : payload.inspection ? recordPreviewReport({ schema: "hemlock.agent.artifact.preview.report.v1", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, sessionId: session.id, ready: true, inspection: payload.inspection, consoleErrors: payload.consoleErrors || [], inspectionDigest: payload.digest || null }) : awaitPreviewReport(session);
+      const verification = report?.schema === "hemlock.agent.artifact.verification.v1" ? { ...report, static: report.static || staticVerification, issues: [...(staticVerification.issues || []), ...(report.issues || [])] } : { ...report, static: staticVerification, issues: staticVerification.issues || [] };
+      const status = verification.status === "passed" && !verification.issues.length && staticVerification.status === "passed" ? "passed" : "blocked";
+      const evidenceRefs = [...new Set([...(verification.evidenceRefs || []), artifactRegistry.manifestPath(session.taskId, session.artifactId), ...(verification.receiptPath ? [verification.receiptPath] : [])])];
+      const finalVerification = { ...verification, schema: "hemlock.agent.artifact.verification.v1", status: status === "passed" ? "passed" : "failed", evidenceRefs };
+      appendAgentEvent("artifact.inspection.completed", status, { session, verification: finalVerification, inspection: payload.inspection || report?.inspection || null, digest: payload.digest || report?.inspectionDigest || null }, { evidenceRefs, reversible: true });
+      result = { schema: "hemlock.agent.preview.inspect.v1", status, session: previewSessions.inspect(session.id, { digest: finalVerification.inspectionDigest, inspection: report?.inspection || payload.inspection }), verification: finalVerification, inspectionReceiptPath: verification.receiptPath || null, evidenceRefs, summary: status === "passed" ? `Preview verification passed for revision ${session.revision}.` : `Preview verification needs repair: ${(finalVerification.issues || []).map((item) => item.message).join(" ")}` };
     }
     else if (command === "artifact.preview.interact") {
       const authorization = previewSessions.authorize(payload.sessionId, String(payload.previewAction || payload.action || ""), payload);
@@ -1255,7 +2098,7 @@ async function runAgentCommand(action, payload = {}) {
       result = await runSipsRuntime({ action: "recall", query: payload.query, limit: payload.limit });
       appendAgentEvent("memory.recalled", "passed", { query: payload.query || "", count: result.records?.length || 0, records: result.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
     }
-    else if (command === "verify") result = await runVerification(String(payload.profile || "app-build"), emitSipsProgress, { operationId: operation.id });
+    else if (command === "verify") result = await runVerification(String(payload.profile || "app-build"), emitSipsProgress, { operationId: operation.id, workspaceRoot: payload.workspaceRoot || agentTask.workspaceRoot });
     else if (command === "change.prepare") result = await prepareChangeSet(payload);
     else if (command === "change.apply") {
       if (!approvedPlanAction) throw new Error("Applying a change set requires an approved Hemlock plan action.");
@@ -1292,6 +2135,8 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "task.ask") result = agentOrchestrator.askUser(String(payload.taskId || agentTask.id), String(payload.question || payload.prompt || ""), payload.context || {});
     else if (command === "task.complete") result = agentOrchestrator.completeTask(String(payload.taskId || agentTask.id), String(payload.reason || "Completed by user"));
     else if (command === "task.block") result = agentOrchestrator.blockTask(String(payload.taskId || agentTask.id), String(payload.reason || "Blocked by user"));
+    else if (command === "artifact.repair.retry") result = await agentOrchestrator.retryArtifactRepair(String(payload.taskId || agentTask.id));
+    else if (command === "artifact.repair.use-last-good") result = await agentOrchestrator.useLastGoodArtifact(String(payload.taskId || agentTask.id));
     const operationResult = result && typeof result === "object" ? { ...result, operationId: result.operationId || operation.id } : result;
     const completionStatus = operationResult?.status === "blocked" ? "blocked" : "passed";
     const evidenceRefs = operationResult?.receiptPath ? [operationResult.receiptPath] : operationResult?.evidenceRefs || [];
@@ -1306,18 +2151,63 @@ async function runAgentCommand(action, payload = {}) {
 }
 
 async function inferStructuredAction(prompt) {
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  if (!prompt.__providerLease) {
+    return threadManager.withProvider(selection.provider, agentTask.threadId || agentTask.id, (lease) => inferStructuredAction({ ...prompt, __providerLease: true }).then((result) => {
+      if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
+      return result;
+    }));
+  }
   const endpoint = agentInferenceEndpoint || serverUrl;
   const task = agentTask;
   const startedAt = Date.now();
+  bumpAgentMetrics({ inferenceCalls: 1, repairCalls: prompt.repair?.schema === "hemlock.agent.artifact.repair.v1" ? 1 : 0 });
   const nextCommand = prompt.nextPlannedStep?.commandId || prompt.plan?.steps?.[prompt.history?.actions?.length || 0]?.commandId || "";
+  const compactTask = {
+    id: task.id,
+    objective: task.objective,
+    intent: task.intent,
+    interactionMode: task.interactionMode,
+    threadId: task.threadId || null,
+    projectId: task.projectId || null,
+    workspaceRoot: task.workspaceRoot || null,
+    autonomy: task.autonomy || "bounded-local",
+  };
+  const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
+  const actionRequest = {
+    task: compactTask,
+    context: compactContext,
+    nextStep: prompt.nextPlannedStep || null,
+    completed: prompt.history || { actions: [], observations: [], operations: [] },
+    repair: prompt.repair || null,
+  };
   const messages = [
     { role: "system", content: prompt.system },
-    { role: "user", content: JSON.stringify({ task, plan: prompt.plan, history: prompt.history, repair: prompt.repair || null }) },
+    { role: "user", content: JSON.stringify(actionRequest) },
   ];
-  appendAgentEvent("inference.started", "running", { mode: "structured-action", taskId: task.id, step: prompt.history?.actions?.length + 1 || 1 });
+  appendAgentEvent("inference.started", "running", {
+    mode: "structured-action",
+    taskId: task.id,
+    provider: selection.provider,
+    model: selection.model || null,
+    reasoning: selection.reasoning,
+    step: prompt.history?.actions?.length + 1 || 1,
+  });
+  if (selection.provider !== "maple") {
+    const external = await runCliInference({ messages, taskId: task.id, operationId: null }, selection, { mode: "structured-action", structured: true });
+    const content = String(external.answer || "").trim();
+    if (!content) {
+      const error = new Error(`${selection.label} returned no structured action content.`);
+      error.code = "EMPTY_ACTION_OUTPUT";
+      error.rawModelOutputRef = external.rawOutputRef;
+      throw error;
+    }
+    return { content, channels: external.channels, rawOutputRef: external.rawOutputRef, provider: selection.provider };
+  }
+  const actionStream = startStream({ taskId: task.id, operationId: null, kind: "agent_action", provider: "maple" });
   const response = await fetchWithTimeout(`${endpoint}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify({
       model: "default_model",
       messages,
@@ -1325,16 +2215,17 @@ async function inferStructuredAction(prompt) {
       top_p: 1,
       top_k: 0,
       // Maple's reasoning channel is model output, not a discardable hidden
-      // preamble. Leave enough completion budget for that channel and the
-      // validated JSON envelope that follows it. Authoring keeps the same
-      // headroom because a task may reach it after a long plan history.
-      max_tokens: nextCommand === "artifact.author" ? 8192 : 4096,
-      stream: false,
+      // preamble. Keep reasoning enabled and let the model decide when it is
+      // done; mapleMaxTokens is only the transport/server ceiling.
+      max_tokens: mapleMaxTokens,
+      stream: true,
       response_format: { type: "json_object" },
+      chat_template_kwargs: { enable_thinking: true },
     }),
   }, inferenceTimeoutMs);
-  const payload = await readResponse(response);
   if (!response.ok) {
+    const payload = await readResponse(response);
+    finishStream(actionStream, { status: "failed", stopReason: "http_error" });
     const detail = payload?.error?.message || payload?.error || payload?.raw || response.statusText || `HTTP ${response.status}`;
     const error = new Error(`Structured Maple action inference returned HTTP ${response.status}: ${detail}`);
     error.code = response.status >= 500 ? "RUNTIME_UNAVAILABLE" : "ACTION_INFERENCE_FAILED";
@@ -1357,20 +2248,66 @@ async function inferStructuredAction(prompt) {
     });
     throw error;
   }
+  let payload = {};
+  let rawPayloads = [];
+  let finishReason = null;
+  let usage = null;
+  const streamedChannels = {};
+  const contentType = response.headers.get("content-type") || "";
+  if (response.body && typeof response.body.getReader === "function" && contentType.toLowerCase().includes("text/event-stream")) {
+    const parser = new Utf8SseParser();
+    const reader = response.body.getReader();
+    let done = false;
+    while (!done) {
+      const result = await reader.read();
+      const events = parser.push(result.value || new Uint8Array(), { final: result.done === true });
+      for (const event of events) {
+        const parsed = parseSsePayload(event);
+        if (parsed.done) { done = true; break; }
+        if (!parsed.payload) continue;
+        rawPayloads.push(compactModelPayload(parsed.payload));
+        const delta = extractModelDelta(parsed.payload);
+        if (delta.finishReason) finishReason = delta.finishReason;
+        if (delta.usage) usage = delta.usage;
+        for (const channel of delta.channels) {
+          streamedChannels[channel.name] = `${streamedChannels[channel.name] || ""}${channel.text}`;
+          publishStreamFrame(actionStream, { channel: channel.name, delta: channel.text, usage: delta.usage, stopReason: delta.finishReason });
+        }
+        payload = parsed.payload;
+      }
+      if (result.done) break;
+    }
+    payload = {
+      ...(payload || {}),
+      choices: [{ message: streamedChannels, finish_reason: finishReason }],
+      usage: usage || payload?.usage || null,
+    };
+  } else {
+    payload = await readResponse(response);
+    rawPayloads = [payload];
+    const bufferedMessage = payload?.choices?.[0]?.message || {};
+    for (const channel of extractModelChannels(bufferedMessage)) publishStreamFrame(actionStream, { channel: channel.name, delta: channel.text, usage: payload.usage || null, stopReason: payload?.choices?.[0]?.finish_reason || null });
+    finishReason = payload?.choices?.[0]?.finish_reason || null;
+    usage = payload.usage || null;
+  }
   const message = payload?.choices?.[0]?.message || {};
   const channels = extractModelChannels(message);
-  const content = message.content;
-  const rawOutputRef = persistModelOutput({ taskId: task.id, operationId: null, mode: "structured-action", channels: Object.fromEntries(channels.map((channel) => [channel.name, channel.text])), rawPayload: payload });
+  const selectedActionText = selectStructuredActionText(message);
+  const content = selectedActionText.text;
+  const rawOutputRef = persistModelOutput({ taskId: task.id, operationId: null, mode: "structured-action", channels: Object.fromEntries(channels.map((channel) => [channel.name, channel.text])), rawPayload: rawPayloads.length === 1 ? rawPayloads[0] : rawPayloads });
   if (typeof content !== "string" || !content.trim()) {
+    finishStream(actionStream, { status: "failed", stopReason: "empty_action_content", usage, rawOutputRef });
     const error = new Error("Maple returned no structured action content.");
     error.code = "EMPTY_ACTION_OUTPUT";
-    appendAgentEvent("inference.failed", "failed", { mode: "structured-action", error: error.message, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef });
+    appendAgentEvent("inference.failed", "failed", { mode: "structured-action", error: error.message, actionChannel: selectedActionText.channel, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef });
     throw error;
   }
+  finishStream(actionStream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
   serverState = { ...serverState, processReady: true, inferenceReady: true };
   appendAgentEvent("inference.completed", "passed", {
     mode: "structured-action",
     usage: payload.usage || null,
+    actionChannel: selectedActionText.channel,
     channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))),
     rawOutputRef,
     telemetry: {
@@ -1382,9 +2319,10 @@ async function inferStructuredAction(prompt) {
       modelChannels: channels.map((channel) => ({ name: channel.name, digest: digestText(channel.text) })),
     },
   });
-  return { content, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef };
+  return { content, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef, streamId: actionStream.streamId, actionChannel: selectedActionText.channel, reasoning: message.reasoning || message.reasoning_content || message.thought || "" };
 }
 
+let codingAutopilot = null;
 agentOrchestrator = new AgentOrchestrator({
   kernel: agentKernel,
   commandRegistry: agentCommands,
@@ -1393,6 +2331,36 @@ agentOrchestrator = new AgentOrchestrator({
   emit: (type, status, payload, options) => appendAgentEvent(type, status, payload, options),
   executeCommand: (command, payload) => runAgentCommand(command, payload),
   inferAction: inferStructuredAction,
+  repairCoding: (input) => codingAutopilot?.run({
+    threadId: agentTask.threadId,
+    taskId: agentTask.id,
+    objective: agentTask.objective,
+    baseChangeSetId: input.baseChangeSetId || null,
+    issues: input.failedResult?.issues || input.failedResult?.verification?.issues || [],
+    context: { task: agentTask, history: input.history, plan: input.plan },
+  }),
+  createSuggestion: (input) => {
+    const existing = threadManager.listSuggestions({ threadId: input.threadId, status: "unread" }).find((item) => item.kind === input.kind);
+    if (existing) return existing;
+    const suggestion = threadManager.createSuggestion(input);
+    appendAgentEvent("suggestion.created", "candidate", { suggestion }, { evidenceRefs: suggestion.evidenceRefs, reversible: true });
+    return suggestion;
+  },
+});
+
+codingAutopilot = new CodingAutopilot({
+  maxAttempts: 2,
+  inferRepair: (repair) => agentOrchestrator.inferCodingRepair(
+    agentTask,
+    agentKernel.getProjection().plans.find((item) => item.id === agentTask.activePlanId) || { steps: [] },
+    agentKernel.getTaskHistory(agentTask.id),
+    { issues: repair.issues || [] },
+    repair.attempt,
+  ),
+  apply: ({ threadId, source, patches, baseDigests, reason }) => runAgentCommand("code.apply", { threadId, source, patches, baseDigests, reason, __fromAgentAction: true, __approvedPlan: true, __agentActionId: `code-repair-${Date.now()}` }),
+  verify: ({ threadId }) => runAgentCommand("verify", { threadId, profile: "app-build", automatic: true }),
+  rollback: ({ threadId, changeSetId }) => runAgentCommand("code.rollback", { threadId, changeSetId, __fromAgentAction: true, __approvedPlan: true }),
+  emit: (type, status, payload, options) => appendAgentEvent(type, status, payload, options),
 });
 
 agentIntentQueue = new AgentIntentQueue({
@@ -1455,7 +2423,8 @@ function appendOutput(current, chunk, limit = 14000) {
 function runChild(command, args, { cwd = repoRoot, timeoutMs = 120000, operationId = null } = {}) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
-    const child = spawn(command, args, {
+    const invocation = resolveChildInvocation(command, args);
+    const child = spawn(invocation.command, invocation.args, {
       cwd,
       env: pythonEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -1532,12 +2501,17 @@ const verificationProfiles = {
 
 async function runVerification(profileId, emit = null, options = {}) {
   const profile = verificationProfiles[profileId] || verificationProfiles["app-build"];
+  const workspaceRoot = options.workspaceRoot && fs.existsSync(path.join(options.workspaceRoot, "package.json")) ? path.resolve(options.workspaceRoot) : profile.cwd;
   appendAgentEvent("verification.started", "running", { profile: profileId, label: profile.label, command: profile.command });
   emit?.({ stage: `verifying · ${profile.label}`, progress: 24, log: profile.command });
   try {
-    const result = await runChild(profile.executable, profile.args, { cwd: profile.cwd, timeoutMs: profile.timeoutMs, operationId: options.operationId || null });
-    const receipt = { profile: profileId in verificationProfiles ? profileId : "app-build", label: profile.label, ...result };
-    appendAgentEvent("verification.completed", result.exitCode === 0 ? "passed" : "failed", { profile: receipt.profile, label: receipt.label, exitCode: result.exitCode, timedOut: result.timedOut }, { evidenceRefs: [] });
+    const result = await runChild(profile.executable, profile.args, { cwd: workspaceRoot, timeoutMs: profile.timeoutMs, operationId: options.operationId || null });
+    const receipt = { schema: "hemlock.agent.verification.v1", profile: profileId in verificationProfiles ? profileId : "app-build", label: profile.label, workspaceRoot, command: profile.command, ...result };
+    const receiptPath = path.join(runtimeDataRoot, "receipts", "verification", `${agentTask.id}-${options.operationId || Date.now()}.json`);
+    writeJsonFile(receiptPath, receipt);
+    receipt.receiptPath = receiptPath;
+    receipt.evidenceRefs = [receiptPath];
+    appendAgentEvent("verification.completed", result.exitCode === 0 ? "passed" : "failed", { profile: receipt.profile, label: receipt.label, exitCode: result.exitCode, timedOut: result.timedOut, receiptPath }, { evidenceRefs: receipt.evidenceRefs });
     return receipt;
   } catch (error) {
     appendAgentEvent("verification.completed", "failed", { profile: profileId, label: profile.label, error: error.message });
@@ -1545,16 +2519,17 @@ async function runVerification(profileId, emit = null, options = {}) {
   }
 }
 
-async function repoMap() {
+async function repoMap(payload = {}) {
+  const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
   const [branch, status, files] = await Promise.all([
-    runChild("git", ["branch", "--show-current"], { timeoutMs: 15000 }),
-    runChild("git", ["status", "--short"], { timeoutMs: 15000 }),
-    runChild("git", ["ls-files"], { timeoutMs: 15000 }),
+    runChild("git", ["branch", "--show-current"], { cwd: workspaceRoot, timeoutMs: 15000 }),
+    runChild("git", ["status", "--short"], { cwd: workspaceRoot, timeoutMs: 15000 }),
+    runChild("git", ["ls-files"], { cwd: workspaceRoot, timeoutMs: 15000 }),
   ]);
   return {
     schema: "hemlock.sips.repo-map.v1",
     status: "ready",
-    root: repoRoot,
+    root: workspaceRoot,
     branch: branch.stdout.trim(),
     dirty: Boolean(status.stdout.trim()),
     statusShort: status.stdout.trim(),
@@ -1600,8 +2575,10 @@ function startServer(adapterPath = "") {
   }
   const args = [...serverArgs];
   if (adapterPath) args.push("--adapter-path", adapterPath);
+  serverProcessError = null;
   serverState = { processReady: false, inferenceReady: false, adapterPath };
-  const child = spawn(python, [...pythonFlags, serverScript, ...args], {
+  console.log(`[hemlock] Maple launch python=${python} architecture=${pythonArchitecture || process.arch}`);
+  const child = spawnPython([...pythonFlags, serverScript, ...args], {
     cwd: repoRoot,
     env: pythonEnvironment(),
     stdio: ["ignore", "pipe", "pipe"],
@@ -1615,9 +2592,15 @@ function startServer(adapterPath = "") {
     const text = String(chunk).trim();
     if (text) console.error(`[maple-server] ${text}`);
   });
+  child.once("error", (error) => {
+    serverProcessError = { message: error.message, code: error.code || null };
+    console.error(`[maple-server] failed to start: ${error.message}`);
+    if (serverProcess === child) serverProcess = null;
+  });
   child.on("exit", (code, signal) => {
     console.log(`[maple-server] exited code=${code ?? "-"} signal=${signal ?? "-"}`);
     if (serverProcess === child) {
+      if (!serverState.processReady) serverProcessError = { message: `Maple server exited before readiness (code=${code ?? "-"}, signal=${signal ?? "-"}).`, code, signal };
       serverProcess = null;
       serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
     }
@@ -1646,15 +2629,23 @@ function stopServer() {
   });
 }
 
-async function waitForServer(timeoutMs = 180000) {
+async function waitForServer(timeoutMs = 180000, { preserveInference = false } = {}) {
   const startedAt = Date.now();
   let lastError = null;
   while (Date.now() - startedAt < timeoutMs) {
+    if (serverProcessError) {
+      const error = new Error(`The local Maple-Preview server failed before becoming ready: ${serverProcessError.message}`);
+      Object.assign(error, serverProcessError);
+      throw error;
+    }
+    if (!serverProcess || serverProcess.killed) {
+      throw new Error("The local Maple-Preview server process exited before becoming ready.");
+    }
     try {
       const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
       if (response.ok) {
-        serverState = { ...serverState, processReady: true, inferenceReady: false };
-        return { processReady: true, inferenceReady: false };
+        serverState = { ...serverState, processReady: true, inferenceReady: preserveInference ? serverState.inferenceReady === true : false };
+        return { processReady: true, inferenceReady: serverState.inferenceReady };
       }
       lastError = new Error(`Maple-Preview health returned HTTP ${response.status}`);
     } catch (error) {
@@ -1663,6 +2654,28 @@ async function waitForServer(timeoutMs = 180000) {
     await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(50, timeoutMs - (Date.now() - startedAt)))));
   }
   throw new Error(`The local Maple-Preview server process did not become ready: ${lastError?.message || "timeout"}.`);
+}
+
+async function launchMapleRuntime() {
+  if (serverLaunchPromise) return serverLaunchPromise;
+  serverLaunchPromise = (async () => {
+    const startedAt = Date.now();
+    try {
+      if (!serverProcess || serverProcess.killed) startServer();
+      await waitForServer(readinessTimeoutMs, { preserveInference: true });
+      const result = createMapleLaunchResult({ server: serverState, startedAt });
+      appendAgentEvent("maple.launch.completed", "passed", result, { reversible: true });
+      return result;
+    } catch (error) {
+      serverState = { ...serverState, processReady: false, inferenceReady: false };
+      const result = createMapleLaunchResult({ server: serverState, startedAt, error });
+      appendAgentEvent("maple.launch.failed", "failed", result, { reversible: true });
+      throw error;
+    } finally {
+      serverLaunchPromise = null;
+    }
+  })();
+  return serverLaunchPromise;
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
@@ -1805,7 +2818,7 @@ function runDream(payload) {
     emitDreamProgress({ stage: "stopping Maple-Preview server before local training", progress: 4, elapsed: 0, log: "" });
     stopServer().then(() => {
       emitDreamProgress({ stage: "starting MLX fine-tuning runtime", progress: 10, elapsed: 0, log: "" });
-      dreamProcess = spawn(python, [...pythonFlags, path.join(__dirname, "dream_train.py"), JSON.stringify(input)], {
+      dreamProcess = spawnPython([...pythonFlags, path.join(__dirname, "dream_train.py"), JSON.stringify(input)], {
         cwd: repoRoot,
         env: pythonEnvironment(),
         stdio: ["ignore", "pipe", "pipe"],
@@ -2027,8 +3040,19 @@ async function runSipsCycle(payload) {
   }
 }
 
+ipcMain.handle("providers:status", () => inspectProviders());
+ipcMain.handle("providers:login", (_event, provider) => openProviderLogin(String(provider || ""), "login"));
+ipcMain.handle("providers:logout", (_event, provider) => openProviderLogin(String(provider || ""), "logout"));
+ipcMain.handle("maple:launch", () => runAgentCommand("maple.launch"));
 ipcMain.handle("agent:state", () => getAgentState());
 ipcMain.handle("agent:intent", (_event, payload = {}) => runAgentCommand("intent.submit", payload));
+ipcMain.handle("agent:threads", (_event, payload = {}) => {
+  const action = String(payload.action || "list");
+  const command = action === "create" ? "thread.create" : action === "switch" ? "thread.switch" : action === "rename" ? "thread.rename" : action === "pause" ? "thread.pause" : action === "resume" ? "thread.resume" : action === "archive" ? "thread.archive" : action === "cancel" ? "thread.cancel" : "thread.list";
+  return runAgentCommand(command, payload);
+});
+ipcMain.handle("agent:projects", (_event, payload = {}) => runAgentCommand(payload.action === "register" ? "project.register" : payload.action === "select" ? "project.select" : "project.list", payload));
+ipcMain.handle("agent:suggestions", (_event, payload = {}) => runAgentCommand(payload.action === "accept" ? "suggestion.accept" : payload.action === "dismiss" ? "suggestion.dismiss" : payload.action === "snooze" ? "suggestion.snooze" : "suggestion.list", payload));
 ipcMain.handle("agent:plan", (_event, payload = {}) => {
   const action = String(payload.action || "propose");
   const command = action === "approve" ? "plan.approve" : action === "reject" ? "plan.reject" : "plan.propose";
@@ -2050,7 +3074,7 @@ ipcMain.handle("agent:changeset", (_event, payload = {}) => {
   return runAgentCommand(`change.${action}`, payload);
 });
 ipcMain.handle("agent:task", (_event, payload = {}) => {
-  const allowed = ["objective", "intent", "phase", "status", "foregroundStep", "budget", "evidenceRefs", "blockedReason"];
+  const allowed = ["objective", "intent", "interactionMode", "phase", "status", "foregroundStep", "budget", "evidenceRefs", "blockedReason", "artifactRepair", "codeRepair", "autonomy"];
   const patch = Object.fromEntries(allowed.filter((key) => Object.prototype.hasOwnProperty.call(payload, key)).map((key) => [key, payload[key]]));
   return updateAgentTask(patch);
 });
@@ -2068,6 +3092,10 @@ ipcMain.handle("agent:artifacts", (_event, payload = {}) => {
 ipcMain.handle("agent:preview", (_event, payload = {}) => {
   const action = String(payload.action || "inspect");
   return runAgentCommand(`artifact.preview.${action}`, { ...(payload.input || {}), taskId: payload.taskId || agentTask.id });
+});
+ipcMain.handle("agent:preview-report", (_event, payload = {}) => {
+  const report = payload.report || payload;
+  return recordPreviewReport(report);
 });
 ipcMain.handle("agent:queue-cancel", (_event, requestId) => agentIntentQueue?.cancelQueued(String(requestId || "")) || { status: "not_found", queue: agentIntentQueue?.snapshot() });
 ipcMain.handle("agent:memory", (_event, payload = {}) => runAgentCommand("remember", payload));
@@ -2098,13 +3126,22 @@ ipcMain.handle("sips:command", async (_event, payload) => {
   return runAgentCommand(action, payload);
 });
 
-app.whenReady().then(() => {
-  if (app.isPackaged || process.env.MAPLE_AUTOSTART_SERVER === "1") startServer();
-  createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+if (hasSingleInstanceLock) {
+  app.whenReady().then(() => {
+    if (app.isPackaged || process.env.MAPLE_AUTOSTART_SERVER === "1") {
+      try {
+        startServer();
+      } catch (error) {
+        serverProcessError = { message: error.message, code: error.code || null };
+        console.error(`[maple-server] unable to launch: ${error.message}`);
+      }
+    }
+    createWindow();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

@@ -1,0 +1,114 @@
+{
+  "ts": "2026-08-15T21:10:03+00:00",
+  "cwd": "/Users/ianzvirbulis/Code/Hemlock",
+  "git": {
+    "rev": "c49d28d",
+    "dirty": true
+  },
+  "output_estimator": "heuristic-chars/4",
+  "probes": {
+    "build": {
+      "cmd": "cd dream-chat && npm run build",
+      "runs": 3,
+      "samples_s": [
+        0.494,
+        0.365,
+        0.367
+      ],
+      "median_s": 0.367,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 3041,
+      "output_tokens": 758,
+      "output_tail": null
+    },
+    "agent-tests": {
+      "cmd": "cd dream-chat && npm run test:agent",
+      "runs": 3,
+      "samples_s": [
+        0.378,
+        0.36,
+        0.371
+      ],
+      "median_s": 0.371,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 11686,
+      "output_tokens": 2922,
+      "output_tail": null
+    },
+    "ui-tests": {
+      "cmd": "cd dream-chat && npm run test:ui",
+      "runs": 3,
+      "samples_s": [
+        0.235,
+        0.234,
+        0.24
+      ],
+      "median_s": 0.235,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 2255,
+      "output_tokens": 564,
+      "output_tail": null
+    },
+    "syntax": {
+      "cmd": "node --check dream-chat/electron/main.cjs && node --check dream-chat/electron/preload.cjs && node --check dream-chat/electron/provider_adapters.cjs",
+      "runs": 3,
+      "samples_s": [
+        0.089,
+        0.087,
+        0.085
+      ],
+      "median_s": 0.087,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 0,
+      "output_tokens": 0,
+      "output_tail": null
+    },
+    "maple-health": {
+      "cmd": "zsh .optimize/maple_health_probe.sh",
+      "runs": 1,
+      "samples_s": [
+        5.003
+      ],
+      "median_s": 5.003,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 21,
+      "output_tokens": 6,
+      "output_tail": null
+    },
+    "maple-stream-dispatch": {
+      "cmd": "node .optimize/maple_stream_dispatch_probe.cjs",
+      "runs": 3,
+      "samples_s": [
+        0.186,
+        0.036,
+        0.036
+      ],
+      "median_s": 0.036,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 96,
+      "output_tokens": 24,
+      "output_tail": null
+    },
+    "artifact-autopilot": {
+      "cmd": "cd dream-chat && npm run test:e2e:artifact-autopilot",
+      "runs": 3,
+      "samples_s": [
+        0.287,
+        0.183,
+        0.181
+      ],
+      "median_s": 0.183,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 298,
+      "output_tokens": 75,
+      "output_tail": null
+    }
+  }
+}

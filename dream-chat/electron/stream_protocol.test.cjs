@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { Utf8SseParser, parseSsePayload, extractModelDelta, digest } = require("./stream_protocol.cjs");
+const { Utf8SseParser, parseSsePayload, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, digest } = require("./stream_protocol.cjs");
 
 test("parses split UTF-8 and SSE boundaries through DONE", () => {
   const parser = new Utf8SseParser();
@@ -23,6 +23,56 @@ test("preserves every string model channel alongside visible content", () => {
   ]);
   assert.equal(delta.finishReason, null);
   assert.equal(delta.usage, null);
+});
+
+test("treats repeated assistant role metadata as non-output", () => {
+  const delta = extractModelDelta({ choices: [{ delta: { role: "assistant", reasoning: "thinking", content: "visible" }, finish_reason: null }] });
+  assert.deepEqual(delta.channels, [
+    { name: "reasoning", text: "thinking" },
+    { name: "content", text: "visible" },
+  ]);
+});
+
+test("compacts streamed payloads without dropping reasoning or content deltas", () => {
+  const compact = compactModelPayload({
+    id: "chat-1",
+    model: "maple",
+    choices: [{ delta: { role: "assistant", reasoning: "step", content: "json" }, finish_reason: null }],
+  });
+  assert.deepEqual(compact, {
+    id: "chat-1",
+    model: "maple",
+    choices: [{ delta: { reasoning: "step", content: "json" } }],
+  });
+});
+
+test("recovers an action envelope emitted in the reasoning channel", () => {
+  const selected = selectStructuredActionText({
+    role: "assistant",
+    reasoning: 'I will select the next step. {"schema":"hemlock.agent.action.v1","commandId":"repo-map"}',
+  });
+  assert.equal(selected.channel, "reasoning");
+  assert.match(selected.text, /hemlock\.agent\.action\.v1/);
+});
+
+test("serializes active stream state without leaking controllers or coalescer functions", () => {
+  const snapshot = streamStateSnapshot({
+    streamId: "stream-1",
+    taskId: "task-1",
+    kind: "agent_action",
+    provider: "maple",
+    sequence: 3,
+    text: "visible",
+    channels: { content: "visible", reasoning: "thinking" },
+    terminal: false,
+    startedAt: 1,
+    frameCoalescer: { flush() {} },
+    controller: { abort() {} },
+  });
+  assert.deepEqual(snapshot.channels, { content: "visible", reasoning: "thinking" });
+  assert.equal("frameCoalescer" in snapshot, false);
+  assert.equal("controller" in snapshot, false);
+  assert.doesNotThrow(() => structuredClone(snapshot));
 });
 
 test("digest is stable and names the algorithm", () => {

@@ -9,6 +9,17 @@ context policies, candidates, memory transitions, training state, and receipts.
 The renderer consumes the durable projection instead of inventing a second task
 state from UI booleans.
 
+### One-click macOS launch
+
+Double-click [`Hemlock.app`](Hemlock.app) at the repository root. It starts the
+Vite desktop surface, opens the Electron window, and autostarts Maple-Preview
+through the local MLX runtime. The app bundle is intentionally kept beside the
+worktree so it can resolve `dream-chat/`; a Finder alias is safe if you want a
+shortcut elsewhere. The terminal-friendly fallback is [`Launch Hemlock.command`](Launch%20Hemlock.command).
+Startup output is recorded at `~/Library/Logs/Hemlock/launch.log`, duplicate
+launches are ignored, and Apple Silicon launches the universal Python runtime
+as arm64 so the MLX extension and interpreter use the same architecture.
+
 ### Host-orchestrated Maple action loop
 
 The current strong-agent tranche adds an Electron-owned `AgentOrchestrator` on

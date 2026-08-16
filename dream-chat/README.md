@@ -37,6 +37,31 @@ status labels, and the composer placeholder use a darker moss hierarchy against
 the paper surface so supporting text remains legible without competing with the
 conversation title.
 
+### Explore first, Build when handed off
+
+The Chat composer has an explicit Explore / Build control. Explore is the
+default: visual ideation, discussion, and questions stay on the direct
+conversation path even when they mention animation, HTML, or design. A Build
+selection or a clear handoff such as `build this`, `make the artifact`,
+`create the draft`, or `open a working version` adds
+`interactionMode: "build"` to the intent payload and creates the bounded
+coding plan. The existing plan approval is the only approval required before
+task-local artifact autopilot starts.
+
+After approval, the host owns planned command identity, action lifecycle,
+evidence expectations, and terminal completion. Maple supplies rationale and
+source inputs. Complete artifacts stay in Hemlock Application Support; the
+repository change-set path remains separately gated.
+
+Artifact autopilot records manifest, revision, preview-session, and inspection
+receipt evidence. Preview inspection is a renderer-to-host report handshake,
+not an empty success payload: the isolated harness reports readiness, bounded
+DOM/accessibility data, and console errors, while the host checks task,
+artifact, revision, and session identity plus static source validity. A failed
+verification gets at most two source/patch repair passes. Invalid candidates
+are never made active; the last verified revision is restorable and exhausted
+tasks expose `Retry repair` and `Use last good revision` actions.
+
 ## Hemlock OS Live Workspace v3
 
 The current live-workspace slice keeps Hemlock's free-floating desktop while
@@ -89,6 +114,7 @@ npm run test:ui
 npm run build
 npm run test:e2e:artistic-fixture
 npm run test:e2e:artistic-maple
+npm run test:e2e:artifact-autopilot
 ```
 
 Runtime artifacts, model weights, adapters, datasets, receipts, preview
@@ -117,6 +143,28 @@ With the Maple server already running on `127.0.0.1:8080`:
 ```bash
 npm run desktop
 ```
+
+For the normal macOS launch path, double-click `Hemlock.app` in the repository
+root. It starts the Electron window, launches the Vite desktop surface, and
+sets Maple autostart automatically. Repeated double-clicks are ignored while
+the existing Hemlock process is running. Startup output is written to
+`~/Library/Logs/Hemlock/launch.log`.
+Keep the app bundle beside this repository (or make a Finder alias to it),
+because it resolves the local `dream-chat/` runtime from that neighboring
+worktree. On Apple Silicon, the launcher pins the universal Hemlock Python
+runtime to the native arm64 slice so MLX loads correctly; set
+`HEMLOCK_PYTHON_ARCH=x86_64` only when intentionally running the full stack
+under Rosetta.
+
+`Launch Hemlock.command` remains a Terminal-friendly fallback, or run this
+from `dream-chat/`:
+
+```bash
+npm run launch
+```
+
+While Hemlock is open, press `⌘⇧M` to open or close the model picker. The
+shortcut is also shown in the top-right picker trigger.
 
 The app uses the local OpenAI-compatible `/v1/chat/completions` endpoint. Facts
 are stored in browser/Electron local storage. In the Electron desktop build,
@@ -161,6 +209,52 @@ HF_HUB_DISABLE_XET=1 hf download deepgrove/maple-preview-2bit-mlx \
 The full-precision `deepgrove/maple-preview` and GGUF variants are not used by
 this MLX Dream path; they are much larger and would unnecessarily duplicate
 storage on a local development machine.
+
+## Hemlock-native Maple agent
+
+Hemlock treats Maple-Preview as a resident local agent rather than a one-shot
+model request. Chat is Explore-first; choose Build or use a clear build
+handoff to create a durable thread and bounded plan. After the single plan
+approval, ordinary coding actions can run inside the explicitly assigned
+project directory. The host owns command identity, path scope, writer locks,
+before/after digests, rollback manifests, verification, and the completion
+claim.
+
+The Chat surface includes durable thread/project switching, per-thread
+provider/model/reasoning state, workspace scope, resumable checkpoints,
+provider escalation suggestions, and a compact activity/evidence trace. Maple
+uses one local inference lane by default; Codex and Claude subscription lanes
+use separate bounded host queues. The Command Center's Provider Scheduler
+panel exposes the persisted lane caps.
+
+General coding follows a host-owned loop of context refresh, repository map,
+inspection, scoped source edit, verification, bounded repair, and final diff.
+Verification failures receive at most two automatic repair passes. A failed
+candidate is rolled back and the last-good revision remains active. Hemlock
+does not silently move a task from Maple to Codex or Claude; provider retry is
+an explicit suggestion. Destructive operations, secrets, external/network
+side effects, dependency installation, and stale workspace bases remain gated.
+
+Artifact authoring accepts full action envelopes, compact bare payloads, and
+direct relative-file maps. The host filters each command through its input
+contract, so valid animation variations remain model-owned source rather than
+being collapsed into one fixed Hemlock template. CSS/DOM, SVG, canvas, and
+kinetic-card styles are covered by a four-variation fixture; source diversity
+and renderer correctness remain separate measurements.
+
+Thread data, checkpoints, conversation references, suggestions, change-set
+manifests, and verification receipts live under
+`~/Library/Application Support/Hemlock/`. Artifact work remains in task-local
+scratch storage and does not mutate repository source automatically. The
+deterministic artifact fixture is the local proof for the bounded repair loop:
+
+```bash
+npm run test:e2e:artifact-autopilot
+```
+
+It exercises malformed action output, host-owned `commandId: "none"`
+replacement, preview failure, malformed repair, successful repair, and
+receipt-backed completion without repository mutation.
 
 ## Hemlock SIPS control center
 

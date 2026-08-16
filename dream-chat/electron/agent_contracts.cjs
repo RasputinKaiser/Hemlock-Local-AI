@@ -21,6 +21,10 @@ const DEFAULT_BUDGET = Object.freeze({
   trainingCyclesUsed: 0,
   maxWallClockMs: 600000,
   wallClockStartedAt: null,
+  maxArtifactRepairs: 2,
+  artifactRepairsUsed: 0,
+  maxCodeRepairs: 2,
+  codeRepairsUsed: 0,
 });
 
 function nowIso() {
@@ -37,6 +41,15 @@ function digest(value) {
 
 function mergeBudget(budget = {}) {
   return { ...DEFAULT_BUDGET, ...budget };
+}
+
+function normalizeExpectedEvidence(value, fallback = []) {
+  if (Array.isArray(value)) return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const keys = Object.keys(value).filter((key) => value[key] === true || value[key] == null || typeof value[key] === "string");
+    if (keys.length) return keys;
+  }
+  return Array.isArray(fallback) ? fallback.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim()) : [];
 }
 
 function assertObject(value, label) {
@@ -102,8 +115,149 @@ function extractJsonObject(text) {
   throw new Error("Maple action response was not valid JSON.");
 }
 
+function quotedField(source, key) {
+  const escapedKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(source || "").match(new RegExp(`[\"']${escapedKey}[\"']\\s*:\\s*[\"']((?:\\\\.|[^\"'\\\\])*)[\"']`, "i"));
+  if (!match) return null;
+  try { return JSON.parse(`\"${match[1]}\"`); } catch { return match[1]; }
+}
+
+function numericField(source, key) {
+  const escapedKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(source || "").match(new RegExp(`[\"']${escapedKey}[\"']\\s*:\\s*(\\d+)`, "i"));
+  return match ? Number(match[1]) : null;
+}
+
+function balancedObjectAfterKey(source, key) {
+  const escapedKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const keyMatch = String(source || "").match(new RegExp(`[\"']${escapedKey}[\"']\\s*:\\s*`, "i"));
+  if (!keyMatch) return null;
+  const start = keyMatch.index + keyMatch[0].length;
+  if (source[start] !== "{") return null;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') { quoted = true; continue; }
+    if (character === "{") depth += 1;
+    if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(source.slice(start, index + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+function recoverTruncatedAction(text) {
+  const source = String(text || "");
+  const commandId = quotedField(source, "commandId");
+  const looksLikeAction = source.includes(ACTION_SCHEMA) || Boolean(commandId) && /[\"'](?:kind|approval|status)[\"']\s*:/.test(source);
+  if (!looksLikeAction || !commandId) return null;
+  const kind = quotedField(source, "kind") || "tool";
+  const approval = quotedField(source, "approval") || "none";
+  const status = quotedField(source, "status") || "proposed";
+  const input = balancedObjectAfterKey(source, "input") || {};
+  return {
+    schema: ACTION_SCHEMA,
+    id: quotedField(source, "id") || "action-recovered",
+    taskId: quotedField(source, "taskId") || "model-task",
+    step: numericField(source, "step") || 1,
+    kind,
+    commandId,
+    input,
+    shortRationale: quotedField(source, "shortRationale") || `Continue the registered ${commandId} step.`,
+    expectedEvidence: [],
+    approval,
+    status,
+    __recoveredTruncated: true,
+  };
+}
+
+function extractActionEnvelope(text) {
+  try { return extractJsonObject(text); } catch (error) {
+    const recovered = recoverTruncatedAction(text);
+    if (recovered) return recovered;
+    throw error;
+  }
+}
+
+function plainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function boundedActionInput(commandId, payload) {
+  const flattenedInput = Object.entries(payload || {}).reduce((result, [key, value]) => {
+    if (!key.startsWith("input.")) return result;
+    result[key.slice("input.".length)] = value;
+    return result;
+  }, {});
+  const source = plainObject(payload?.input)
+    ? payload.input
+    : Object.keys(flattenedInput).length
+      ? flattenedInput
+      : plainObject(payload)
+        ? payload
+        : {};
+  const pick = (keys) => Object.fromEntries(keys.filter((key) => Object.prototype.hasOwnProperty.call(source, key)).map((key) => [key, source[key]]));
+  const directSourceMap = Object.keys(source).length > 0 && Object.entries(source).every(([file, content]) => typeof file === "string" && /\.[a-z0-9]{1,12}$/i.test(file) && typeof content === "string")
+    ? Object.fromEntries(Object.entries(source))
+    : null;
+  switch (String(commandId || "")) {
+    case "artifact.create":
+      {
+        const input = pick(["artifactId", "title", "entrypoint", "mime"]);
+        const artifactKind = String(source.kind || "").toLowerCase();
+        if (["html", "svg", "text", "markdown", "json"].includes(artifactKind)) input.kind = artifactKind;
+        return input;
+      }
+    case "artifact.author":
+    case "artifact.update":
+      if (directSourceMap) return { source: directSourceMap };
+      return pick(["artifactId", "kind", "filename", "runtimeTemplate", "objective", "source", "patches", "repairFor", "status", "evidence"]);
+    case "artifact.preview.open":
+      return pick(["artifactId", "revision"]);
+    case "artifact.preview.inspect":
+      return pick(["artifactId", "revision", "sessionId", "inspection"]);
+    case "code.apply":
+      if (directSourceMap) return { source: directSourceMap };
+      return pick(["source", "patches", "baseDigests", "reason", "verificationProfile"]);
+    default:
+      return plainObject(payload?.input) ? payload.input : {};
+  }
+}
+
+function coerceActionPayload(payload, { taskId = "model-task", step = 1, commandId = null, expectedEvidence = [], approval = "none" } = {}) {
+  if (!plainObject(payload) || !String(commandId || "").trim()) return null;
+  if (payload.schema === ACTION_SCHEMA) return payload;
+  const input = boundedActionInput(commandId, payload);
+  const rationale = String(payload.shortRationale || payload.reason || payload.title || `Continue the registered ${commandId} step.`).trim();
+  return {
+    schema: ACTION_SCHEMA,
+    id: String(payload.id || "action-coerced"),
+    taskId: String(payload.taskId || taskId),
+    step: Number.isInteger(payload.step) && payload.step > 0 ? payload.step : step,
+    kind: "tool",
+    commandId,
+    input,
+    shortRationale: rationale || `Continue the registered ${commandId} step.`,
+    expectedEvidence: normalizeExpectedEvidence(payload.expectedEvidence, expectedEvidence),
+    approval,
+    status: "proposed",
+    __coercedPayload: true,
+  };
+}
+
 function parseActionEnvelope(text, registry = {}) {
-  const action = extractJsonObject(text);
+  const action = extractActionEnvelope(text);
   validateAction(action, registry);
   return action;
 }
@@ -217,8 +371,13 @@ module.exports = {
   id,
   digest,
   mergeBudget,
+  normalizeExpectedEvidence,
   validateAction,
   extractJsonObject,
+  extractActionEnvelope,
+  recoverTruncatedAction,
+  boundedActionInput,
+  coerceActionPayload,
   parseActionEnvelope,
   createPlan,
   createAction,

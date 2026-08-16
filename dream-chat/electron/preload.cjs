@@ -2,9 +2,20 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("mapleDesktop", {
   isDesktop: true,
+  providers: {
+    status: () => ipcRenderer.invoke("providers:status"),
+    login: (provider) => ipcRenderer.invoke("providers:login", provider),
+    logout: (provider) => ipcRenderer.invoke("providers:logout", provider),
+  },
+  maple: {
+    launch: () => ipcRenderer.invoke("maple:launch"),
+  },
   agent: {
     getState: () => ipcRenderer.invoke("agent:state"),
     submitIntent: (input = {}) => ipcRenderer.invoke("agent:intent", input),
+    threads: (action = "list", input = {}) => ipcRenderer.invoke("agent:threads", { action, ...input }),
+    projects: (action = "list", input = {}) => ipcRenderer.invoke("agent:projects", { action, ...input }),
+    suggestions: (action = "list", input = {}) => ipcRenderer.invoke("agent:suggestions", { action, ...input }),
     proposePlan: (taskId, input = {}) => ipcRenderer.invoke("agent:plan", { action: "propose", taskId, ...input }),
     approvePlan: (taskId, planId) => ipcRenderer.invoke("agent:plan", { action: "approve", taskId, planId }),
     rejectPlan: (taskId, planId, reason = "Rejected by user") => ipcRenderer.invoke("agent:plan", { action: "reject", taskId, planId, reason }),
@@ -20,6 +31,7 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
     cancelQueued: (requestId) => ipcRenderer.invoke("agent:queue-cancel", requestId),
     artifacts: (action, input = {}) => ipcRenderer.invoke("agent:artifacts", { action, input }),
     preview: (action, input = {}) => ipcRenderer.invoke("agent:preview", { action, input }),
+    reportPreview: (report = {}) => ipcRenderer.invoke("agent:preview-report", report),
     subscribeStream: (callback) => {
       const listener = (_event, frame) => callback(frame);
       ipcRenderer.on("agent:stream", listener);
@@ -49,6 +61,15 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
   },
   submitIntent(payload = {}) {
     return ipcRenderer.invoke("agent:intent", payload);
+  },
+  threads(action = "list", input = {}) {
+    return ipcRenderer.invoke("agent:threads", { action, ...input });
+  },
+  projects(action = "list", input = {}) {
+    return ipcRenderer.invoke("agent:projects", { action, ...input });
+  },
+  suggestions(action = "list", input = {}) {
+    return ipcRenderer.invoke("agent:suggestions", { action, ...input });
   },
   updateAgentTask(payload) {
     return ipcRenderer.invoke("agent:task", payload);
@@ -101,6 +122,9 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
   preview(action, input = {}) {
     return ipcRenderer.invoke("agent:preview", { action, input });
   },
+  reportPreview(report = {}) {
+    return ipcRenderer.invoke("agent:preview-report", report);
+  },
   subscribeStream(callback) {
     const listener = (_event, frame) => callback(frame);
     ipcRenderer.on("agent:stream", listener);
@@ -113,6 +137,9 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
   },
   startDream(payload) {
     return ipcRenderer.invoke("dream:start", payload);
+  },
+  launchMaple() {
+    return ipcRenderer.invoke("maple:launch");
   },
   onDreamProgress(callback) {
     const listener = (_event, progress) => callback(progress);
@@ -133,8 +160,19 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
 });
 
 contextBridge.exposeInMainWorld("hemlockAgent", {
+  providers: {
+    status: () => ipcRenderer.invoke("providers:status"),
+    login: (provider) => ipcRenderer.invoke("providers:login", provider),
+    logout: (provider) => ipcRenderer.invoke("providers:logout", provider),
+  },
+  maple: {
+    launch: () => ipcRenderer.invoke("maple:launch"),
+  },
   getState: () => ipcRenderer.invoke("agent:state"),
   submitIntent: (input = {}) => ipcRenderer.invoke("agent:intent", input),
+  threads: (action = "list", input = {}) => ipcRenderer.invoke("agent:threads", { action, ...input }),
+  projects: (action = "list", input = {}) => ipcRenderer.invoke("agent:projects", { action, ...input }),
+  suggestions: (action = "list", input = {}) => ipcRenderer.invoke("agent:suggestions", { action, ...input }),
   proposePlan: (taskId, input = {}) => ipcRenderer.invoke("agent:plan", { action: "propose", taskId, ...input }),
   approvePlan: (taskId, planId) => ipcRenderer.invoke("agent:plan", { action: "approve", taskId, planId }),
   rejectPlan: (taskId, planId, reason = "Rejected by user") => ipcRenderer.invoke("agent:plan", { action: "reject", taskId, planId, reason }),
@@ -150,6 +188,7 @@ contextBridge.exposeInMainWorld("hemlockAgent", {
   cancelQueued: (requestId) => ipcRenderer.invoke("agent:queue-cancel", requestId),
   artifacts: (action, input = {}) => ipcRenderer.invoke("agent:artifacts", { action, input }),
   preview: (action, input = {}) => ipcRenderer.invoke("agent:preview", { action, input }),
+  reportPreview: (report = {}) => ipcRenderer.invoke("agent:preview-report", report),
   subscribeStream: (callback) => {
     const listener = (_event, frame) => callback(frame);
     ipcRenderer.on("agent:stream", listener);
@@ -169,4 +208,5 @@ contextBridge.exposeInMainWorld("hemlockAgent", {
   training: (action, input = {}) => ipcRenderer.invoke("agent:command", { action: `training.${action}`, ...input }),
   receipts: { query: (input = {}) => ipcRenderer.invoke("agent:receipts", input) },
   windows: (action, input = {}) => ipcRenderer.invoke("agent:windows", { action, input }),
+  launchMaple: () => ipcRenderer.invoke("maple:launch"),
 });

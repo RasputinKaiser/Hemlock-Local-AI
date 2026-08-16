@@ -6,6 +6,20 @@ const ARTIFACT_SCHEMA = "hemlock.agent.artifact.v1";
 const VALID_KINDS = new Set(["html", "javascript", "css", "svg", "image", "text", "ascii", "markdown", "json", "audio", "video", "binary"]);
 const VALID_STATUSES = new Set(["drafting", "previewable", "ready", "failed", "superseded", "exported_to_change_set"]);
 const RUNTIME_TEMPLATES = new Set(["html", "canvas", "text", "svg", "markdown", "json", "media", "binary"]);
+const COMPATIBLE_RUNTIME_TEMPLATES = {
+  html: new Set(["html", "canvas"]),
+  svg: new Set(["svg", "html"]),
+  javascript: new Set(["html", "canvas"]),
+  css: new Set(["html"]),
+  text: new Set(["text", "markdown"]),
+  ascii: new Set(["text"]),
+  markdown: new Set(["markdown", "text"]),
+  json: new Set(["json"]),
+  image: new Set(["media"]),
+  audio: new Set(["media"]),
+  video: new Set(["media"]),
+  binary: new Set(["binary"]),
+};
 
 function nowIso() { return new Date().toISOString(); }
 function digest(value) { return `sha256:${crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`; }
@@ -32,6 +46,17 @@ function stableSource(source = {}) {
   return Object.fromEntries(Object.keys(result).sort().map((key) => [key, result[key]]));
 }
 function sourceDigest(source) { return digest(JSON.stringify(stableSource(source))); }
+function applyPatches(source, patches = []) {
+  if (!Array.isArray(patches) || patches.length > 24) throw new Error("Artifact patches must be a bounded list of at most 24 file replacements.");
+  const next = { ...(source || {}) };
+  for (const patch of patches) {
+    const file = safeRelativePath(patch?.path || patch?.file || "");
+    if (typeof patch?.content !== "string") throw new Error(`Artifact patch ${file} must provide complete text content.`);
+    if (patch.content.length > 2 * 1024 * 1024) throw new Error(`Artifact patch ${file} exceeds the 2 MiB v1 file limit.`);
+    next[file] = patch.content;
+  }
+  return stableSource(next);
+}
 
 class ArtifactRegistry {
   constructor({ root, workspaceId, onEvent = () => {}, changeSet = null }) {
@@ -109,7 +134,7 @@ class ArtifactRegistry {
     const filename = safeRelativePath(input.filename || artifact.entrypoint);
     const runtimeTemplate = String(input.runtimeTemplate || input.runtime || "html").toLowerCase();
     const objective = String(input.objective || "").trim();
-    if (!VALID_KINDS.has(kind) || !RUNTIME_TEMPLATES.has(runtimeTemplate) || !filename || !objective) throw new Error("artifact.author requires validated kind, filename, runtime template, and objective.");
+    if (!VALID_KINDS.has(kind) || !RUNTIME_TEMPLATES.has(runtimeTemplate) || !COMPATIBLE_RUNTIME_TEMPLATES[kind]?.has(runtimeTemplate) || !filename || !objective) throw new Error("artifact.author requires validated kind, filename, runtime template, and objective.");
     return this.update({
       taskId: input.taskId,
       artifactId: input.artifactId,
@@ -124,7 +149,7 @@ class ArtifactRegistry {
 
   update(input = {}) {
     const artifact = this.read(input.taskId, input.artifactId);
-    const source = stableSource(input.source ?? artifact.source);
+    const source = input.source != null ? stableSource(input.source) : Array.isArray(input.patches) ? applyPatches(artifact.source, input.patches) : stableSource(artifact.source);
     const revision = artifact.revision + 1;
     const revisionId = `r${revision}`;
     const revisionRoot = path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", revisionId);
@@ -139,6 +164,18 @@ class ArtifactRegistry {
     this.writeJson(this.manifestPath(input.taskId, input.artifactId), next);
     this.emit("artifact.revision.created", "drafting", { artifact: next, revision: record }, [this.manifestPath(input.taskId, input.artifactId), path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", revisionId)]);
     return next;
+  }
+
+  restore(input = {}) {
+    const artifact = this.read(input.taskId, input.artifactId);
+    const revision = Number(input.revision);
+    const record = artifact.revisions.find((item) => item.revision === revision);
+    if (!record) throw new Error(`Artifact revision was not found: r${revision}`);
+    const next = { ...artifact, entrypoint: record.entrypoint || artifact.entrypoint, status: "ready", revision: record.revision, digest: record.digest, source: record.source, timestamps: { ...artifact.timestamps, updatedAt: nowIso() }, evidence: [...artifact.evidence, { type: "artifact.revision.restored", revision }].slice(-80) };
+    this.writeJson(this.manifestPath(input.taskId, input.artifactId), next);
+    const evidenceRefs = [this.manifestPath(input.taskId, input.artifactId), path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", `r${revision}`)];
+    this.emit("artifact.revision.restored", "passed", { artifact: next, revision }, evidenceRefs);
+    return { ...next, manifestPath: evidenceRefs[0], revisionPath: evidenceRefs[1], evidenceRefs, summary: `Restored artifact revision ${revision}.` };
   }
 
   inspect(input = {}) {
@@ -168,4 +205,4 @@ class ArtifactRegistry {
   }
 }
 
-module.exports = { ArtifactRegistry, ARTIFACT_SCHEMA, VALID_KINDS, sourceDigest, stableSource, digest };
+module.exports = { ArtifactRegistry, ARTIFACT_SCHEMA, VALID_KINDS, sourceDigest, stableSource, applyPatches, digest };

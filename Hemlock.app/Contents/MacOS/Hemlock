@@ -1,0 +1,9 @@
+#!/bin/zsh
+
+set -u
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+bundle_dir="$(cd -- "$script_dir/../.." && pwd)"
+repo_root="$(cd -- "$bundle_dir/.." && pwd)"
+
+exec "$repo_root/scripts/launch-hemlock.zsh" --repo-root "$repo_root" --app

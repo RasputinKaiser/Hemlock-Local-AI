@@ -1,0 +1,39 @@
+{
+  "ts": "2026-08-15T20:21:53+00:00",
+  "cwd": "/Users/ianzvirbulis/Code/Hemlock",
+  "git": {
+    "rev": "c49d28d",
+    "dirty": true
+  },
+  "output_estimator": "heuristic-chars/4",
+  "probes": {
+    "maple-health": {
+      "cmd": "zsh .optimize/maple_health_probe.sh",
+      "runs": 1,
+      "samples_s": [
+        3.264
+      ],
+      "median_s": 3.264,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 21,
+      "output_tokens": 6,
+      "output_tail": null
+    },
+    "maple-stream-dispatch": {
+      "cmd": "node .optimize/maple_stream_dispatch_probe.cjs",
+      "runs": 3,
+      "samples_s": [
+        0.053,
+        0.034,
+        0.033
+      ],
+      "median_s": 0.034,
+      "exit": 0,
+      "ok": true,
+      "output_bytes": 96,
+      "output_tokens": 24,
+      "output_tail": null
+    }
+  }
+}

@@ -278,3 +278,424 @@ live_workspace_v3:
     - "Full Maple-backed streaming/steering runtime proof still needs a live Electron replay with the extended timeout; the direct real lane now proves Maple channel preservation and parsed structured output."
     - "Target-M1 pointer/paint, delta-to-paint, artifact-refresh, long-task, and ten-minute buffer timing gates were not measured in this pass."
     - "A full ambitious multi-revision Maple-authored garden and bounded repair remain unproven in the real Maple lane; the deterministic fixture proves host behavior with an artistic fixture source."
+media_redaction:
+  status: complete
+  source: "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 9.28.45 PM.mov"
+  output: "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 9.28.45 PM-censored.mov"
+  duration_seconds: 27.9
+  video: "2870x1620 H.264 60fps"
+  original_preserved: true
+  redactions:
+    receipts: "Opaque redaction over the Receipts content region during 18.8-21.3s, covering the path lines through the scroll transition."
+    settings_runtime_storage: "Opaque redaction over the Runtime Storage path region during 23.25-24.7s."
+  verification:
+    ffprobe: passed
+    encoded_ocr: "0 suspicious username matches across 140 frames sampled at 5fps with macOS Vision OCR."
+    visual_checks: "Rendered frames checked at 18.8, 19.2, 19.8, 20.8, 21.3, 23.4, 24.4, and 24.7 seconds."
+
+video_showcase:
+  status: rendered_and_verified
+  project: video-showcase
+  sources:
+    - "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 10.38.46 PM.mov"
+    - "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 10.39.32 PM.mov"
+  source_preserved: true
+  output: video-showcase/exports/kin-timber-showcase-cut.mp4
+  ledger_asset: ".media/video/video_001.mp4"
+  duration_seconds: 41.033008
+  format: "1920x1080 H.264 yuv420p BT.709 at 30fps"
+  audio: "none; both supplied sources had no audio stream"
+  edit: "Eight selected windows with 0.18-second fades; UI pixels preserved; original 1.97:1 capture letterboxed into 16:9 without cropping."
+  proof:
+    render: passed
+    ffprobe: passed
+    decode: passed
+    visual_review: "normal, reduced/squint, blurred readability sheets, and transition-neighborhood checks inspected"
+
+video_showcase_revision_2:
+  status: rendered_and_verified
+  project: video-showcase
+  source_new: "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 10.53.45 PM.mov"
+  source_existing: "video-showcase/exports/kin-timber-showcase-cut.mp4"
+  source_preserved: true
+  output: "video-showcase/exports/kin-timber-showcase-cut-v3-smoothed.mp4"
+  ledger_asset: ".media/video/video_002.mp4"
+  duration_seconds: 49.466667
+  format: "1920x1080 H.264 yuv420p BT.709 at 30fps"
+  audio: "none; new source had no audio stream"
+  edit: "Construction arc added at the front; eight windows total with 0.18-second fades; UI pixels preserved; 16:9 letterbox without cropping."
+  frame_rate_smoothing: "Scene-aware linear interpolation from the new source's uneven roughly 23.44fps average to constant 30fps; existing first-pass material remained 30fps."
+  proof:
+    render: passed
+    ffprobe: passed
+    decode: passed
+    visual_review: "normal, reduced/squint, blurred readability sheets, and transition-neighborhood checks inspected"
+
+video_showcase_revision_3_x_paced:
+  status: rendered_and_verified
+  project: video-showcase
+  target: "X post"
+  source_new: "/Users/ianzvirbulis/Desktop/Screen Recording 2026-08-14 at 10.53.45 PM.mov"
+  source_existing: "video-showcase/exports/kin-timber-showcase-cut.mp4"
+  source_preserved: true
+  output: "video-showcase/exports/kin-timber-showcase-cut-x-paced.mp4"
+  ledger_asset: ".media/video/video_003.mp4"
+  duration_seconds: 30.2
+  format: "1920x1080 H.264 yuv420p BT.709 at 30fps"
+  audio: "none; source material had no audio stream"
+  edit: "Seven shorter beats; immediate construction hook; six 0.14-second fades; UI pixels preserved; 16:9 letterbox without cropping."
+  frame_rate_smoothing: "Scene-aware linear interpolation from the new source's uneven roughly 23.44fps average to constant 30fps; existing first-pass material remained 30fps."
+  proof:
+    render: passed
+    ffprobe: passed
+    decode: passed
+    visual_review: "normal, reduced/squint, blurred readability, and all six transition neighborhoods inspected"
+
+provider_integration:
+  status: implemented_with_claude_reauth_required
+  lanes:
+    maple_preview:
+      label: Maple-Preview
+      runtime: local MLX OpenAI-compatible endpoint at http://127.0.0.1:8080
+      reasoning: native
+    codex:
+      label: Codex
+      runtime: "authenticated codex exec JSONL subprocess"
+      sandbox: read-only
+      reasoning: [low, medium, high, xhigh, max]
+    claude:
+      label: Claude
+      runtime: "claude auth-backed stream-json subprocess"
+      reasoning: [low, medium, high, xhigh, max]
+  picker:
+    surface: top-right system bar
+    persistence: localStorage key hemlock-model-selection-v1
+    controls: provider lane, provider model, reasoning level
+  settings:
+    surface: Subscription providers
+    actions: [log_in, re_authenticate, log_out, refresh_status]
+    login_flow: "opens the provider's own interactive CLI flow in Terminal"
+    credential_boundary: "Hemlock never reads, asks for, or stores provider API keys, OAuth tokens, or subscription credentials"
+  host_routing:
+    conversation: "selected lane streams through the Electron host and preserves provider/source/raw-output receipts"
+    structured_actions: "selected external lanes are bounded to exact JSON action output; unsupported or malformed output remains blocked"
+  verification:
+    provider_parser_tests: passed
+    agent_tests: "41 passed"
+    ui_tests: "10 passed"
+    build: passed
+    browser_preview: "top-right picker, Codex reasoning menu, and Settings provider rows visually inspected"
+    codex_live_smoke: "passed; bounded prompt returned OK"
+    claude_live_smoke: "blocked; CLI returned HTTP 401 authentication_failed because the local OAuth access token was revoked"
+  claim_boundary: "The integration and manual login controls are implemented. Codex is live-verified through the authenticated CLI. Claude requires the user to choose Re-authenticate in Hemlock Settings, complete Claude's own login flow, then refresh status; local auth status alone is not treated as proof of a usable inference token."
+
+stability_pass_2026_08_15:
+  status: verified_with_codex_luna
+  requested_lane: "GPT-5.6 Luna through the Codex subscription lane; Maple-Preview and Dream inference were intentionally not run."
+  changes:
+    - "External Codex/Claude conversation inference now restarts after an accepted steering update, matching the existing Maple steering contract."
+    - "Provider CLI startup, nonzero exit, empty output, and authentication failures now leave a conversation task blocked with provider/model/reasoning, stream, and raw-output receipt context. Structured-action failures remain available to the existing repair/fallback loop."
+    - "Activity work notes and structured-action start events identify the selected provider instead of hard-coding Maple."
+  luna_delegation:
+    preflight: passed
+    role: goal_scout
+    result: blocked_by_existing_goal_board
+    note: "The named GPT-5.6 Luna scout returned goal-role-receipt.v1 but declined inspection because docs/goals/maple-dream-proper-app/state.yaml has one active Worker task T004; it did not reinterpret that task as a Scout audit."
+    configured_model: gpt-5.6-luna
+    runtime_model_slug: unverified
+  verification:
+    node_syntax: passed
+    agent_tests: "41 passed"
+    ui_tests: "10 passed"
+    build: passed
+    electron_desktop_startup: "passed; npm run desktop started Vite and Electron without a startup crash, then was stopped cleanly; no model inference was invoked"
+    yaml_parse: passed
+    diff_check: passed
+    codex_live_smoke: "passed with model gpt-5.6-luna; bounded prompt returned OK"
+    browser_preview: "passed; top-right Codex picker, gpt-5.6-luna model, max reasoning, Claude model/reasoning controls, Settings provider rows, reload persistence, and no app console errors"
+  unchanged_boundaries:
+    - "Maple-Preview remains available in the picker but was not invoked during this pass."
+    - "Claude live inference remains blocked by the previously observed revoked local OAuth token until the user completes Re-authenticate in Hemlock Settings."
+    - "Browser preview cannot prove desktop CLI login or Electron subprocess execution; the Codex live smoke was run directly through the authenticated Codex CLI."
+
+launch_shortcut_2026_08_15:
+  status: implemented
+  launcher: "Launch Hemlock.command at the repository root"
+  terminal_alias: "cd dream-chat && npm run launch"
+  model_picker_shortcut: "Cmd-Shift-M toggles the top-right model picker"
+  verification:
+    launcher_syntax: passed
+    launcher_smoke: "passed; quoted ./Launch Hemlock.command started npm run launch, Vite, and Electron, then was stopped cleanly"
+    picker_shortcut: "passed; Cmd-Shift-M opened and then closed the model picker in the rendered preview"
+    verify_agent: "passed; 41 agent tests, 10 UI tests, and production build"
+  claim_boundary: "The launcher starts the normal Vite plus Electron development pair; it does not start Maple, Dream, or a provider inference request by itself."
+
+performance_stability_2026_08_15:
+  status: implemented_with_measured_baseline
+  runtime_launch:
+    command: "maple.launch"
+    surface: "Dream Lab / Maple-Dream runtime card"
+    behavior: "Starts the local Maple process when needed, waits for /health, and deduplicates concurrent launch requests."
+    stability: "A child-process exit before readiness fails fast instead of waiting for the full readiness timeout."
+    inference_boundary: "Process health is reported separately from inference verification; the launch action sends no chat completion request and does not start Dream training."
+    receipt: "hemlock.maple.launch.v1"
+    failure_handling: "Maple child-process error and pre-readiness exit details are preserved in the launch failure receipt instead of waiting for a generic readiness timeout."
+  streaming:
+    status: implemented
+    change: "Maple stream deltas are accumulated per channel for one 16 ms host-to-renderer dispatch window; the terminal frame flushes queued content synchronously."
+    compatibility: "The host still accumulates exact channel text and emits monotonically increasing stream sequences; only redundant IPC frame frequency is reduced."
+    synthetic_probe: ".optimize/maple_stream_dispatch_probe.cjs"
+    synthetic_result: "4,000 source deltas became 2 IPC frames, a 99.95% reduction for the measured two-channel burst. This is an IPC result, not a claim about Maple token throughput."
+    unit_tests: "3 passed"
+  renderer:
+    closed_surfaces: "Closed windows no longer construct their full React surface; minimized windows retain their title bar without constructing hidden body content."
+    provider_status: "Codex and Claude CLI status checks are deferred until the model picker is opened or Settings Refresh is used; concurrent refreshes share one in-flight request."
+  verification:
+    maple_runtime_receipt_and_bridge_tests: "5 passed"
+    agent_tests: "47 passed"
+    ui_tests: "10 passed"
+    build: passed
+    node_syntax: passed
+    yaml_parse: passed
+    diff_check: passed
+    browser_preview: "passed; Dream Lab shows a disabled desktop-only Launch Maple / Dream button in browser preview with an explicit no-inference/no-training note"
+    electron_desktop_startup: "passed; npm run desktop started Vite and Electron without a startup crash, then was stopped cleanly; no Maple process or inference was invoked"
+  measured_devloop_baseline:
+    probe_file: ".optimize/probes.sh"
+    before_run: ".optimize/runs/20260815T154539.json"
+    after_run: ".optimize/runs/20260815T155327.json"
+    medians_seconds:
+      build: "0.462 -> 0.403"
+      agent_tests: "0.389 -> 0.384"
+      ui_tests: "0.284 -> 0.243"
+      syntax: "0.111 -> 0.092"
+    interpretation: "All probes stayed green. No wall-clock result exceeded the optimization skill's >5% or >2s acceptance threshold; the renderer/runtime changes are recorded as structural performance and stability work, not as a claimed timed speedup."
+  measured_maple_runtime:
+    health_probe: ".optimize/maple_health_probe.sh"
+    before_run: ".optimize/runs/20260815T-maple-baseline.json"
+    after_run: ".optimize/runs/20260815T-maple-after.json"
+    full_regression_run: ".optimize/runs/20260815T-maple-full-after.json"
+    health_ready_seconds: "5.228 -> 3.264; the faster after sample is recorded but not attributed to the code change because model-load timing is cache/system-state sensitive and the probe runs once per sample."
+    full_regression_medians_seconds: "build 0.366, agent-tests 0.577, ui-tests 0.301, syntax 0.118, maple-health 4.040, maple-stream-dispatch 0.047; all probes green."
+    stream_dispatch_seconds: "0.034 median over the focused after run and 0.047 median in the full regression run; the probe remained green after the change."
+  claim_boundary: "Maple/Dream launch is wired and host-boot verified. A successful local model health check and a browser button do not prove Maple inference quality, Dream training success, or provider authentication."
+
+maple_preview_agent_reliability_2026_08_15:
+  status: implemented_verified
+  interaction_mode:
+    payload_field: interactionMode
+    values: [explore, build]
+    default: explore
+    build_handoffs: ["build this", "make the artifact", "create the draft", "open a working version", "implement this", "fix this bug"]
+    behavior: "Visual ideation stays conversational; Build or a clear handoff creates the coding plan and preserves the single plan approval gate."
+  host_action_compiler:
+    command_identity: "Host always supplies the current planned commandId, kind, approval, evidence, taskId, step, and lifecycle status."
+    malformed_evidence: "One-key evidence objects normalize to string arrays; invalid values fall back to host plan evidence."
+    terminal_action: "Host creates the deterministic terminal action after the final planned command without another Maple inference."
+  artifact_autopilot:
+    storage: "Task-scoped Hemlock Application Support scratch artifacts; repository source remains untouched."
+    receipts: [manifest, revision, preview_session, inspection_report, verification_receipt, repair_receipt]
+    preview_handshake: "Renderer reports readiness, DOM/accessibility summaries, and console errors through the dedicated preview-report bridge; host validates task, artifact, revision, session, static source, and rendered content."
+    repair: "At most two bounded full-source or complete-file patch repairs; invalid candidates are rolled back and never become the last-good revision."
+    exhausted_actions: ["Retry repair", "Use last good revision"]
+  deterministic_fixture:
+    command: "npm run test:e2e:artifact-autopilot"
+    scenario: "Malformed action, commandId none, scratch creation, preview runtime error, malformed repair, successful repair, receipt-backed completion."
+    result: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+  verification:
+    agent_tests: "65 passed"
+    ui_tests: "10 passed"
+    build: passed
+    node_syntax: passed
+    yaml_parse: passed
+    diff_check: passed
+    electron_desktop_startup: "passed; npm run desktop reached Vite ready and Electron started without a startup crash, then was stopped cleanly; no model inference was invoked"
+    final_measurement: ".optimize/runs/20260815T-final-verify-2.json"
+  claim_boundary: "The deterministic host contract and repair behavior are proven locally. Live Maple artifact inference remains optional and is not claimed by the fixture; no repository mutation is automatic."
+
+maple_preview_hemlock_native_agent_2026_08_15:
+  status: implemented_verified
+  durable_threads:
+    implementation: "ThreadManager persists independent projects, user-assigned workspace roots, thread metadata, checkpoints, suggestions, provider caps, writer leases, and per-thread conversation JSONL references under Hemlock Application Support."
+    ui: "Chat exposes a thread/project switcher, New thread flow, current workspace scope, provider/model context, status, and host-generated suggestion cards. Switching restores the selected thread's task projection and conversation history reference."
+    restart_boundary: "Unfinished work is restored as a resumable blocked/paused projection; startup does not resume execution without an explicit user action. Workspace digest is revalidated on resume."
+  provider_scheduler:
+    defaults: { maple: 1, codex: 2, claude: 2 }
+    behavior: "Maple-Preview is serialized by a host-owned provider lease; Codex and Claude use bounded independent lanes. Provider changes are explicit and affect the next request/resume, never an inference already in flight."
+    controls: "Provider caps are persisted through provider.capacity and exposed in the Command Center scheduler panel."
+  coding_autonomy:
+    plan: [context.refresh, repo-map, repo.inspect, git.status, code.apply, verify, git.diff]
+    mutation: "Complete source maps or bounded complete-file patches are restricted to the assigned workspace, guarded by a same-directory writer lease, secret-sensitive path rejection, base-digest checks, before/after digests, rollback manifests, and change-set receipts."
+    repair: "Coding verification failures get at most two host-owned repair passes; failed candidates roll back and the last-good change-set remains active."
+    completion_gate: "A general coding task cannot complete without an applied hemlock.agent.change-set.v1 and a passing hemlock.agent.verification.v1 receipt. Artifact tasks retain the preview verification gate."
+    escalation: "Maple failures produce an unread provider-escalation suggestion for explicit Codex/Claude retry; there is no silent provider fallback."
+  context_and_metrics:
+    checkpoint_fields: "Thread/task/provider/model/reasoning/phase/active plan step/pending action/evidence/workspace digest/repair/issues/autonomy are durable at lifecycle boundaries."
+    conversation: "User and assistant conversation entries are stored per thread with provider/model/reasoning and raw output references; unrelated thread history is not sent as inference context."
+  verification:
+    agent_tests: "65 passed"
+    ui_tests: "10 passed"
+    build: passed
+    syntax: passed
+    agent_evaluation: "validActionRate=1; falseSuccessCount=0 on the supplied trace evaluator"
+    artifact_fixture: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+    desktop_startup: "npm run desktop reached Vite ready and started Electron; the bounded smoke was stopped cleanly after startup. No Maple, Dream, Codex, or Claude inference was invoked."
+  claim_boundary: "The host-owned thread/scope/scheduler/coding contracts and deterministic artifact repair fixture are verified locally. Live multi-provider concurrency, live Maple coding quality, and full simultaneous kernel projection rehydration remain runtime-dependent and were not claimed by these tests."
+
+live_maple_validation_2026_08_15:
+  status: blocked_on_model_action_format
+  command: "HEMLOCK_MAPLE_MAX_MS=120000 npm run test:e2e:artistic-maple"
+  health: "passed; /health returned status ok after MAPLE_AUTOSTART_SERVER=1 npm run desktop"
+  conversation: "passed; real Maple streaming returned non-empty content with reasoning and content channels"
+  structured_action: "blocked; parseStatus invalid JSON, finish_reason length, completion token budget 4096; the response included an incomplete/non-contract artifact action envelope"
+  elapsed_ms: 80752
+  receipt: "/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-maple-1786835168879.json"
+  claim_boundary: "The real Maple process and conversation path were exercised. The endpoint did not complete a structured artifact action, so no host artifact mutation or completion was claimed."
+
+maple_action_contract_and_variation_fix_2026_08_15:
+  status: implemented_verified
+  host_contract:
+    compact_context: "Structured-action inference now sends a compact task/context/next-step payload without full conversation history or duplicate raw task state."
+    budgets: "Non-authoring Maple action turns use max_tokens 1536; artifact.author, artifact.update, and code.apply turns retain 8192 source headroom."
+    payload_shapes: [full_action_envelope, compact_bare_payload, direct_relative_file_map]
+    recovery: "Host can recover a truncated envelope's registered command metadata, coerce a bare payload into the current planned command, filter command-specific inputs, and still validate allowlist, scope, approval, and evidence host-side."
+    artifact_create: "Only metadata is accepted; source/html/data/patch payloads are discarded until the later author step. Invalid artifact kind/entrypoint values receive host defaults."
+    authoring_variation: "Valid source is preserved as model-owned input; the host fallback is used only for malformed/incomplete authoring and is not the normal visual template."
+  deterministic_variation_fixture:
+    command: "npm run test:e2e:artistic-variations-fixture"
+    result: "requested=4; passed=4; uniqueSourceCount=4; diversity=varied"
+    styles: [css_dom, svg_botanical, canvas_particles, kinetic_cards]
+  verification:
+    agent_tests: "70 passed"
+    ui_tests: "10 passed"
+    build: passed
+    syntax: passed
+    artifact_autopilot: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+  live_compact_action:
+    command: "HEMLOCK_MAPLE_MAX_MS=120000 npm run test:e2e:artistic-maple"
+    status: host_normalizable
+    conversation: "passed; real Maple streaming returned role/reasoning/content channels"
+    structured_action: "returned a compact bare metadata object rather than the requested full envelope; host coercion produced a hemlock.agent.action.v1 artifact.create action with taskId, commandId, approval, and evidence"
+    source_execution: "not claimed; the standalone runner intentionally does not mutate or preview an artifact"
+    elapsed_ms: 26044
+    receipt: "/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-maple-1786835972852.json"
+  live_variation_matrix:
+    command: "HEMLOCK_MAPLE_MAX_MS=180000 npm run test:e2e:artistic-variations"
+    status: blocked_on_local_authoring_budget
+    result: "requested=4; passed=0; failed=4; the first long source-authoring turn returned no usable content before the shared 180000ms budget expired, leaving insufficient budget for the remaining variants"
+    receipt: "/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-variations-1786836159847.json"
+    thinking_disabled_probe: "HEMLOCK_MAPLE_MAX_MS=90000 HEMLOCK_MAPLE_VARIATION_LIMIT=1 npm run test:e2e:artistic-variations also returned no complete input.source before its 90000ms budget; chat_template_kwargs.enable_thinking=false is wired but did not establish live authoring success on this run"
+    thinking_disabled_receipt: "/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-variations-1786836576864.json"
+    claim_boundary: "Live Maple source-variation quality and renderer correctness remain unproven. The host contract and deterministic four-style variation fixture are green; the local model needs a shorter/faster authoring strategy or a larger bounded authoring budget for live multi-variant proof."
+
+maple_reasoning_streaming_variation_followup_2026_08_15:
+  status: implemented_with_live_model_boundaries
+  changes:
+    reasoning: "Removed the structured-action thinking suppression. Maple requests now explicitly use chat_template_kwargs.enable_thinking=true; reasoning is recorded and streamed rather than discarded."
+    live_streaming: "Structured Maple actions use SSE through an internal agent_action stream; the renderer keeps that internal trace in Activity while only model_text streams materialize as conversational messages."
+    server_output_ceiling: "Raised the local Maple server ceiling from 512 to 4096 output tokens so reasoning does not consume the entire authoring response before source is emitted. Per-request budgets remain host-controlled."
+    payload_normalization: "Host coercion now accepts Maple's flattened input.source authoring shape as well as nested input.source and direct relative-file maps."
+    variation_probe: "Live variation probes use streaming plus reasoning, support selecting individual styles, cap index.html to 2200 characters, and record bounded channel diagnostics on failure."
+  verification:
+    agent_tests: "71 passed"
+    ui_tests: "10 passed"
+    build: passed
+    artifact_autopilot: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+    variation_fixture: "requested=4; passed=4; uniqueSourceCount=4; diversity=varied"
+    syntax: "all electron/*.cjs syntax valid"
+    state_yaml: valid
+    diff_check: passed
+    reasoning_disable_scan: "no enable_thinking=false paths remain under dream-chat"
+    live_action: "conversation and structured artifact.create action both streamed role/reasoning/content channels; host normalized the action; receipt=/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-maple-1786837099710.json"
+    live_css_dom: "passed; one real Maple CSS/DOM animation produced a bounded 2250-character source map with css-animation signature; receipt=/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-variations-1786837455164.json"
+    live_full_matrix: "requested=4; passed=1; failed=3 by the shared 240000ms local Maple budget; CSS/DOM passed, later SVG/canvas/kinetic turns did not complete usable content; receipt=/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-variations-1786837708924.json"
+    live_svg_isolated: "requested=1; passed=0; Maple emitted SVG source in the reasoning channel but finished with length before a complete content action; host correctly did not claim it; receipt=/Users/ianzvirbulis/Library/Application Support/Hemlock/e2e/maple/artistic-variations-1786837801717.json"
+  claim_boundary: "Reasoning and live streaming are now enabled in the runtime contract, and one real Maple animation variation passed host source-shape validation. The remaining live styles still need a compact authoring/retry strategy and renderer verification; deterministic four-style diversity remains green and is not substituted for live-model proof."
+
+maple_reasoning_no_forced_budget_followup_2026_08_15:
+  status: implemented_verified
+  policy: "Maple reasoning is always enabled for local conversation, structured actions, and artistic variation probes. The prompt no longer asks Maple to keep reasoning short, and the old 1536-token ordinary-action versus 8192-token authoring split is removed."
+  runtime: "The host uses a shared configurable Maple output ceiling: 16384 tokens by default, with HEMLOCK_MAPLE_MAX_TOKENS available for explicit tuning and a host floor of 4096. This is transport/server capacity, not a reasoning instruction; Maple may stop naturally when it is done. Invalid environment values fall back safely to the default."
+  streaming: "Conversation uses the host SSE path and structured actions use an internal agent_action SSE path. Reasoning and content deltas are retained as separate channels; only conversational model_text streams become Chat messages, while action reasoning remains visible in Activity."
+  boundaries: "Source-file size, path scope, safety approval, artifact repair count, preview verification, and inference wall-clock cancellation remain host-owned reliability boundaries. They do not impose a short reasoning-word budget."
+  verification:
+    agent_tests: "71 passed"
+    ui_tests: "10 passed"
+    build: passed
+    artifact_autopilot: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+    variation_fixture: "requested=4; passed=4; uniqueSourceCount=4; diversity=varied"
+    syntax: "main.cjs, e2e_artistic_maple.cjs, and e2e_artistic_variations.cjs valid"
+    state_yaml: valid
+    diff_check: passed
+  live_boundary: "The prior live matrix remains the honest model-quality result: one CSS/DOM variation passed, while SVG/canvas/kinetic attempts did not complete usable source within the shared local budget. The host did not claim those failures as completed artifacts; deterministic four-style variation coverage remains green."
+
+maple_adaptive_capability_loop_2026_08_15:
+  status: implemented_verified
+  model_freedom: "An approved plan is now a user-approved capability boundary and starting direction, not a positional command script. Maple receives the current evidence, the current planned step, and an allowlisted allowedNextCommands set, then may select the next useful safe read, inspect, verify, artifact, preview, or plan-approved write action."
+  adaptive_plan: "When Maple selects an allowlisted action outside the current step, Hemlock either moves that action forward from the remaining approved plan or inserts a host-owned adaptive step. The plan records adaptiveDecisions, plan.adapted is emitted, and action.hostSelection records requested versus selected command identity."
+  recovery: "Missing or none commandIds fall back to the current approved step. Unknown, unsafe, or unavailable model commands fall back to that step with action.command.recovered evidence instead of unnecessarily killing the whole task. Inputs are filtered through the command-specific host contract before execution."
+  model_control: "Maple can return ask_user, blocked, or answer when that is the genuinely useful next state; the host preserves those terminal/pausing intentions while retaining lifecycle and completion gates."
+  safety_boundary: "Adaptive selection is limited to registered safe capabilities. Training, runtime, external/network, secret-sensitive, destructive, and explicit-only operations cannot be introduced by model choice. Workspace scope, approval, verification, and receipt-backed completion remain host-owned."
+  verification:
+    agent_tests: "74 passed"
+    ui_tests: "10 passed"
+    build: passed
+    artifact_autopilot: "completed=true; inferenceCalls=7; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+    variation_fixture: "requested=4; passed=4; uniqueSourceCount=4; diversity=varied"
+    syntax: "agent_kernel.cjs, agent_contracts.cjs, and agent_orchestrator.cjs valid"
+    state_yaml: valid
+    diff_check: passed
+  claim_boundary: "The deterministic loop now proves adaptive safe action selection, unavailable-command recovery, and user-question pausing. Live Maple still remains non-deterministic; these host changes do not claim that every local model variation will author or verify successfully."
+
+hemlock_double_click_launcher_2026_08_15:
+  status: implemented_verified_with_native_maple_smoke
+  user_path: "Double-click Hemlock.app at the repository root; Launch Hemlock.command remains the terminal-friendly fallback."
+  launcher: "scripts/launch-hemlock.zsh starts npm run desktop with MAPLE_AUTOSTART_SERVER=1, writes ~/Library/Logs/Hemlock/launch.log, and uses a PID-backed user-level lock to ignore duplicate starts and recover stale locks."
+  app_bundle: "Hemlock.app/Contents/Info.plist and Hemlock.app/Contents/MacOS/Hemlock are executable and resolve the neighboring dream-chat worktree. A Finder alias is supported; moving the bundle away from the worktree is intentionally not treated as portable installation."
+  runtime_fix: "Electron now pins universal Python child processes through /usr/bin/arch to the host architecture by default, with HEMLOCK_PYTHON_ARCH=arm64|x86_64 available for an intentional override. This prevents an x86_64 Python slice from loading the arm64-only MLX extension."
+  verification:
+    plist: "plutil -lint Hemlock.app/Contents/Info.plist passed"
+    syntax: "node --check dream-chat/electron/main.cjs and zsh -n launcher scripts passed"
+    dry_run: "Hemlock.app and Launch Hemlock.command both resolved npm and MAPLE_AUTOSTART_SERVER=1"
+    actual_double_click: "open Hemlock.app started the launcher, Vite at http://127.0.0.1:5173/, Electron, and Maple with architecture=arm64"
+    maple_health: "GET http://127.0.0.1:8080/health returned {status: ok}"
+    duplicate_launch: "A concurrent Launch Hemlock.command returned 0 and logged the existing launcher PID without starting a second desktop"
+  claim_boundary: "The app startup and Maple process-health path are verified. The smoke did not claim a completed model inference; Hemlock's UI still distinguishes process readiness from inference readiness."
+
+maple_live_loop_and_preview_stability_2026_08_15:
+  status: implemented_verified_after_runtime_restart
+  handoff_detection:
+    behavior: "Natural requests such as Build a new unique interactive animation artifact and Build an actual webapp enter Build mode; visual ideation and create-a-concept phrasing remain Explore unless there is a clear handoff. Renderer and host classifiers stay aligned."
+  host_preview_progression:
+    behavior: "artifact.preview.open and artifact.preview.inspect are host-deterministic approved-plan steps. Hemlock fills artifact/session identifiers from receipts and does not spend another Maple structured-action turn restating them. Repository inspection and safe adaptive selection remain model-driven."
+    measured_fixture: "Artifact autopilot completed with inferenceCalls=5, terminalInferenceCalls=0, repairCalls=2, previewInspectionCalls=2, artifactRevisionCount=2, repositoryTouched=false, falseSuccess=false."
+  maple_stream_contract:
+    behavior: "Repeated role metadata is excluded from model output channels; reasoning and content remain streamed and durable. Structured-action parsing can recover an envelope emitted in a reasoning channel. Stored SSE payloads are compacted to deltas while channel text remains complete."
+    observed_receipt: "The prior 5,112,972-byte streamed payload trace projects to 4,293,744 bytes under the compact payload representation, a 16.02% reduction; the source receipt remains untouched."
+  ipc_stability:
+    behavior: "agent:state and agent:cancel now receive bounded plain-data stream snapshots rather than active coalescers/controllers, preventing Electron structured-clone failures and preserving cancellation visibility."
+    runtime_observation: "Before restart, launch.log recorded An object could not be cloned for agent:state and agent:cancel. After restart with the fix loaded, Maple health returned status ok and no new clone errors appeared in the observed launch log."
+  verification:
+    agent_tests: "81 passed"
+    ui_tests: "10 passed"
+    build: passed
+    artifact_autopilot: "completed=true; inferenceCalls=5; terminalInferenceCalls=0; repairCalls=2; repairAttempts=2; previewInspectionCalls=2; artifactRevisionCount=2; repositoryTouched=false; falseSuccess=false"
+    variation_fixture: "requested=4; passed=4; uniqueSourceCount=4; diversity=varied"
+    syntax: "main.cjs, stream_protocol.cjs, agent_orchestrator.cjs, interaction_modes.cjs, and launch-hemlock.zsh passed syntax checks"
+    diff_check: passed
+    maple_health_after_restart: "GET http://127.0.0.1:8080/health returned {status: ok}; running desktop processes are the restarted launcher, Vite, Electron, and arm64 Maple server."
+  claim_boundary: "The host no longer loops preview actions or fails state/cancel IPC on non-cloneable stream internals. The local Maple model remains non-deterministic: a long reasoning response may still take time, and no live artifact-quality claim is made by these host and fixture checks."
+
+github_publish_2026_08_15:
+  status: blocked_by_repository_permission
+  target: "https://github.com/deepgrove-ai/mlx-lm-deepgrove"
+  branch: agent/hemlock-maple-stability
+  local_commit_before_receipt: "259d64c Add Hemlock-native Maple agent workflow"
+  push_attempt: "git push -u origin agent/hemlock-maple-stability returned HTTP 403; no remote branch or PR was created."
+  authenticated_account: RasputinKaiser
+  repository_permission: "GitHub API reports viewerPermission=READ and permissions.push=false."
+  excluded_dirty_roots:
+    - .media/
+    - video-showcase/
+    - work/
+  claim_boundary: "The scoped Hemlock changes are committed locally and ready for an account with write access. Merge and deployment cannot be claimed until the branch is pushed; this repository has no Hemlock deployment workflow configured."

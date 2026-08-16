@@ -14,8 +14,10 @@ class PreviewSessionManager {
     this.sessions = new Map();
   }
   open({ taskId, artifactId, revision }) {
+    const existing = [...this.sessions.values()].find((item) => item.status === "running" && item.taskId === taskId && item.artifactId === artifactId && Number(item.revision) === Number(revision));
+    if (existing) return { ...existing };
     const id = `preview-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
-    const session = { schema: PREVIEW_SCHEMA, id, taskId, artifactId, revision, status: "running", startedAt: this.now(), actions: 0, retries: {}, screenshots: 0, paused: false, visible: true, lastInspectionDigest: null };
+    const session = { schema: PREVIEW_SCHEMA, id, taskId, artifactId, revision, status: "running", startedAt: this.now(), actions: 0, retries: {}, screenshots: 0, paused: false, visible: true, lastInspectionDigest: null, inspectionReport: null };
     this.sessions.set(id, session);
     return { ...session };
   }
@@ -45,6 +47,13 @@ class PreviewSessionManager {
     return record;
   }
   inspect(sessionId, input = {}) { const session = this.get(sessionId); session.lastInspectionDigest = input.digest || digest(JSON.stringify(input)); return { ...session }; }
+  recordReport(sessionId, report) {
+    const session = this.get(sessionId);
+    session.lastInspectionDigest = report?.inspectionDigest || digest(JSON.stringify(report || {}));
+    session.inspectionReport = report || null;
+    session.lastInspectionAt = this.now();
+    return { ...session };
+  }
   pause(sessionId) { const session = this.get(sessionId); session.paused = true; this.emit("artifact.interaction.blocked", "blocked", { session: { ...session }, reason: "preview_paused" }); return { ...session }; }
   stop(sessionId, reason = "user_stopped") { const session = this.get(sessionId); session.status = "stopped"; session.stopReason = reason; session.stoppedAt = this.now(); this.emit("artifact.preview.stopped", "completed", { session: { ...session } }); return { allowed: false, reason, session: { ...session } }; }
 }

@@ -47,3 +47,16 @@ test("preserves host authoring status and evidence on a complete revision", () =
   assert.equal(authored.revisions.at(-1).status, "previewable");
   assert.equal(authored.evidence.at(-1).type, "authoring.host_fallback");
 });
+
+test("applies bounded complete-file patches and restores the prior revision", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hemlock-artifact-"));
+  const registry = new ArtifactRegistry({ root, workspaceId: "workspace-test" });
+  registry.create({ taskId: "task-1", artifactId: "garden", kind: "html" });
+  const first = registry.author({ taskId: "task-1", artifactId: "garden", kind: "html", filename: "index.html", runtimeTemplate: "html", objective: "Make a garden", source: { "index.html": "<main>good</main>" }, status: "previewable" });
+  const second = registry.update({ taskId: "task-1", artifactId: "garden", patches: [{ path: "index.html", content: "<main>candidate</main>" }], status: "previewable" });
+  assert.equal(second.source["index.html"], "<main>candidate</main>");
+  const restored = registry.restore({ taskId: "task-1", artifactId: "garden", revision: first.revision });
+  assert.equal(restored.revision, first.revision);
+  assert.equal(restored.source["index.html"], "<main>good</main>");
+  assert.throws(() => registry.update({ taskId: "task-1", artifactId: "garden", patches: [{ path: "index.html", content: 42 }] }), /complete text content/);
+});

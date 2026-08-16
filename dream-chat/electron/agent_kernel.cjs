@@ -315,6 +315,14 @@ class AgentKernel {
     return plan;
   }
 
+  updatePlan(planId, patch = {}) {
+    const plan = this.state.plans.find((item) => item.id === planId);
+    if (!plan) throw new Error(`Hemlock plan was not found: ${planId}`);
+    Object.assign(plan, patch, { updatedAt: nowIso() });
+    this.persist("plan.updated", { plan });
+    return plan;
+  }
+
   createAction(action) {
     if (!action?.id) throw new Error("A durable action needs an id.");
     const existing = this.state.actions.find((item) => item.id === action.id);

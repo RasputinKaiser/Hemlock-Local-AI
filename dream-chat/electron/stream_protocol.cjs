@@ -58,8 +58,65 @@ function parseSsePayload(event) {
 function extractModelChannels(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return [];
   return Object.entries(value)
-    .filter(([, text]) => typeof text === "string" && text.length > 0)
+    // `role` is transport metadata, not a model-output channel. Some local
+    // Maple templates repeat `role: "assistant"` on every streamed delta;
+    // treating it as text makes the durable trace grow by megabytes and
+    // produces misleading assistantassistantassistant... output in Activity.
+    .filter(([name, text]) => name !== "role" && typeof text === "string" && text.length > 0)
     .map(([name, text]) => ({ name, text }));
+}
+
+function compactModelPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const choice = payload.choices?.[0];
+  if (!choice || typeof choice !== "object") return payload;
+  const compactChoice = {};
+  if (choice.delta && typeof choice.delta === "object") {
+    compactChoice.delta = Object.fromEntries(extractModelChannels(choice.delta).map(({ name, text }) => [name, text]));
+  }
+  if (choice.message && typeof choice.message === "object") {
+    compactChoice.message = Object.fromEntries(extractModelChannels(choice.message).map(({ name, text }) => [name, text]));
+  }
+  if (choice.finish_reason !== undefined && choice.finish_reason !== null) compactChoice.finish_reason = choice.finish_reason;
+  const compact = { choices: [compactChoice] };
+  for (const key of ["id", "object", "model", "created", "system_fingerprint"]) {
+    if (payload[key] !== undefined) compact[key] = payload[key];
+  }
+  if (payload.usage !== undefined) compact.usage = payload.usage;
+  return compact;
+}
+
+function selectStructuredActionText(message) {
+  const channels = extractModelChannels(message);
+  const actionPattern = /hemlock\.agent\.action\.v1|["']commandId["']\s*:/i;
+  const actionChannel = channels.find(({ text }) => actionPattern.test(text));
+  if (actionChannel) return { text: actionChannel.text, channel: actionChannel.name };
+  const content = channels.find(({ name }) => name === "content");
+  return { text: content?.text || "", channel: content?.name || null };
+}
+
+function streamStateSnapshot(stream, tailLength = 2400) {
+  if (!stream || typeof stream !== "object") return null;
+  const boundedTail = Math.max(0, Number(tailLength) || 0);
+  const tail = (text) => boundedTail > 0 ? text.slice(-boundedTail) : "";
+  const channels = Object.fromEntries(Object.entries(stream.channels || {})
+    .filter(([name, text]) => name !== "role" && typeof text === "string")
+    .map(([name, text]) => [name, tail(text)]));
+  return {
+    streamId: stream.streamId || null,
+    taskId: stream.taskId || null,
+    operationId: stream.operationId || null,
+    kind: stream.kind || null,
+    provider: stream.provider || null,
+    sequence: Number(stream.sequence || 0),
+    text: typeof stream.text === "string" ? tail(stream.text) : "",
+    channels,
+    terminal: Boolean(stream.terminal),
+    startedAt: stream.startedAt || null,
+    lastCheckpointAt: stream.lastCheckpointAt || null,
+    lastCheckpointBytes: Number(stream.lastCheckpointBytes || 0),
+    abortReason: stream.abortReason || null,
+  };
 }
 
 function extractModelDelta(payload) {
@@ -78,4 +135,14 @@ function createStreamId(prefix = "stream") {
   return `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
-module.exports = { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, createStreamId, digest };
+module.exports = {
+  Utf8SseParser,
+  parseSsePayload,
+  extractModelChannels,
+  extractModelDelta,
+  compactModelPayload,
+  selectStructuredActionText,
+  streamStateSnapshot,
+  createStreamId,
+  digest,
+};
