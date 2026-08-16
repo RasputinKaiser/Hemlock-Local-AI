@@ -699,3 +699,17 @@ github_publish_2026_08_15:
     - video-showcase/
     - work/
   claim_boundary: "The scoped Hemlock changes are committed locally and ready for an account with write access. Merge and deployment cannot be claimed until the branch is pushed; this repository has no Hemlock deployment workflow configured."
+
+github_repo_publish_2026_08_15:
+  status: published
+  repository: "https://github.com/RasputinKaiser/Hemlock-Local-AI"
+  visibility: private
+  default_branch: main
+  published_commit: "8a936194912fd4eacbe83cc3ca4839ecc650b254"
+  follow_up_receipt_commit: pending
+  verification: "GitHub API reports the repository exists, is private, defaults to main, and main contains Add Hemlock-native Maple agent workflow."
+  excluded_dirty_roots:
+    - .media/
+    - video-showcase/
+    - work/
+  claim_boundary: "The dedicated GitHub repository and main branch are published. No deployment target is configured for this repository yet."
