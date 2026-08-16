@@ -90,11 +90,15 @@ function formatElapsed(seconds) {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
+function redactUserPaths(value) {
+  return String(value).replace(/\/Users\/[^/\s"'`<>]+/g, "~");
+}
+
 function displayText(value, fallback = "—") {
   if (value == null || value === "") return fallback;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return redactUserPaths(value);
   if (Array.isArray(value)) return value.map((item) => displayText(item, "")).filter(Boolean).join(" · ") || fallback;
-  try { return JSON.stringify(value); } catch { return fallback; }
+  try { return redactUserPaths(JSON.stringify(value)); } catch { return fallback; }
 }
 
 function compactPreview(value, maxLength = 150) {
@@ -415,6 +419,30 @@ function App() {
     });
   }
 
+  function hydrateAgentSnapshot(snapshot) {
+    if (!snapshot) return;
+    setAgentSnapshot(snapshot);
+    setAgentProjection(snapshot.runtime?.workspace || snapshot.agent || null);
+    setArtifacts(snapshot.runtime?.workspace?.artifacts || []);
+    setActiveArtifactId(snapshot.runtime?.workspace?.activeArtifactId || snapshot.runtime?.workspace?.artifacts?.at(-1)?.id || null);
+    setPreviewSession(snapshot.runtime?.workspace?.previewSession || null);
+    if (snapshot.runtime?.workspace?.activeStreams) setStreamFrames(snapshot.runtime.workspace.activeStreams);
+    if (snapshot.queue) setQueueState(snapshot.queue);
+    setCandidates(snapshot.runtime?.workspace?.candidates || snapshot.agent?.candidates || []);
+    setSourcePolicies(snapshot.runtime?.workspace?.sources || snapshot.agent?.sources || snapshot.context?.sources || []);
+    if (snapshot.task) setTask(snapshot.task);
+    if (snapshot.context) setContextSnapshot(snapshot.context);
+    if (snapshot.server) {
+      setServerProcessReady(snapshot.server.processReady);
+      setInferenceReady(snapshot.server.inferenceReady);
+      setAdapterVerified(snapshot.server.adapterPath ? snapshot.server.inferenceReady : null);
+    }
+    setEvents(snapshot.events || []);
+    if (snapshot.providers) setProviderStatuses(snapshot.providers);
+    if (snapshot.threads) setThreadRegistry(snapshot.threads);
+    if (snapshot.suggestions) setSuggestions(snapshot.suggestions);
+  }
+
   function appendConversationResponse(conversation) {
     const channels = Array.isArray(conversation?.channels) ? conversation.channels : [];
     if (!conversation || (!conversation.answer && !channels.length)) return;
@@ -542,26 +570,7 @@ function App() {
     let disposed = false;
     agent.getState().then((snapshot) => {
       if (disposed) return;
-      setAgentSnapshot(snapshot);
-      setAgentProjection(snapshot.runtime?.workspace || snapshot.agent || null);
-      setArtifacts(snapshot.runtime?.workspace?.artifacts || []);
-      setActiveArtifactId(snapshot.runtime?.workspace?.activeArtifactId || snapshot.runtime?.workspace?.artifacts?.at(-1)?.id || null);
-      setPreviewSession(snapshot.runtime?.workspace?.previewSession || null);
-      if (snapshot.runtime?.workspace?.activeStreams) setStreamFrames(snapshot.runtime.workspace.activeStreams);
-      if (snapshot.queue) setQueueState(snapshot.queue);
-      setCandidates(snapshot.runtime?.workspace?.candidates || snapshot.agent?.candidates || []);
-      setSourcePolicies(snapshot.runtime?.workspace?.sources || snapshot.agent?.sources || snapshot.context?.sources || []);
-      if (snapshot.task) setTask(snapshot.task);
-      if (snapshot.context) setContextSnapshot(snapshot.context);
-      if (snapshot.server) {
-        setServerProcessReady(snapshot.server.processReady);
-        setInferenceReady(snapshot.server.inferenceReady);
-        setAdapterVerified(snapshot.server.adapterPath ? snapshot.server.inferenceReady : null);
-      }
-      setEvents(snapshot.events || []);
-      if (snapshot.providers) setProviderStatuses(snapshot.providers);
-      if (snapshot.threads) setThreadRegistry(snapshot.threads);
-      if (snapshot.suggestions) setSuggestions(snapshot.suggestions);
+      hydrateAgentSnapshot(snapshot);
     }).catch((stateError) => setError(`Hemlock runtime state unavailable: ${stateError.message}`));
     const stop = agent.subscribe?.((event) => {
       setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event].slice(-160));
@@ -891,6 +900,26 @@ function App() {
     }
   }
 
+  async function refreshAgentState() {
+    const agent = desktopAgent();
+    if (!isDesktop || !agent?.getState) {
+      setError("The durable plan is available in the Hemlock desktop control plane.");
+      return null;
+    }
+    setCommandBusy("agent.state");
+    setError("");
+    try {
+      const snapshot = await agent.getState();
+      hydrateAgentSnapshot(snapshot);
+      return snapshot;
+    } catch (stateError) {
+      setError(`Hemlock runtime state unavailable: ${stateError.message}`);
+      return null;
+    } finally {
+      setCommandBusy("");
+    }
+  }
+
   async function refreshThreadRegistry() {
     const result = await runCommand("thread.list");
     if (result?.threads) setThreadRegistry(result);
@@ -911,7 +940,11 @@ function App() {
   }
 
   async function createThread() {
-    const workspaceRoot = window.prompt("Project directory for this Hemlock thread:", task.workspaceRoot || "");
+    if (!isDesktop) {
+      setError("New threads require the Hemlock desktop control plane.");
+      return;
+    }
+    const workspaceRoot = window.prompt("Project directory for this Hemlock thread (the path stays local and is not shown in Hemlock UI):", "");
     if (!workspaceRoot?.trim()) return;
     const result = await runCommand("thread.create", { workspaceRoot: workspaceRoot.trim(), title: "New Hemlock thread", provider: modelSelection.provider, model: modelSelection.model, reasoning: modelSelection.reasoning, autonomy: "bounded-local" });
     if (result?.thread) await switchThread(result.thread.id);
@@ -1361,13 +1394,15 @@ function App() {
     const trace = events.slice(-4).reverse();
     const receipts = events.filter((event) => event.evidenceRefs?.length || event.type.includes("completed") || event.type.includes("failed")).slice(-5).reverse();
     const taskEvent = (event) => event.taskId === task.id || event.payload?.taskId === task.id || event.payload?.task?.id === task.id;
+    const latestTaskEvent = events.filter(taskEvent).at(-1) || null;
+    const latestEvent = latestTaskEvent;
     const blockers = events.filter((event) => taskEvent(event) && (event.status === "failed" || event.type.includes("blocked"))).slice(-2).reverse();
     const plans = (agentProjection?.plans || []).filter((item) => item.taskId === task.id);
     const actions = (agentProjection?.actions || []).filter((item) => item.taskId === task.id);
     const activePlan = plans.find((item) => item.id === task.activePlanId) || plans.at(-1) || null;
     const activeAction = actions.find((item) => item.id === task.activeActionId) || actions.filter((item) => !["completed", "failed", "cancelled", "blocked", "rejected"].includes(item.status)).at(-1) || null;
     const observations = agentProjection?.observations || [];
-    const latestObservation = observations.at(-1) || null;
+    const latestObservation = observations.filter((observation) => observation.taskId === task.id).at(-1) || null;
     const planNeedsApproval = activePlan?.status === "proposed" || (task.status === "waiting_for_approval" && !activeAction);
     const actionNeedsApproval = Boolean(activeAction && ["proposed", "validated"].includes(activeAction.status) && activePlan?.status === "approved");
     const activeCandidates = candidates.filter((item) => ["candidate", "accepted", "snoozed"].includes(item.status)).slice().reverse();
@@ -1450,11 +1485,24 @@ function App() {
     const taskEvents = events.filter((event) => event.taskId === task.id || event.payload?.taskId === task.id || event.payload?.task?.id === task.id);
     const workNotes = taskEvents.map((event) => ({ event, note: conciseAgentNote(event, task) })).filter((item) => item.note).slice(-12);
     const liveStreams = streamFrames.filter((stream) => stream.kind === "model_text" && !stream.terminal);
+    const plans = (agentProjection?.plans || []).filter((plan) => plan.taskId === task.id);
+    const planFromEvents = taskEvents.slice().reverse().map((event) => event.payload?.plan).find(Boolean) || null;
+    const activePlan = plans.find((plan) => plan.id === task.activePlanId) || planFromEvents || plans.at(-1) || null;
     const actions = (agentProjection?.actions || []).filter((action) => action.taskId === task.id);
     const activeAction = actions.find((action) => action.id === task.activeActionId) || actions.filter((action) => !["completed", "failed", "cancelled", "blocked", "rejected"].includes(action.status)).at(-1) || actions.at(-1) || null;
     const latestActionEvent = taskEvents.filter((event) => event.type.startsWith("action.") || event.type.startsWith("command.")).at(-1) || null;
-    const latestObservation = (agentProjection?.observations || []).filter((observation) => observation.taskId === task.id || !observation.taskId).at(-1) || null;
-    const evidenceRefs = [...new Set([...(latestObservation?.evidenceRefs || []), ...(latestActionEvent?.evidenceRefs || []), ...(task.evidenceRefs || [])].filter(Boolean))];
+    const latestObservation = (agentProjection?.observations || []).filter((observation) => observation.taskId === task.id).at(-1) || null;
+    const planNeedsApproval = Boolean(activePlan?.status === "proposed" && task.status === "waiting_for_approval");
+    const planStateMissing = Boolean(task.status === "waiting_for_approval" && task.activePlanId && !activePlan);
+    const planIsApproved = activePlan?.status === "approved";
+    const evidenceRefs = planNeedsApproval || planStateMissing ? [] : [...new Set([...(latestObservation?.evidenceRefs || []), ...(latestActionEvent?.evidenceRefs || []), ...(task.evidenceRefs || [])].filter(Boolean))];
+    const evidenceStatus = planNeedsApproval || planStateMissing ? "waiting" : latestObservation?.status || latestActionEvent?.status || "waiting";
+    const evidenceSummary = planNeedsApproval
+      ? "No command or preview verification has run. Hemlock is waiting for your plan approval."
+      : planStateMissing
+        ? "The task requires approval, but its durable plan is not loaded in this window. Refresh task state before acting."
+        : latestObservation?.summary || latestActionEvent?.payload?.reason || "Authoritative observations and receipts will collect here.";
+    const modelActivity = liveStreams.length ? "streaming" : task.status === "waiting_for_approval" && !planIsApproved ? "idle · approval required" : task.status === "running" ? "working" : task.status || "idle";
     const objective = displayText(task.objective, "Untitled Hemlock task");
     const objectiveIsLong = objective.length >= 120;
     const objectiveSummary = objectiveIsLong ? compactPreview(objective) : objective;
@@ -1469,10 +1517,13 @@ function App() {
         return <details className="maple-channel maple-channel-secondary" open key={`${channel.name}-${index}`}><summary className="model-channel-label">{label} · emitted by {channelProviderName(channel.source || message.provider)}</summary><pre>{displayText(channel.text, "")}</pre></details>;
       });
     };
-    return <div className="chat-surface">{renderThreadBar()}<div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary>{objectiveSummary}</summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={liveStreams.length ? `${liveStreams.length} stream${liveStreams.length === 1 ? "" : "s"}` : task.status} /></div>{renderSuggestionCards()}{(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" onClick={() => void desktopAgent()?.cancelQueued?.(entry.requestId)}>{entry.position}. {entry.payload?.objective || entry.payload?.text}</button>)}</div>}<div className="chat-scroll">
+    return <div className="chat-surface">{renderThreadBar()}<div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary>{objectiveSummary}</summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={modelActivity} /></div>{renderSuggestionCards()}{(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" onClick={() => void desktopAgent()?.cancelQueued?.(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}</div>}
+      {(activePlan || planStateMissing || task.status === "waiting_for_approval") && <section className={`chat-plan-card ${planNeedsApproval || planStateMissing ? "is-awaiting" : "is-approved"}`} aria-label="Plan and approval"><div className="chat-plan-heading"><div><span className="card-kicker">PLAN / APPROVAL</span><strong>{planNeedsApproval ? "Review before Maple starts" : planStateMissing ? "Plan state needs refresh" : "Bounded plan"}</strong></div><StatusLamp state={planNeedsApproval || planStateMissing ? "working" : "ready"} label={planNeedsApproval ? "waiting for approval" : planStateMissing ? "not loaded" : activePlan?.status || "ready"} /></div>{activePlan ? <><div className="chat-plan-scroll"><div className="chat-plan-meta"><span>HOST-PREPARED CAPABILITY BOUNDARY</span><small>{activePlan.steps?.length || 0} steps · no source mutation has run</small></div><p className="chat-plan-rationale">{displayText(activePlan.rationale, "Hemlock prepared this bounded plan from the request.")}</p><ol className="chat-plan-steps">{(activePlan.steps || []).map((step) => <li key={`${activePlan.id}-${step.step}`} className={step.status === "ready" ? "is-ready" : ""}><span>{step.step}</span><div><strong>{displayText(step.label || step.commandId || step.kind)}</strong><small>{displayText(step.expectedEvidence?.join?.(" · ") || "Host receipt after this step")}</small></div></li>)}</ol><p className="chat-plan-boundary"><strong>{planNeedsApproval ? "Maple has not run yet." : planIsApproved ? "Maple is free to choose the next useful action inside this approved boundary." : "The host has not claimed work outside this plan."}</strong> Safeguards still own scope, approvals, verification, and completion.</p></div>{planNeedsApproval && <div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })} disabled={commandBusy === "plan.approve"}><Icon name="check" size={14} /> {commandBusy === "plan.approve" ? "Approving…" : "Approve plan"}</button><button type="button" className="quiet-action" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Chat" })} disabled={Boolean(commandBusy)}>Reject</button></div>}</> : <><p className="chat-plan-rationale">{evidenceSummary}</p><div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void refreshAgentState()} disabled={commandBusy === "agent.state"}><Icon name="refresh" size={14} /> {commandBusy === "agent.state" ? "Refreshing…" : "Refresh task state"}</button></div></>}</section>}
+      {liveStreams.length > 0 && <section className="chat-live-stream" aria-label="Live model stream" aria-live="polite"><div className="chat-live-stream-heading"><div><span className="card-kicker">LIVE MODEL STREAM</span><strong>{MODEL_LANES[liveStreams.at(-1)?.provider || modelSelection.provider]?.label || "Maple-Preview"} is working</strong></div><small>{Math.round((liveStreams.at(-1)?.text || "").length)} chars · {displayText(liveStreams.at(-1)?.status, "streaming")}</small></div>{liveStreams.slice(-1).map((stream) => <div className="chat-live-stream-body" key={stream.streamId}>{Object.entries(stream.channels || {}).filter(([, text]) => text).map(([channel, text]) => <div className="chat-live-channel" key={`${stream.streamId}-${channel}`}><span>{displayText(channel, "content")}</span><pre>{text}</pre></div>)}</div>)}</section>}
+      <div className="chat-scroll">
       {!messages.length && !workNotes.length && <div className="empty-work"><span className="empty-symbol"><Icon name="leaf" size={26} /></span><h3>Start with {MODEL_LANES[modelSelection.provider].label}</h3><p>Conversation comes first. Exact model channels, live actions, and evidence will appear here as the task develops.</p></div>}
       {messages.map((message) => { const messageProvider = message.provider || message.channels?.[0]?.source || "maple"; const messageProviderName = channelProviderName(messageProvider); return <article className={`work-message ${message.role}`} key={message.id}><div className="message-meta"><span>{displayText(message.role === "user" ? "YOU" : messageProviderName.toUpperCase())}{message.streaming ? " · LIVE" : ""}</span><time>{displayText(message.time)}</time></div>{message.role === "assistant" ? <section className="maple-output-card" aria-label={`${messageProviderName} emitted response`}><div className="card-kicker"><span>{messageProviderName.toUpperCase()} OUTPUT</span><small>{message.displayMode || "model-verbatim"}</small></div>{renderChannels(message)}</section> : <div className="message-content">{displayText(message.content)}</div>}{message.telemetry && <details className="host-telemetry" open={message.role === "assistant"}><summary>Host telemetry</summary><p>{message.telemetry.provider ? `${message.telemetry.provider} · ${message.telemetry.reasoning || "native"} · ` : ""}{message.telemetry.elapsedMs != null ? `${Math.round(message.telemetry.elapsedMs / 100) / 10}s` : "timing unavailable"}{message.telemetry.completionTokens != null ? ` · ${message.telemetry.completionTokens} output tokens` : ""}{message.telemetry.finishReason ? ` · stop: ${message.telemetry.finishReason}` : ""}{message.telemetry.outputDigest ? ` · ${message.telemetry.outputDigest}` : ""}{message.telemetry.streamId ? ` · stream ${message.telemetry.streamId}` : ""}{message.telemetry.bufferedFallback ? " · buffered fallback" : message.telemetry.streaming ? " · SSE stream" : ""}{message.rawOutputRef ? ` · raw ${message.rawOutputRef}` : ""}</p></details>}</article>; })}
-      <section className="live-task-surface" aria-label="Live task detail"><div className="live-task-heading"><span>LIVE TASK</span><small>host detail beside {selectedLane.label} output</small></div><div className="live-task-grid"><section className="live-action-card"><div className="card-kicker"><span>LIVE ACTION</span><small>{displayText(activeAction?.status, "idle")}</small></div>{activeAction ? <><strong>{displayText(activeAction.commandId || activeAction.kind)}</strong><p>{displayText(activeAction.shortRationale)}</p><details open><summary>Exact validated action envelope</summary><pre>{displayText(activeAction, "No action envelope recorded.")}</pre></details>{(activeAction.modelChannels?.length || activeAction.rawModelOutputRef) && <details open><summary>Raw provider output reference</summary><pre>{displayText({ rawModelOutputRef: activeAction.rawModelOutputRef, modelChannels: activeAction.modelChannels, parseStatus: activeAction.parseStatus, fallbackMode: activeAction.fallbackMode }, "No raw output reference.")}</pre></details>}</> : <p className="empty-copy">No validated action is active. Casual conversation stays in Chat.</p>}</section><section className="live-evidence-card"><div className="card-kicker"><span>EVIDENCE</span><small>{displayText(latestObservation?.status || latestActionEvent?.status, "waiting")}</small></div><p>{displayText(latestObservation?.summary || latestActionEvent?.payload?.reason || "Authoritative observations and receipts will collect here.")}</p>{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{evidenceRefs.length > 0 && <ul>{evidenceRefs.slice(0, 5).map((ref) => <li key={ref}>{displayText(ref)}</li>)}</ul>}{(task.blockedReason || latestActionEvent?.payload?.stopReason) && <p className="evidence-stop">Stop reason: {displayText(task.blockedReason || latestActionEvent.payload.stopReason)}</p>}{task.artifactRepair?.status === "exhausted" && <div className="repair-actions"><button type="button" onClick={() => void runCommand("artifact.repair.retry", { taskId: task.id })}>Retry repair</button>{task.artifactRepair?.lastGoodRevision && <button type="button" onClick={() => void runCommand("artifact.repair.use-last-good", { taskId: task.id })}>Use last good revision</button>}</div>}</section></div></section>
+      <section className="live-task-surface" aria-label="Live task detail"><div className="live-task-heading"><span>LIVE TASK</span><small>host detail beside {selectedLane.label} output</small></div><div className="live-task-grid"><section className="live-action-card"><div className="card-kicker"><span>LIVE ACTION</span><small>{displayText(activeAction?.status, planNeedsApproval ? "not started" : "idle")}</small></div>{activeAction ? <><strong>{displayText(activeAction.commandId || activeAction.kind)}</strong><p>{displayText(activeAction.shortRationale)}</p><details open><summary>Exact validated action envelope</summary><pre>{displayText(activeAction, "No action envelope recorded.")}</pre></details>{(activeAction.modelChannels?.length || activeAction.rawModelOutputRef) && <details open><summary>Raw provider output reference</summary><pre>{displayText({ rawModelOutputRef: activeAction.rawModelOutputRef, modelChannels: activeAction.modelChannels, parseStatus: activeAction.parseStatus, fallbackMode: activeAction.fallbackMode }, "No raw output reference.")}</pre></details>}</> : <p className="empty-copy">{planNeedsApproval ? "No model action has run yet. Approve the plan to let Maple start choosing and streaming work." : "No validated action is active. Casual conversation stays in Chat."}</p>}</section><section className="live-evidence-card"><div className="card-kicker"><span>EVIDENCE</span><small>{displayText(evidenceStatus, "waiting")}</small></div><p>{displayText(evidenceSummary)}</p>{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{evidenceRefs.length > 0 && <ul>{evidenceRefs.slice(0, 5).map((ref) => <li key={ref}>{displayText(ref)}</li>)}</ul>}{(task.blockedReason || latestActionEvent?.payload?.stopReason) && <p className="evidence-stop">Stop reason: {displayText(task.blockedReason || latestActionEvent.payload.stopReason)}</p>}{task.artifactRepair?.status === "exhausted" && <div className="repair-actions"><button type="button" onClick={() => void runCommand("artifact.repair.retry", { taskId: task.id })}>Retry repair</button>{task.artifactRepair?.lastGoodRevision && <button type="button" onClick={() => void runCommand("artifact.repair.use-last-good", { taskId: task.id })}>Use last good revision</button>}</div>}</section></div></section>
       {workNotes.length > 0 && <details className="host-trace" open={false}><summary>Full trace · decisions, tools, observations, repairs, and receipts</summary><div className="agent-notes-list">{workNotes.map(({ event, note }) => <div className={`agent-note agent-note-${event.status}`} key={event.id}><i /><span>{note}</span><time>{formatTime(event.createdAt)}</time></div>)}</div></details>}
       {isThinking && <div className="live-note"><span className="pulse" /> Host is waiting for {selectedLane.label} response <span>···</span></div>}
       <div ref={endRef} />

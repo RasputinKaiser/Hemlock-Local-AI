@@ -713,3 +713,16 @@ github_repo_publish_2026_08_15:
     - video-showcase/
     - work/
   claim_boundary: "The dedicated GitHub repository and main branch are published. No deployment target is configured for this repository yet."
+
+chat_plan_scroll_and_path_privacy_2026_08_16:
+  status: implemented_verified
+  plan_surface: "Chat now renders the durable plan and approval controls outside the conversation scroll. The plan steps use a bounded internal scroller, while Approve plan, Reject, and Refresh task state remain reachable."
+  model_visibility: "The Chat surface distinguishes host-prepared planning from Maple execution, states explicitly when Maple has not run, and exposes live model_text channels in a dedicated live stream panel after approval."
+  evidence_truth: "Pending plan approval forces the Chat evidence state to waiting and excludes stale observation/evidence references from the approval surface. Observations are scoped to the active task."
+  path_privacy: "Displayed user-home paths are redacted to ~/... in UI text, queue labels, thread controls, and prompts. Host payloads and workspace scope enforcement continue using the real filesystem path."
+  verification:
+    ui_tests: "13 passed"
+    build: passed
+    maple_health: "GET http://127.0.0.1:8080/health returned {status: ok} after the live Vite/Electron session reloaded the UI."
+    diff_check: passed
+  claim_boundary: "This fixes the Chat/build presentation and display privacy boundary. It does not claim that Maple has run until a live inference stream or host receipt is present."
