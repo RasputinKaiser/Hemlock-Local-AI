@@ -22,7 +22,11 @@ const {
   normalizeSelection,
   parseProviderLine,
 } = require("./provider_adapters.cjs");
-const { createMapleLaunchResult } = require("./maple_runtime.cjs");
+const {
+  createMapleLaunchResult,
+  compactInferenceMessages,
+  isMapleTransportError,
+} = require("./maple_runtime.cjs");
 const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
 
@@ -130,6 +134,13 @@ function digestText(value) {
   return `sha256:${crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`;
 }
 
+function tokensPerSecond(usage, elapsedMs) {
+  const completionTokens = Number(usage?.completion_tokens ?? usage?.output_tokens ?? usage?.completionTokens);
+  const durationSeconds = Number(elapsedMs) / 1000;
+  if (!Number.isFinite(completionTokens) || completionTokens <= 0 || !Number.isFinite(durationSeconds) || durationSeconds <= 0) return null;
+  return Math.round((completionTokens / durationSeconds) * 10) / 10;
+}
+
 function modelChannelRecords(channels = {}, source = "maple") {
   return Object.entries(channels)
     .filter(([name, text]) => name !== "role" && typeof text === "string")
@@ -229,6 +240,16 @@ const requestedMapleMaxTokens = Number(process.env.HEMLOCK_MAPLE_MAX_TOKENS);
 const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
   ? Math.max(4096, requestedMapleMaxTokens)
   : 16384;
+const maplePromptCacheSize = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE))
+  ? Math.max(1, Math.min(10, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
+  : 4;
+const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "512M");
+const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY))
+  ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY)))
+  : 1;
+const mapleDecodeConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY))
+  ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY)))
+  : 1;
 const serverArgs = [
   "mlx_lm",
   "server",
@@ -248,6 +269,14 @@ const serverArgs = [
   "20",
   "--max-tokens",
   String(mapleMaxTokens),
+  "--prompt-cache-size",
+  String(maplePromptCacheSize),
+  "--prompt-cache-bytes",
+  maplePromptCacheBytes,
+  "--prompt-concurrency",
+  String(maplePromptConcurrency),
+  "--decode-concurrency",
+  String(mapleDecodeConcurrency),
   "--log-level",
   "INFO",
 ];
@@ -695,6 +724,7 @@ function emitStreamFrame(stream, { delta = "", channel = "content", terminal = f
     operationId: stream.operationId,
     kind: stream.kind,
     provider: stream.provider || "maple",
+    startedAt: stream.startedAt,
     channel: channel || "content",
     sequence: stream.sequence++,
     delta: String(delta || ""),
@@ -1377,6 +1407,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
     finishReason: "provider_cli_completed",
     promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null,
     completionTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null,
+    tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
     outputDigest: streamDigest(JSON.stringify(stream.channels)),
     contentDigest: digestText(answer),
     streamId: stream.streamId,
@@ -1403,7 +1434,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
 }
 
 async function runInference(payload = {}) {
-  const initialMessages = Array.isArray(payload.messages) ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })) : [];
+  const initialMessages = compactInferenceMessages(payload.messages);
   const selection = normalizeSelection({ provider: payload.provider || payload.modelProvider || agentTask.provider, model: payload.model || agentTask.model, reasoning: payload.reasoning || agentTask.reasoning });
   if (!payload.__providerLease) {
     return threadManager.withProvider(selection.provider, payload.threadId || payload.taskId || agentTask.threadId || agentTask.id, (lease) => runInference({ ...payload, __providerLease: true }, { __providerLease: true }).then((result) => {
@@ -1424,6 +1455,8 @@ async function runInference(payload = {}) {
   let bufferedFallback = false;
   let usage = null;
   let steeringIndex = 0;
+  let mapleTransportRetries = 0;
+  await ensureMapleRuntime();
   while (true) {
     const controller = new AbortController();
     stream.controller = controller;
@@ -1535,6 +1568,7 @@ async function runInference(payload = {}) {
         finishReason,
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
         completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null,
+        tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
         outputDigest: streamDigest(JSON.stringify(stream.channels)),
         contentDigest: streamDigest(answerText),
         adapterPath: recovered ? null : requestedAdapter || null,
@@ -1570,6 +1604,18 @@ async function runInference(payload = {}) {
         channels: stream.channels,
         rawPayload: rawPayloads.length ? rawPayloads : responsePayload,
       });
+      if (!reason && isMapleTransportError(error) && mapleTransportRetries < 1 && !stream.text.trim()) {
+        mapleTransportRetries += 1;
+        finishStream(stream, { status: "restarting", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
+        await restartMapleRuntime(error.message || "Maple transport failed during inference.");
+        stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
+        rawPayloads = [];
+        responsePayload = {};
+        finishReason = null;
+        bufferedFallback = false;
+        usage = null;
+        continue;
+      }
       if (reason === "steering") {
         finishStream(stream, { status: "interrupted_by_steering", stopReason: "steering", rawOutputRef: interruptedRawOutputRef });
         const steering = (agentTask.steering || []).slice(steeringIndex);
@@ -2205,7 +2251,7 @@ async function inferStructuredAction(prompt) {
     return { content, channels: external.channels, rawOutputRef: external.rawOutputRef, provider: selection.provider };
   }
   const actionStream = startStream({ taskId: task.id, operationId: null, kind: "agent_action", provider: "maple" });
-  const response = await fetchWithTimeout(`${endpoint}/v1/chat/completions`, {
+  const response = await fetchMapleWithRecovery(`${endpoint}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify({
@@ -2315,6 +2361,7 @@ async function inferStructuredAction(prompt) {
       finishReason: payload.choices?.[0]?.finish_reason || null,
       promptTokens: payload.usage?.prompt_tokens ?? null,
       completionTokens: payload.usage?.completion_tokens ?? null,
+      tokensPerSecond: tokensPerSecond(payload.usage, Date.now() - startedAt),
       outputDigest: digestText(content),
       modelChannels: channels.map((channel) => ({ name: channel.name, digest: digestText(channel.text) })),
     },
@@ -2678,6 +2725,30 @@ async function launchMapleRuntime() {
   return serverLaunchPromise;
 }
 
+async function ensureMapleRuntime() {
+  if (serverProcess && !serverProcess.killed) {
+    if (!serverState.processReady) return waitForServer(readinessTimeoutMs, { preserveInference: true });
+    try {
+      const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
+      if (response.ok) return { processReady: true, inferenceReady: serverState.inferenceReady === true };
+    } catch {
+      // A process can remain in the child table after MLX has lost its HTTP
+      // listener. The recovery path below gives it a clean restart.
+    }
+  }
+  return restartMapleRuntime("Maple health check failed before inference.");
+}
+
+async function restartMapleRuntime(reason = "Maple runtime recovery requested.") {
+  appendAgentEvent("maple.runtime.restarting", "running", { reason, cachePolicy: { size: maplePromptCacheSize, bytes: maplePromptCacheBytes, promptConcurrency: maplePromptConcurrency, decodeConcurrency: mapleDecodeConcurrency } }, { reversible: true });
+  await stopServer();
+  serverProcessError = null;
+  serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
+  const result = await launchMapleRuntime();
+  appendAgentEvent("maple.runtime.restarted", "passed", { reason, processReady: result.processReady, inferenceReady: result.inferenceReady }, { reversible: true });
+  return result;
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -2685,6 +2756,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function fetchMapleWithRecovery(url, options = {}, timeoutMs = inferenceTimeoutMs) {
+  await ensureMapleRuntime();
+  try {
+    return await fetchWithTimeout(url, options, timeoutMs);
+  } catch (error) {
+    if (!isMapleTransportError(error)) throw error;
+    await restartMapleRuntime(error.message || "Maple transport failed.");
+    return fetchWithTimeout(url, options, timeoutMs);
   }
 }
 

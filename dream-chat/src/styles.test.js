@@ -36,11 +36,12 @@ test("Chat keeps the transcript above a collapsible plan dock", () => {
 test("Chat keeps host activity out of the transcript and collapsed by default", () => {
   assert.match(mainSource, /const hostActivity = <section className="chat-host-rail"/);
   assert.match(mainSource, /<details className="chat-host-details" open={hostActivityOpen}/);
-  assert.match(mainSource, /<\/div>\{hostActivity\}<div className="interaction-mode-bar"/);
+  assert.match(mainSource, /className="chat-work-rail"/);
   assert.match(styles, /\.chat-host-rail\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
   assert.match(styles, /\.chat-host-details\s*\{[^}]*background:\s*#f4f8ef;/s);
   assert.match(styles, /\.chat-host-details\[open\]\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
   assert.match(styles, /\.chat-host-details > \.live-task-surface\s*\{[^}]*overflow:\s*auto;[^}]*border-top:/s);
+  assert.match(styles, /\.chat-host-rail \.live-evidence-card\s*\{[^}]*display:\s*none;/s);
 });
 
 test("Chat keeps the task hero compact so the transcript gets the viewport", () => {
@@ -50,6 +51,24 @@ test("Chat keeps the task hero compact so the transcript gets the viewport", () 
   assert.match(mainSource, /className="chat-context-summary"/);
   assert.match(styles, /\.chat-context-summary > span:last-child\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
   assert.match(styles, /\.work-message\.assistant \.maple-output-card\s*\{[^}]*border:\s*0;[^}]*box-shadow:\s*none;/s);
+});
+
+test("Chat uses a transcript-first work rail and exposes throughput telemetry", () => {
+  assert.match(styles, /\.chat-surface\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 2fr\) minmax\(320px, 1fr\);/s);
+  assert.match(styles, /\.chat-surface > \.chat-activity-strip\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*3;/s);
+  assert.match(styles, /\.chat-surface > \.chat-scroll\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*4;/s);
+  assert.match(styles, /\.chat-surface > \.chat-host-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*3 \/ span 2;/s);
+  assert.match(styles, /\.chat-surface > \.chat-evidence-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*5;/s);
+  assert.match(styles, /\.chat-surface > \.chat-compose\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*8;/s);
+  assert.match(styles, /\.chat-status-bar\s*\{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-row:\s*9;/s);
+  assert.match(styles, /\.chat-surface > \.chat-work-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*3 \/ span 6;/s);
+  assert.match(styles, /\.window-chat \.window-bar\s*\{[^}]*background:\s*#0b3228;/s);
+  assert.match(mainSource, /chat-evidence-rail/);
+  assert.match(mainSource, /className="chat-status-bar"/);
+  assert.match(mainSource, /thread-context-label/);
+  assert.match(mainSource, /formatTokensPerSecond/);
+  assert.match(mainSource, /tok\/s/);
+  assert.match(mainSource, /liveStream\?\.startedAt/);
 });
 
 test("Chat restores the active thread conversation and keeps host JSON secondary", () => {
@@ -72,5 +91,6 @@ test("Displayed workspace paths redact the macOS home-directory identity", () =>
   assert.match(mainSource, /function redactUserPaths\(value\)/);
   assert.match(mainSource, /replace\(\/.*Users/);
   assert.match(mainSource, /redactUserPaths\(value\)/);
+  assert.match(mainSource, /displayText\(message\.rawOutputRef\)/);
   assert.match(mainSource, /the path stays local and is not shown in Hemlock UI/);
 });
