@@ -83,6 +83,34 @@ function createWorkNotifier({ notify, now = () => Date.now(), config = {} } = {}
     pending() {
       return [...running.values()].map((entry) => ({ ...entry }));
     },
+
+    // Drop a started job without announcing anything. A user-cancelled job is
+    // not a completion — the user stopped it themselves, so no receipt is
+    // owed. Returns true when a pending entry was actually removed; cancelling
+    // an unknown id is harmless.
+    onJobCancelled(jobId) {
+      return running.delete(String(jobId ?? ""));
+    },
+  };
+}
+
+// Chat responses (Maple/provider conversation inference) share the exact
+// timing, threshold and focus policy above — this thin adapter exists so the
+// main-process stream resolve/reject boundary starts, settles or drops a chat
+// job without ever reimplementing the policy. The label is the calm
+// receipt-style title used when the response earns an announcement.
+function trackChatResponseJob(notifier, jobId, label = "Maple response") {
+  notifier.onJobStarted(jobId, label);
+  return {
+    // Terminal outcome the user waited for: announce per policy (long +
+    // unfocused only).
+    finish({ ok = true, detail = "" } = {}) {
+      return notifier.onJobFinished(jobId, { ok, detail });
+    },
+    // User stopped the stream: never announce, never linger.
+    cancel() {
+      return notifier.onJobCancelled(jobId);
+    },
   };
 }
 
@@ -94,4 +122,5 @@ module.exports = {
   shouldNotify,
   formatDuration,
   createWorkNotifier,
+  trackChatResponseJob,
 };

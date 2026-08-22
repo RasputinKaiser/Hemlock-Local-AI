@@ -825,3 +825,38 @@ electron_host_ux_lane_b_2026_08_21:
     renderer_tests: "windowManager + styles tests: 16 passed"
     vite_build: "passed (dist rebuilt for HEMLOCK_PROD_UI flow)"
   claim_boundary: "IPC handlers and preload surfaces are verified against mocked Electron. No live desktop relaunch or real macOS notification delivery was exercised in this pass; consumers of notify() remain future work per plan."
+
+tranche5_improvements_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_120000-hemlockos-tranche5-improvements.md
+  changes:
+    maple_response_notifications:
+      what: "Long Maple/provider chat completions (>30s, unfocused window) announce via workNotifier; structured-action never notifies; cancelled streams never announce or linger."
+      files: "electron/main.cjs (hooks at runInference + runCliInference boundaries), work_notifications.cjs (trackChatResponseJob adapter), maple_notify.test.cjs (8 tests)"
+      leak_guard: "Jobs settle (finish/cancel) BEFORE risky post-terminal work; Maple success-path receipt write is guarded with an event receipt on failure; cancel-after-finish is a no-op."
+    evidence_ledger_grouping:
+      what: "Chat evidence rail rows grouped by event-type prefix with counts + newest time (pure groupEvidence helper in src/evidenceLedger.js, 3 tests); stale thread.search comment corrected."
+    launcher_stale_reap:
+      what: "reap_stale_mlx_lm(port) kills non-child mlx_lm listeners on 8080 pre-Electron, warns on non-mlx_lm squatters, waits only after a kill; double-launch protected by PID-lock early return."
+    copy_provenance:
+      what: "Option-click copy on assistant messages includes [PROVIDER · time · thread] header + rawOutputRef via pure withProvenance helper (src/copyProvenance.js, 4 tests); plain click byte-identical."
+    primer_command_center:
+      what: "PrimerCard second mount at top of Command Center .workbench-main; shared dismissal state; no CSS/layout change."
+    reopen_tips:
+      what: "Settings 'Reopen getting-started tips' clears only the dismissed flag (clearPrimerDismissal), focuses Chat or falls back to Command Center."
+    glossary_tooltips:
+      what: "GlossaryHint component (7 usages, 5 terms): native title= hover kept; keyboard-focus and tap popovers with paper/sage/gold styling; Escape hides element-level without touching overlay ordering."
+      fixes_after_review: "Click-after-focus no longer toggle-closes the popover (openedByFocus ref consumed by click); .glossary-hint position:relative so the popover anchors to the hint instead of .os-window (was clipped invisible). Both fixes empirically verified via CDP trusted input in real Chromium."
+    narrator_consolidation:
+      what: "Command Center copy-only dedup: ribbon NOW cell shows phase only, loop OBSERVATION cell points to Evidence card, work-note idle copy shortened, filler detail removed. No layout change."
+    audit_viewport_convention:
+      what: "docs/plans/2026-08-22-audit-viewport-convention.md pins detector audits at 1240x820 for comparable counts."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 121 passed (113 baseline + 8 maple_notify)"
+    renderer_suite: "node --test src/*.test.js: 26 passed (16 baseline + 3 evidenceLedger + 4 copyProvenance + 3 windowManager/styles additions)"
+    vite_build: "passed"
+    syntax: "main.cjs node --check passed; launcher zsh -n passed; main.jsx esbuild passed"
+    reviews: "Every task passed independent spec+quality review except 3.1, which failed first review (2 empirically reproduced defects) and passed after direct fixes; 1.1 leak-path finding from quality review fixed with regression test."
+  incident_note: "One fix subagent timed out after reverting uncommitted main.cjs hooks (git restore); hooks were re-applied directly by the orchestrator with the leak guard included. No other work was lost."
+  claim_boundary: "All verification is host-side and deterministic (unit suites, builds, CDP DOM probes). Live Maple notification delivery, real macOS notification rendering, and a live desktop relaunch were not exercised in this pass."
+

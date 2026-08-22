@@ -30,7 +30,7 @@ const {
 } = require("./maple_runtime.cjs");
 const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
-const { createWorkNotifier } = require("./work_notifications.cjs");
+const { createWorkNotifier, trackChatResponseJob } = require("./work_notifications.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -1419,6 +1419,12 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   }
   const { executable, args } = command;
   const stream = startStream({ taskId, operationId: payload.operationId || null, kind: "model_text", provider: selection.provider });
+  // Work-notification boundary: conversation-mode chat responses announce
+  // completion when the run outlives the notifier threshold and the window is
+  // unfocused; structured-action calls never notify. Settle BEFORE any risky
+  // post-terminal work (persistModelOutput) so a receipt-write throw can never
+  // leak the pending job; cancel() is a no-op after finish().
+  const cliNotify = mode === "conversation" ? trackChatResponseJob(workNotifier, `maple-${stream.streamId}`) : null;
   const parserState = { text: "" };
   let stdoutBuffer = "";
   let stderr = "";
@@ -1482,6 +1488,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
 
   const interrupted = stream.abortReason;
   if (interrupted) {
+    cliNotify?.cancel();
     finishStream(stream, { status: interrupted === "steering" ? "interrupted_by_steering" : "cancelled", stopReason: interrupted });
     if (interrupted === "steering" && mode === "conversation") {
       const steeringStart = Number.isInteger(payload.__steeringCount) ? payload.__steeringCount : 0;
@@ -1510,6 +1517,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   if (processResult.error || lastError || processResult.exitCode !== 0) {
     const detail = lastError || processResult.error?.message || stderr.trim().slice(-600) || `${selection.label} exited with code ${processResult.exitCode ?? "-"}.`;
     const error = new Error(`${selection.label} inference failed: ${detail}`);
+    cliNotify?.finish({ ok: false, detail: error.message });
     const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-failed`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
     finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
     error.rawOutputRef = rawOutputRef;
@@ -1518,12 +1526,14 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   }
   if (!stream.text.trim()) {
     const error = new Error(`${selection.label} returned no final response.`);
+    cliNotify?.finish({ ok: false, detail: error.message });
     const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-empty`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
     finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
     error.rawOutputRef = rawOutputRef;
     recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, rawOutputRef, streamId: stream.streamId, channels: stream.channels });
     throw error;
   }
+  cliNotify?.finish({ ok: true });
   const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode, usage } });
   finishStream(stream, { status: "completed", stopReason: "provider_cli_completed", usage, rawOutputRef });
   const answer = stream.text.trim();
@@ -1586,6 +1596,10 @@ async function runInference(payload = {}) {
   let steeringIndex = 0;
   let mapleTransportRetries = 0;
   await ensureMapleRuntime();
+  // Work-notification boundary (see runCliInference): long Maple conversation
+  // responses announce completion while unfocused. Settled at every terminal
+  // outcome below; retry/steering paths keep the same pending job on purpose.
+  const mapleNotify = trackChatResponseJob(workNotifier, `maple-${stream.streamId}`);
   while (true) {
     const controller = new AbortController();
     stream.controller = controller;
@@ -1724,7 +1738,15 @@ async function runInference(payload = {}) {
       const channels = modelChannelRecords(stream.channels);
       const answerText = String(stream.channels.content || responsePayload?.choices?.[0]?.message?.content || "").trim();
       const choice = responsePayload?.choices?.[0] || {};
-      const rawOutputRef = persistModelOutput({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId || null, streamId: stream.streamId, mode: "conversation", channels: stream.channels, rawPayload: rawPayloads.length ? rawPayloads : responsePayload });
+      mapleNotify.finish({ ok: true });
+      // Guarded receipt write: if persistModelOutput throws (disk full, etc.)
+      // the notification job is already settled and the error still surfaces.
+      let rawOutputRef = null;
+      try {
+        rawOutputRef = persistModelOutput({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId || null, streamId: stream.streamId, mode: "conversation", channels: stream.channels, rawPayload: rawPayloads.length ? rawPayloads : responsePayload });
+      } catch (receiptError) {
+        appendAgentEvent("model-output.persist.failed", "failed", { streamId: stream.streamId, error: receiptError.message }, { reversible: true });
+      }
       finishStream(stream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
       const telemetry = {
         provider: "maple",
@@ -1797,12 +1819,14 @@ async function runInference(payload = {}) {
         continue;
       }
       if (reason === "cancelled" || reason === "interrupted") {
+        mapleNotify.cancel();
         finishStream(stream, { status: "cancelled", stopReason: reason, rawOutputRef: interruptedRawOutputRef });
         const cancellation = new Error("Inference was cancelled before completion.");
         cancellation.code = "CANCELLED";
         throw cancellation;
       }
       finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
+      mapleNotify.finish({ ok: false, detail: error.message });
       serverState = { ...serverState, inferenceReady: false };
       updateAgentTask({ phase: "blocked", status: "blocked", blockedReason: error.message, foregroundStep: "Inference blocked; inspect the command trace" });
       appendAgentEvent("inference.failed", "failed", { error: error.message, adapterPath: requestedAdapter || null, elapsedMs: Date.now() - startedAt, streamId: stream.streamId, rawOutputRef: interruptedRawOutputRef, channels: modelChannelRecords(stream.channels) });

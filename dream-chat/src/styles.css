@@ -701,6 +701,9 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .ledger-row strong { overflow: hidden; color: inherit; font-family: "DM Mono", monospace; font-size: 9px; font-weight: 500; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
 .ledger-row small { overflow: hidden; color: #5f7560; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .ledger-row time { color: #5e775f; font-family: "DM Mono", monospace; font-size: 9px; }
+.ledger-row.ledger-group { border-left: 2px solid rgba(145, 189, 132, .28); padding-left: 8px; }
+.ledger-row.ledger-group:hover { border-left-color: #91bd84; }
+.ledger-row.ledger-group strong { color: #dbe8d2; }
 .ledger-section > strong { display: block; color: #f0ead7; font-family: "Newsreader", Georgia, serif; font-size: 16px; font-weight: 400; line-height: 1.05; }
 .ledger-section > p { margin: 8px 0; color: #a8bca5; font-size: 10px; line-height: 1.45; }
 .ledger-section > small { color: #5e7561; font-family: "DM Mono", monospace; font-size: 9px; }
@@ -1431,3 +1434,11 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 /* Nudge mid-tone metadata labels darker so they keep ≥4.5:1 on dimmed paper. */
 .understory .window-status, .understory .small-label { color: #4c5d50; }
 .understory .artifact-footer, .understory .artifact-revisions { color: #46584b; }
+
+/* Glossary hints (GlossaryHint in main.jsx): native title= still covers hover;
+   the popover covers keyboard focus and touch taps. Paper surface, sage border,
+   gold DM Mono kicker term, above window content but below modals (z 55 < 60+). */
+.glossary-hint { position: relative; }
+span.glossary-hint, small.glossary-hint, strong.glossary-hint, p.glossary-hint { cursor: help; }
+.glossary-popover { position: absolute; left: 0; bottom: calc(100% + 7px); z-index: 55; width: max-content; max-width: 260px; padding: 8px 10px 9px; border: 1px solid rgba(79, 92, 73, .35); border-radius: 8px; background: var(--paper); color: var(--ink); font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 10px; font-weight: 400; line-height: 1.5; letter-spacing: normal; text-transform: none; text-align: left; white-space: normal; box-shadow: 0 6px 18px rgba(27, 48, 41, .22); pointer-events: none; }
+.glossary-popover strong { display: block; margin-bottom: 3px; color: #80662d; font-family: "DM Mono", monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }

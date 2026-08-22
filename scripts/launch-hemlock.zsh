@@ -139,22 +139,37 @@ export HEMLOCK_REPO_ROOT="$repo_root"
 # The Electron host would adopt it — but if it's wedged, chat breaks subtly
 # and a second mlx_lm can spawn-fail with EADDRINUSE. Reap any mlx_lm
 # listener before boot; never touch non-mlx_lm processes.
-if command -v lsof >/dev/null 2>&1; then
-  stale_pids=$(lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
-  for stale_pid in ${=stale_pids}; do
-    if ps -p "$stale_pid" -o command= 2>/dev/null | grep -q "mlx_lm"; then
-      print "[$(date '+%Y-%m-%dT%H:%M:%S%z')] reaping stale mlx_lm server pid=$stale_pid on port 8080"
-      kill -9 "$stale_pid" 2>/dev/null || true
+#
+# This runs strictly BEFORE anything is spawned (Electron starts the Maple
+# server itself via MAPLE_AUTOSTART_SERVER=1), so no listener on the port can
+# be a child of this launcher — every mlx_lm hit here is genuinely stale.
+# Kept as a function (parameterized by port) so it can be exercised in a
+# sandbox against a throwaway port without touching a live 8080.
+reap_stale_mlx_lm() {
+  local port="$1"
+  local pid cmd reaped=0
+  command -v lsof >/dev/null 2>&1 || return 0
+  for pid in $(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u); do
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$cmd" == *mlx_lm* ]]; then
+      print "[$(date '+%Y-%m-%dT%H:%M:%S%z')] reaped stale mlx_lm pid=$pid port=$port"
+      kill -9 "$pid" 2>/dev/null || true
+      reaped=1
+    elif [[ -n "$cmd" ]]; then
+      print "[$(date '+%Y-%m-%dT%H:%M:%S%z')] warning: port $port held by non-mlx_lm pid=$pid (${cmd}); leaving it alone"
     fi
   done
-  # Give the port a moment to free if we reaped anything.
-  if [[ -n "$stale_pids" ]]; then
+  # Give the port a moment to free, but only if we actually killed something —
+  # a non-mlx_lm owner we deliberately spared shouldn't cost us 5 seconds.
+  if (( reaped )); then
     for _ in {1..5}; do
-      lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1 || break
+      lsof -nP -t -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
       sleep 1
     done
+    print "[$(date '+%Y-%m-%dT%H:%M:%S%z')] warning: port $port still busy after reaping stale mlx_lm"
   fi
-fi
+}
+reap_stale_mlx_lm 8080
 
 cd "$app_dir"
 if [[ "${HEMLOCK_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
