@@ -129,7 +129,7 @@ function defaultPlanSteps(intent, objective = "") {
       { commandId: "git.diff", label: "Record the final scoped diff", expectedEvidence: ["git://diff"] },
     ];
   }
-  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Inspect recent evidence before proposing improvement", expectedEvidence: ["receipt://recent"] }];
+  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Recall recent local evidence before proposing", expectedEvidence: ["receipt://recent"] }, { commandId: "improve.propose", label: "Propose a bounded local improvement from the evidence", expectedEvidence: ["receipt://proposed-improvement"] }, { kind: "answer", label: "Summarize the proposed improvement for approval" }];
   if (intent === "conversation") return [{ kind: "answer", label: "Answer from the scoped context and evidence" }];
   return [{ commandId: "repo-map", label: "Inspect the local project", expectedEvidence: ["repo://current-worktree"] }];
 }

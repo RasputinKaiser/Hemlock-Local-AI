@@ -1,24 +1,28 @@
 import React from "react";
 import { Icon } from "./Icons.jsx";
 
-export function WindowFrame({ windowState, meta, active, onFocus, onDragStart, onResizeStart, onMinimize, onMaximize, onClose, children }) {
+export function WindowFrame({ windowState, meta, active, dragging, resizing, onFocus, onDragStart, onResizeStart, onMinimize, onMaximize, onClose, children }) {
   if (!windowState || windowState.state === "closed") return null;
   const id = windowState.windowId;
   const maximized = windowState.state === "maximized";
   const minimized = windowState.state === "minimized";
-  const style = maximized ? undefined : {
-    left: `${windowState.bounds.x}px`,
-    top: `${windowState.bounds.y}px`,
-    width: `${windowState.bounds.width}px`,
-    height: `${windowState.bounds.height}px`,
-    minWidth: `${Math.min(windowState.minimumSize.width, windowState.bounds.width)}px`,
-    minHeight: `${Math.min(windowState.minimumSize.height, windowState.bounds.height)}px`,
+  // Keep zOrder applied even when maximized: a maximized window must still stack above
+  // other open windows, and dropping zIndex lets DOM order decide the paint order.
+  const style = {
+    ...(maximized ? {} : {
+      left: `${windowState.bounds.x}px`,
+      top: `${windowState.bounds.y}px`,
+      width: `${windowState.bounds.width}px`,
+      height: `${windowState.bounds.height}px`,
+      minWidth: `${Math.min(windowState.minimumSize.width, windowState.bounds.width)}px`,
+      minHeight: `${Math.min(windowState.minimumSize.height, windowState.bounds.height)}px`,
+    }),
     zIndex: windowState.zOrder,
   };
   const resizeEdges = ["top-left", "top", "top-right", "left", "right", "bottom-left", "bottom", "bottom-right"];
   return (
     <section
-      className={`os-window window-${id} ${active ? "is-active" : ""} ${maximized ? "is-maximized" : ""} ${minimized ? "is-minimized" : ""}`}
+      className={`os-window window-${id} ${active ? "is-active" : ""} ${maximized ? "is-maximized" : ""} ${minimized ? "is-minimized" : ""} ${dragging ? "is-dragging" : ""} ${resizing ? "is-resizing" : ""}`}
       style={style}
       aria-label={meta.label}
       onPointerDown={() => onFocus(id)}

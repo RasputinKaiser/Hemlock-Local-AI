@@ -2,6 +2,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("mapleDesktop", {
   isDesktop: true,
+  pickDirectory: () => ipcRenderer.invoke("dialog:pick-directory"),
+  confirmDialog: (options = {}) => ipcRenderer.invoke("dialog:confirm", options),
+  notify: ({ title, body } = {}) => ipcRenderer.invoke("notification:show", { title, body }),
+  windowsList: () => ipcRenderer.invoke("windows:list"),
   providers: {
     status: () => ipcRenderer.invoke("providers:status"),
     login: (provider) => ipcRenderer.invoke("providers:login", provider),
@@ -28,6 +32,7 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
     approveChangeSet: (taskId, changeSetId) => ipcRenderer.invoke("agent:changeset", { action: "approve", taskId, changeSetId, confirm: true }),
     rejectChangeSet: (taskId, changeSetId, note = "Rejected by user") => ipcRenderer.invoke("agent:changeset", { action: "reject", taskId, changeSetId, note }),
     cancel: (taskId) => ipcRenderer.invoke("agent:cancel", taskId),
+    cancelStream: (payload = {}) => ipcRenderer.invoke("agent:stream-cancel", payload),
     cancelQueued: (requestId) => ipcRenderer.invoke("agent:queue-cancel", requestId),
     artifacts: (action, input = {}) => ipcRenderer.invoke("agent:artifacts", { action, input }),
     preview: (action, input = {}) => ipcRenderer.invoke("agent:preview", { action, input }),
@@ -160,6 +165,10 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
 });
 
 contextBridge.exposeInMainWorld("hemlockAgent", {
+  pickDirectory: () => ipcRenderer.invoke("dialog:pick-directory"),
+  confirmDialog: (options = {}) => ipcRenderer.invoke("dialog:confirm", options),
+  notify: ({ title, body } = {}) => ipcRenderer.invoke("notification:show", { title, body }),
+  windowsList: () => ipcRenderer.invoke("windows:list"),
   providers: {
     status: () => ipcRenderer.invoke("providers:status"),
     login: (provider) => ipcRenderer.invoke("providers:login", provider),
@@ -185,6 +194,7 @@ contextBridge.exposeInMainWorld("hemlockAgent", {
   approveChangeSet: (taskId, changeSetId) => ipcRenderer.invoke("agent:changeset", { action: "approve", taskId, changeSetId, confirm: true }),
   rejectChangeSet: (taskId, changeSetId, note = "Rejected by user") => ipcRenderer.invoke("agent:changeset", { action: "reject", taskId, changeSetId, note }),
   cancel: (taskId) => ipcRenderer.invoke("agent:cancel", taskId),
+  cancelStream: (payload = {}) => ipcRenderer.invoke("agent:stream-cancel", payload),
   cancelQueued: (requestId) => ipcRenderer.invoke("agent:queue-cancel", requestId),
   artifacts: (action, input = {}) => ipcRenderer.invoke("agent:artifacts", { action, input }),
   preview: (action, input = {}) => ipcRenderer.invoke("agent:preview", { action, input }),

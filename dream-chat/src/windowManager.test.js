@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  WINDOW_SCHEMA, createWindowState, migrateWindowState, moveWindow, normalizeZOrder,
+  WINDOW_SCHEMA, createWindowState, focusWindow, migrateWindowState, moveWindow, normalizeZOrder,
   resizeWindow, snapBounds, toggleMaximize, keyboardPlacement,
 } from "./windowManager.js";
 
@@ -40,11 +40,14 @@ test("resizes from every edge and corner while preserving minimum size and canva
   }
 });
 
-test("moves, snaps at 16px, and Option disables snapping", () => {
+test("moves, snaps only when deliberately close (7px), and Option disables snapping", () => {
   const state = createWindowState("chat", { state: "normal", canvas, bounds: { x: 20, y: 20, width: 520, height: 380 } });
-  assert.equal(moveWindow(state, -8, 0, canvas).snapTarget, "left");
+  assert.equal(moveWindow(state, -14, 0, canvas).snapTarget, "left", "within 7px snaps");
+  assert.notEqual(moveWindow(state, -8, 0, canvas).snapTarget, "left", "8px away must NOT snap");
   assert.equal(moveWindow(state, -8, 0, canvas, { altKey: true }).snapTarget, null);
   assert.equal(snapBounds({ x: 300, y: 0, width: 520, height: 380 }, canvas).snapTarget, "top");
+  assert.equal(snapBounds({ x: 300, y: 10, width: 520, height: 380 }, canvas).snapTarget, null, "10px from top must NOT snap");
+  assert.equal(snapBounds({ x: 300, y: 5, width: 520, height: 380 }, canvas).snapTarget, "top", "5px from top snaps");
 });
 
 test("maximise/restore preserves exact valid bounds and keyboard placement is bounded", () => {
@@ -66,4 +69,20 @@ test("z order is compact and focus does not grow forever", () => {
   windows = normalizeZOrder(windows, "b");
   assert.equal(windows.b.zOrder, 3);
   assert.deepEqual(Object.values(windows).map((item) => item.zOrder).sort((a, b) => a - b), [1, 2, 3]);
+});
+
+test("focusing an open window re-clamps stale bounds onto the current canvas", () => {
+  // Regression: artifact window persisted at x=645 against a canvas that later
+  // shrank; clicking its dock item only re-ordered z and the window stayed invisible.
+  const smallCanvas = { width: 640, height: 700 };
+  const windows = {
+    artifact: {
+      ...createWindowState("artifact", { state: "normal", canvas, bounds: { x: 600, y: 0, width: 560, height: 400 } }),
+      state: "normal",
+    },
+  };
+  const focused = focusWindow(windows, "artifact", undefined, smallCanvas);
+  assert.equal(focused.artifact.state, "normal");
+  assert.equal(focused.artifact.bounds.x + focused.artifact.bounds.width <= smallCanvas.width, true);
+  assert.equal(focused.artifact.zOrder, 1);
 });

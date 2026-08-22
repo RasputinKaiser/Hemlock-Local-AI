@@ -67,7 +67,8 @@ class AgentIntentQueue {
       return { schema: "hemlock.agent.queue.result.v1", status: "steered", steering: result, queue: this.sync() };
     }
 
-    if (this.active || isActiveTask(this.activeTask())) {
+    const task = this.activeTask();
+    if (this.active || (task && isActiveTask(task))) {
       return this.enqueue(payload);
     }
     return this.start(payload);

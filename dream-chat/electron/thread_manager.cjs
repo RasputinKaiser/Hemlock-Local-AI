@@ -349,6 +349,75 @@ class ThreadManager {
     return this.checkpoints(threadId).at(-1) || null;
   }
 
+  // Bounded search over thread titles plus conversation bodies. Only the most
+  // recently updated `scanLimit` threads are scanned so a large registry stays
+  // cheap; results are capped at `limit`.
+  searchThreads(query, { limit = 20, scanLimit = 12, conversationLimit = 200 } = {}) {
+    const needle = String(query || "").trim().toLowerCase();
+    if (!needle) return [];
+    const ordered = [...this.state.threads].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+    const results = [];
+    for (const thread of ordered.slice(0, Math.max(1, scanLimit))) {
+      if (results.length >= limit) break;
+      if (String(thread.title || "").toLowerCase().includes(needle)) {
+        results.push({ threadId: thread.id, title: thread.title, matchedIn: "title", snippet: null });
+        continue;
+      }
+      let hit = null;
+      try {
+        hit = this.readConversation(thread.id, { limit: conversationLimit }).find((message) => String(message.content || "").toLowerCase().includes(needle)) || null;
+      } catch { hit = null; }
+      if (hit) {
+        const content = String(hit.content || "");
+        const at = content.toLowerCase().indexOf(needle);
+        const start = Math.max(0, at - 40);
+        const end = Math.min(content.length, at + needle.length + 60);
+        results.push({
+          threadId: thread.id,
+          title: thread.title,
+          matchedIn: "conversation",
+          snippet: `${start > 0 ? "…" : ""}${content.slice(start, end).trim()}${end < content.length ? "…" : ""}`,
+        });
+      }
+    }
+    return results.slice(0, Math.max(1, limit));
+  }
+
+  // Roll a thread's durable working state back to a recorded checkpoint. The
+  // conversation log itself is preserved; what rolls back is the resume point
+  // (phase/status/evidence refs/plan and action pointers). A marker checkpoint
+  // is written so the restored state becomes the resumption point.
+  restoreCheckpoint(threadId, checkpointId) {
+    const thread = this.thread(threadId);
+    if (!thread) throw new Error(`Hemlock thread was not found: ${threadId}`);
+    if (thread.status === "archived") throw new Error("Archived threads must be restored before a checkpoint rollback.");
+    const restored = this.checkpoints(threadId).find((item) => item.id === checkpointId);
+    if (!restored) throw new Error(`Hemlock checkpoint was not found for thread ${threadId}: ${checkpointId}`);
+    // Never resurrect an in-flight or archived status from history: an active
+    // run status would claim work is happening when nothing is, so it parks as
+    // "paused" (explicitly resumable) instead.
+    let status = restored.status;
+    if (RUNNING_THREAD_STATUSES.has(status)) status = "paused";
+    if (status === "archived") status = "ready";
+    const updated = this.updateThread(threadId, {
+      phase: restored.phase,
+      status,
+      checkpointId: restored.id,
+      activePlanId: null,
+      activeActionId: null,
+      blockedReason: null,
+    });
+    const marker = this.checkpoint(threadId, {
+      taskId: restored.taskId,
+      phase: restored.phase,
+      status,
+      activePlanStep: restored.activePlanStep,
+      evidenceRefs: restored.evidenceRefs,
+      reason: `checkpoint-restored:${restored.id}`,
+    });
+    return { thread: this.thread(threadId) || updated, restoredCheckpoint: { ...restored }, checkpoint: marker };
+  }
+
   appendConversation(threadId, message = {}) {
     const thread = this.thread(threadId);
     if (!thread) throw new Error(`Hemlock thread was not found: ${threadId}`);

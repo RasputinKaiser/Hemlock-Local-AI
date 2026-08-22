@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Notification, ipcMain, shell, dialog } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -14,6 +14,7 @@ const { CodingWorkspace } = require("./coding_workspace.cjs");
 const { CodingAutopilot } = require("./coding_autopilot.cjs");
 const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
+const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
 const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
@@ -29,6 +30,7 @@ const {
 } = require("./maple_runtime.cjs");
 const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
+const { createWorkNotifier } = require("./work_notifications.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -128,6 +130,19 @@ const modelCandidates = [
   path.join(repoRoot, "maple-2bit-mlx"),
 ].filter(Boolean).map((candidate) => path.resolve(candidate));
 const modelPath = modelCandidates.find((candidate) => fs.existsSync(candidate)) || modelCandidates[0];
+
+// Local MLX model registry for the picker. "default_model" is the Maple
+// launch model; other entries are absolute model directories served by the
+// same mlx_lm server, which lazy-loads whatever path a request names.
+const LOCAL_MODEL_PATHS = {
+  "default_model": modelPath,
+  "lfm25-8b": path.join(os.homedir(), "Models", "Hemlock", "LFM2.5-8B-A1B-mlx-4bit"),
+};
+
+function resolveLocalModelPath(model) {
+  const resolved = LOCAL_MODEL_PATHS[String(model || "")];
+  return resolved && fs.existsSync(resolved) ? resolved : "default_model";
+}
 const minimumDreamFreeBytes = Number(process.env.HEMLOCK_MIN_FREE_BYTES || 10 * 1024 ** 3);
 
 function digestText(value) {
@@ -242,7 +257,7 @@ const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
   : 16384;
 const maplePromptCacheSize = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE))
   ? Math.max(1, Math.min(10, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
-  : 4;
+  : 8;
 const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "512M");
 const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY)))
@@ -250,6 +265,48 @@ const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE
 const mapleDecodeConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY)))
   : 1;
+
+// ── Maple-Preview performance optimizations ──────────────────────────────
+//
+// 1. n-gram speculative decoding (--ngram-draft): zero-cost prompt-lookup
+//    draft on CPU. No extra model loaded, so peak memory stays at ~6-7 GB.
+//    Adaptive depth auto-chooses the best speed. Up to 2-3x decode speedup
+//    on code/repetitive output. Disable with HEMLOCK_NGRAM_DRAFT=0.
+//
+// 2. KV cache quantization (--kv-bits): 4-bit reduces KV cache memory by
+//    ~75%, letting the prompt cache hold more entries and context extend
+//    farther on the same hardware. Disable with HEMLOCK_KV_BITS=0.
+//
+// 3. Prefill step size (--prefill-step-size): smaller chunks improve
+//    responsiveness on long prompts; the n-gram draft also benefits from
+//    a slightly smaller prefill chunk. Tune with HEMLOCK_PREFILL_STEP_SIZE.
+// Persistent cross-restart prompt caching (--prompt-cache-file) is NOT available:
+// mlx_lm's HTTP server exposes only in-memory --prompt-cache-size/--prompt-cache-bytes
+// (both already tuned below); the on-disk cache flag exists only in generate.py CLI.
+// Verified 2026-08-22 — do not re-attempt against this server without an upstream change.
+const mapleNgramDraft = String(process.env.HEMLOCK_NGRAM_DRAFT || "1") !== "0";
+// KV cache quantization is DISABLED by default (HEMLOCK_KV_BITS=0). The
+// maple-2bit-mlx model uses a RotatingKVCache, and MLX raises
+// `NotImplementedError: RotatingKVCache Quantization NYI` then aborts the GPU
+// command buffer (SIGABRT) when --kv-bits is set. That silently kills the
+// server mid-session and the app records an empty `conversation-failed`
+// inference — the real cause of "Maple-Preview never responds". Only enable
+// it if a future model uses a quantizable KV cache; override with
+// HEMLOCK_KV_BITS=n (0 disables).
+const mapleKvBits = Number.isFinite(Number(process.env.HEMLOCK_KV_BITS))
+  ? Math.max(0, Math.min(8, Math.round(Number(process.env.HEMLOCK_KV_BITS))))
+  : 0;
+const maplePrefillStepSize = Number.isInteger(Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  ? Math.max(256, Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  : 1024;
+// Maximum speculative depth for n-gram drafting. Larger depth = more chance
+// to catch long repeated n-grams (code, templates) but a rejected deep draft
+// costs more target forwards. 12 is a good balance for Maple's 512-token
+// sliding window. Tune with HEMLOCK_NGRAM_DEPTH.
+const mapleNgramDepth = Number.isInteger(Number(process.env.HEMLOCK_NGRAM_DEPTH))
+  ? Math.max(2, Math.min(32, Number(process.env.HEMLOCK_NGRAM_DEPTH)))
+  : 12;
+
 const serverArgs = [
   "mlx_lm",
   "server",
@@ -279,6 +336,15 @@ const serverArgs = [
   String(mapleDecodeConcurrency),
   "--log-level",
   "INFO",
+  // ── Performance optimizations ──────────────────────────────
+  // n-gram prompt-lookup speculative decoding (adaptive depth, zero-cost CPU draft)
+  ...(mapleNgramDraft ? ["--ngram-draft"] : []),
+  ...(mapleNgramDraft ? ["--ngram-depth", String(mapleNgramDepth)] : []),
+  // KV cache quantization: 4-bit saves ~75% KV cache memory
+  ...(mapleKvBits > 0 ? ["--kv-bits", String(mapleKvBits)] : []),
+  // Prefill in smaller chunks for better responsiveness
+  "--prefill-step-size",
+  String(maplePrefillStepSize),
 ];
 const serverUrl = "http://127.0.0.1:8080";
 const readinessTimeoutMs = 180000;
@@ -316,9 +382,11 @@ function createWindow() {
     if (mainWindow === window) mainWindow = null;
   });
 
-  const url = isDev
-    ? process.env.MAPLE_DEV_URL || "http://127.0.0.1:5173"
-    : `file://${__dirname}/../dist/index.html`;
+  const url = process.env.HEMLOCK_PROD_UI === "1"
+    ? `file://${__dirname}/../dist/index.html`
+    : isDev
+      ? process.env.MAPLE_DEV_URL || "http://127.0.0.1:5173"
+      : `file://${__dirname}/../dist/index.html`;
   window.loadURL(url);
   window.webContents.setWindowOpenHandler(({ url: target }) => {
     // Artifact previews are sandboxed renderer documents. No preview content
@@ -571,6 +639,12 @@ let agentTask = {
 };
 
 fs.mkdirSync(sessionDir, { recursive: true });
+// Persist the initial task state immediately. Without this, the session's
+// state.json on disk can still describe the *previous* session's task (e.g.
+// status "running" from a session that crashed mid-task), and a later
+// restart would restore that stale task and queue every new intent behind
+// an action loop that can never run.
+writeAgentState();
 
 let agentKernel = new AgentKernel({ root: runtimeDataRoot, repoRoot, task: agentTask });
 let agentOrchestrator = null;
@@ -587,6 +661,11 @@ const artifactRegistry = new ArtifactRegistry({
   workspaceId: agentKernel.workspaceId,
   onEvent: artifactEvent,
   changeSet: ({ artifact, taskId }) => prepareArtifactChangeSet({ artifact, taskId }),
+});
+const changesetApplier = new ChangeSetApplier({
+  changesetRoot: path.join(sipsDir, "workspaces", "changesets"),
+  readArtifactManifest: (taskId, artifactId) => { try { return artifactRegistry.read(taskId, artifactId); } catch { return null; } },
+  onEvent: (type, status, payload, extra = {}) => appendAgentEvent(type, status, payload, { reversible: true, ...extra }),
 });
 const previewSessions = new PreviewSessionManager({
   emit: (type, status, payload) => appendAgentEvent(type, status, payload, { reversible: true }),
@@ -1047,6 +1126,18 @@ async function processAgentIntent(payload = {}) {
   appendAgentEvent("task.created", "accepted", { task: agentTask, source: payload.source || "command-center" });
   appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 500), intent, interactionMode, source: payload.source || "command-center" });
   threadManager.appendConversation(agentTask.threadId, { role: "user", content: text, provider: selection.provider, model: selection.model, reasoning: selection.reasoning });
+  // Auto-title: a thread still carrying its default title takes its name from
+  // the first user message, so the picker shows recognizable identities.
+  {
+    const autoTitleThread = threadManager.thread(agentTask.threadId);
+    if (autoTitleThread && (!autoTitleThread.title || autoTitleThread.title === "New Hemlock thread" || autoTitleThread.title === "Hemlock thread")) {
+      const derivedTitle = text.replace(/\s+/g, " ").trim().slice(0, 60) || autoTitleThread.title;
+      if (derivedTitle && derivedTitle !== autoTitleThread.title) {
+        threadManager.updateThread(agentTask.threadId, { title: derivedTitle });
+        agentTask = { ...agentTask, objective: agentTask.objective && agentTask.objective !== "New Hemlock thread" ? agentTask.objective : derivedTitle };
+      }
+    }
+  }
 
   let context = null;
   try {
@@ -1074,10 +1165,21 @@ async function processAgentIntent(payload = {}) {
   // It still receives a durable task and command receipt, but it should not
   // force the user through a plan-approval ceremony for “hey, how are ya?”.
   if (intent === "conversation" && payload.directChat !== false) {
-    const messages = Array.isArray(payload.messages) && payload.messages.length
-      ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })).filter((message) => ["system", "user", "assistant"].includes(message.role) && message.content)
-      : [{ role: "user", content: text }];
-    const inference = await runInference({
+    // Thread-owned context: the authoritative transcript is the thread's
+    // stored conversation, not the renderer's local state. The renderer's
+    // message array can contain cross-thread bleed or stale entries; the
+    // backend conversation log cannot. Fall back to the payload only if the
+    // thread has no stored history yet (first message of a fresh thread).
+    const storedConversation = agentTask.threadId ? threadManager.readConversation(agentTask.threadId) : [];
+    const storedMessages = storedConversation
+      .map((entry) => ({ role: entry.role, content: String(entry.content || "") }))
+      .filter((message) => ["user", "assistant"].includes(message.role) && message.content);
+    const messages = storedMessages.length
+      ? [...storedMessages, { role: "user", content: text }]
+      : Array.isArray(payload.messages) && payload.messages.length
+        ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })).filter((message) => ["system", "user", "assistant"].includes(message.role) && message.content)
+        : [{ role: "user", content: text }];
+    let inference = await runInference({
       apiBase: payload.apiBase,
       adapterPath: payload.adapterPath,
       provider: selection.provider,
@@ -1093,6 +1195,32 @@ async function processAgentIntent(payload = {}) {
       top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
       max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
     });
+    // Length-guard: if the model consumed its entire token budget on the
+    // thinking channel and produced no visible answer, retry once with the
+    // thinking channel disabled so the user gets a real response instead of
+    // an empty transcript row. Only for local lanes that honor the flag.
+    const lengthChoice = inference.payload?.choices?.[0] || {};
+    const lengthMessage = lengthChoice.message || {};
+    const lengthAnswer = String(inference.answer || lengthMessage.content || "").trim();
+    if (lengthChoice.finish_reason === "length" && !lengthAnswer && selection.provider === "maple") {
+      appendAgentEvent("inference.retrying", "running", { reason: "token budget consumed by reasoning channel; retrying without thinking", threadId: agentTask.threadId }, { reversible: true });
+      inference = await runInference({
+        apiBase: payload.apiBase,
+        adapterPath: payload.adapterPath,
+        provider: selection.provider,
+        model: selection.model,
+        reasoning: "off",
+        messages,
+        taskId: agentTask.id,
+        threadId: agentTask.threadId,
+        workspaceRoot: agentTask.workspaceRoot,
+        operationId: payload.operationId || null,
+        temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
+        top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
+        top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
+        max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
+      });
+    }
     const choice = inference.payload?.choices?.[0]?.message || {};
     // Streaming responses carry text in ordered deltas, not in the final SSE
     // chunk's `message` field. Use the durable inference answer assembled by
@@ -1102,6 +1230,7 @@ async function processAgentIntent(payload = {}) {
       schema: "hemlock.agent.conversation.response.v1",
       requestId: payload.requestId || null,
       taskId: agentTask.id,
+      threadId: agentTask.threadId,
       answer,
       channels: inference.channels || [],
       rawOutputRef: inference.rawOutputRef || null,
@@ -1463,14 +1592,19 @@ async function runInference(payload = {}) {
     const timeoutHandle = setTimeout(() => controller.abort("timeout"), inferenceTimeoutMs);
     try {
       const base = {
-        model: "default_model",
+        model: selection.provider === "maple" ? resolveLocalModelPath(selection.model) : "default_model",
         messages,
         temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
         top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
         top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
         max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
         stream: true,
-        chat_template_kwargs: { enable_thinking: true },
+        // Reasoning toggle: "off" explicitly disables the thinking channel
+        // (LFM2.5 honors enable_thinking:false and skips CoT entirely — much
+        // faster for casual chat). "on" leaves the flag unset: Maple emits its
+        // reasoning channel regardless, so forcing the flag only added server
+        // overhead (~23% slower first response, no content difference).
+        ...(payload.reasoning === "off" ? { chat_template_kwargs: { enable_thinking: false } } : {}),
       };
       let response = await fetch(`${endpoint}/v1/chat/completions`, {
         method: "POST",
@@ -1533,7 +1667,14 @@ async function runInference(payload = {}) {
       // even though the identical request can return visible content in a
       // buffered response. Keep the SSE attempt and its receipt, then use one
       // bounded buffered retry instead of surfacing an empty answer.
-      if (!bufferedFallback && !stream.text.trim()) {
+      // Fire the buffered retry when the visible CONTENT channel is empty
+      // (reasoning-only streams, or an empty delta) rather than only when the
+      // whole stream text is empty. An empty content channel is what the app
+      // would otherwise render as a blank "· content" block.
+      const streamHasContent = Boolean(String(stream.channels.content || "").trim());
+      const streamHasReasoning = Boolean(String(stream.channels.reasoning || "").trim());
+      if (!bufferedFallback && !streamHasContent) {
+        if (streamHasReasoning) bumpAgentMetrics({ mapleReasoningOnlyStream: 1 });
         const fallbackResponse = await fetch(`${endpoint}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1554,6 +1695,31 @@ async function runInference(payload = {}) {
         usage = fallbackPayload.usage || null;
         bufferedFallback = true;
         for (const channel of extractModelChannels(fallbackChoice.message)) publishStreamFrame(stream, { channel: channel.name, delta: channel.text, usage, stopReason: finishReason });
+      }
+      // Bounded second retry: if even the buffered fallback returned an empty
+      // CONTENT channel, try once more with a slightly raised temperature. This
+      // contains the rare double-empty KV-warmup hiccup instead of rendering a
+      // blank response. At most ONE extra request ever fires per inference.
+      const fallbackContentEmpty = !String(stream.channels.content || "").trim();
+      if (bufferedFallback && fallbackContentEmpty) {
+        bumpAgentMetrics({ mapleDoubleEmptyRetry: 1 });
+        const retryResponse = await fetch(`${endpoint}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...base, stream: false, temperature: Math.min(1, Number(base.temperature ?? 0.7) + 0.15) || 0.85 }),
+          signal: controller.signal,
+        });
+        if (retryResponse.ok) {
+          const retryPayload = await readResponse(retryResponse);
+          const retryChoice = retryPayload?.choices?.[0];
+          if (retryChoice?.message && String(retryChoice.message.content || "").trim()) {
+            rawPayloads.push(retryPayload);
+            responsePayload = retryPayload;
+            finishReason = retryChoice.finish_reason || null;
+            usage = retryPayload.usage || null;
+            for (const channel of extractModelChannels(retryChoice.message)) publishStreamFrame(stream, { channel: channel.name, delta: channel.text, usage, stopReason: finishReason });
+          }
+        }
       }
       const channels = modelChannelRecords(stream.channels);
       const answerText = String(stream.channels.content || responsePayload?.choices?.[0]?.message?.content || "").trim();
@@ -1922,8 +2088,11 @@ const agentCommands = {
   "receipt.inspect": { label: "Inspect a local receipt", capability: "read", auto: true, approval: "none", timeoutMs: 15000 },
   recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
+  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true },
   "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false },
   "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -1931,6 +2100,7 @@ const agentCommands = {
   "thread.pause": { label: "Pause Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.resume": { label: "Resume Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.restore": { label: "Restore archived Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -1987,6 +2157,7 @@ const agentCommands = {
   "artifact.compare": { label: "Compare artifact revisions", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.freeze": { label: "Freeze artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
   "artifact.export": { label: "Export artifact change set", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
+  "changeset.apply": { label: "Apply an exported artifact change set to the thread repository", capability: "task", auto: false, approval: "explicit", timeoutMs: 60000 },
   "artifact.preview.open": { label: "Open isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.preview.inspect": { label: "Inspect isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.preview.interact": { label: "Interact with isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
@@ -2015,6 +2186,13 @@ async function runAgentCommand(action, payload = {}) {
     let result;
     if (command === "intent.submit") result = await submitAgentIntent({ ...payload, operationId: payload.operationId || operation.id });
     else if (command === "thread.list") result = threadManager.snapshot();
+    else if (command === "thread.search") {
+      // Bounded title+body search over recent threads. Read-only; results feed
+      // the palette THREADS section's content matches.
+      const query = String(payload.query || "");
+      const limit = Number.isFinite(Number(payload.limit)) ? Math.max(1, Math.min(20, Math.round(Number(payload.limit)))) : 6;
+      result = { schema: "hemlock.agent.thread.search.v1", status: "searched", query, results: threadManager.searchThreads(query, { limit }) };
+    }
     else if (command === "provider.capacity") result = { schema: "hemlock.agent.provider.capacity.v1", status: "updated", providerCaps: threadManager.setProviderCaps(payload.caps || payload) };
     else if (command === "thread.create") {
       const thread = threadManager.createThread(payload);
@@ -2023,7 +2201,24 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "thread.switch") {
       const thread = threadManager.switchThread(String(payload.threadId || ""));
       if (thread.taskSnapshot && typeof thread.taskSnapshot === "object") {
-        agentTask = { ...thread.taskSnapshot, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy };
+        // A thread's taskSnapshot may be from a previous session that
+        // crashed or was closed mid-task, leaving status "running" or
+        // "waiting_for_approval".  Treat that as blocked so the queue
+        // does not enqueue every new intent behind a stale action loop.
+        const staleSnapshot = thread.taskSnapshot;
+        const sessionBoundary = staleSnapshot.startedAt
+          && Date.now() - new Date(staleSnapshot.startedAt).getTime() > 600000; // 10 min
+        agentTask = {
+          ...staleSnapshot,
+          threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot,
+          provider: thread.provider, model: thread.model, reasoning: thread.reasoning,
+          autonomy: thread.autonomy,
+          status: sessionBoundary ? "blocked" : staleSnapshot.status,
+          phase: sessionBoundary ? "blocked" : staleSnapshot.phase,
+          blockedReason: sessionBoundary
+            ? "The previous session was interrupted; inspect and resume the task."
+            : staleSnapshot.blockedReason || null,
+        };
       } else {
         agentTask = { ...agentTask, id: thread.taskId || `task-${thread.id}`, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, objective: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase || "conversation", status: thread.status || "ready", blockedReason: thread.blockedReason || null };
       }
@@ -2033,6 +2228,7 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "switched", thread, task: agentTask, context: compileThreadContext(thread.id), conversation: threadManager.readConversation(thread.id) };
     }
     else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
+    else if (command === "conversation.history") result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId: String(payload.threadId || agentTask.threadId || ""), conversation: threadManager.readConversation(String(payload.threadId || agentTask.threadId || "")) };
     else if (command === "thread.pause") {
       const threadId = String(payload.threadId || agentTask.threadId);
       const checkpoint = threadManager.checkpoint(threadId, { taskId: agentTask.id, phase: "paused", status: "paused", reason: payload.reason || "paused-by-user", evidenceRefs: agentTask.evidenceRefs, artifactRepair: agentTask.artifactRepair, verificationIssues: agentTask.artifactRepair?.issues || [] });
@@ -2046,6 +2242,11 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "resumable", thread, checkpoint: threadManager.latestCheckpoint(threadId), context: compileThreadContext(threadId) };
     }
     else if (command === "thread.archive") result = { schema: "hemlock.agent.thread.result.v1", status: "archived", thread: threadManager.archiveThread(String(payload.threadId || agentTask.threadId)) };
+    else if (command === "thread.restore") {
+      const threadId = String(payload.threadId || "");
+      const thread = threadManager.updateThread(threadId, { status: "ready", phase: "conversation", archivedAt: null, blockedReason: null });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "restored", thread };
+    }
     else if (command === "thread.cancel") result = { schema: "hemlock.agent.thread.result.v1", status: "cancelled", thread: threadManager.cancelThread(String(payload.threadId || agentTask.threadId)) };
     else if (command === "project.list") result = { schema: "hemlock.agent.project.result.v1", status: "ready", projects: threadManager.snapshot().projects };
     else if (command === "project.register") result = { schema: "hemlock.agent.project.result.v1", status: "registered", project: threadManager.registerProject(payload) };
@@ -2152,6 +2353,7 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "change.approve") result = await transitionChangeSet(payload, "approve");
     else if (command === "change.reject") result = await transitionChangeSet(payload, "reject");
+    else if (command === "changeset.apply") result = await changesetApplier.apply({ ...payload, threadWorkspaceRoot: agentTask.workspaceRoot || null });
     else if (command === "candidate.create") {
       const candidate = agentKernel.createCandidate(payload);
       appendAgentEvent("candidate.created", "candidate", { candidate }, { evidenceRefs: candidate.sourceRefs || [], reversible: true });
@@ -2255,7 +2457,7 @@ async function inferStructuredAction(prompt) {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify({
-      model: "default_model",
+      model: resolveLocalModelPath(selection.model),
       messages,
       temperature: 0,
       top_p: 1,
@@ -2615,10 +2817,31 @@ async function codingInference(prompt, adapterPath = "") {
   return { content: String(choice.message.content || "").trim(), reasoning: String(choice.message.reasoning || "").trim(), usage: payload.usage || null };
 }
 
-function startServer(adapterPath = "") {
+async function startServer(adapterPath = "") {
   if (serverProcess && !serverProcess.killed) return;
   if (!fs.existsSync(modelPath)) {
     throw new Error(`Maple-Preview model was not found at ${modelPath}. Set HEMLOCK_MODEL_PATH to a local MLX model directory.`);
+  }
+  // Adopt an already-running Maple server instead of colliding with it. A
+  // leftover server from a prior launch, a crashed process, or an external
+  // test can hold 127.0.0.1:8080; spawning our own would then fail with
+  // EADDRINUSE and surface to the user as a misleading "Failed to fetch"
+  // transport error. If a healthy server already answers on the port, reuse
+  // it so chat works without a restart.
+  try {
+    const probe = await fetchWithTimeout(`${serverUrl}/health`, {}, 1500);
+    if (probe.ok) {
+      serverState = { processReady: true, inferenceReady: false, adapterPath };
+      console.log(`[hemlock] adopted existing Maple-Preview server on ${serverUrl}`);
+      // Health already answered OK above; mark the process ready so the UI
+      // heartbeat reflects reality instead of showing DOWN until the first
+      // inference completes.
+      serverState = { processReady: true, inferenceReady: false, adapterPath };
+      appendAgentEvent("maple.server.ready", "passed", { adopted: true, processReady: true, inferenceReady: false }, { reversible: true });
+      return;
+    }
+  } catch {
+    // No server answering yet; fall through and spawn our own.
   }
   const args = [...serverArgs];
   if (adapterPath) args.push("--adapter-path", adapterPath);
@@ -2691,7 +2914,9 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
     try {
       const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
       if (response.ok) {
+        const wasReady = serverState.processReady === true;
         serverState = { ...serverState, processReady: true, inferenceReady: preserveInference ? serverState.inferenceReady === true : false };
+        if (!wasReady) appendAgentEvent("maple.server.ready", "passed", { processReady: true, inferenceReady: serverState.inferenceReady === true }, { reversible: true });
         return { processReady: true, inferenceReady: serverState.inferenceReady };
       }
       lastError = new Error(`Maple-Preview health returned HTTP ${response.status}`);
@@ -2708,10 +2933,16 @@ async function launchMapleRuntime() {
   serverLaunchPromise = (async () => {
     const startedAt = Date.now();
     try {
-      if (!serverProcess || serverProcess.killed) startServer();
+      if (!serverProcess || serverProcess.killed) await startServer();
       await waitForServer(readinessTimeoutMs, { preserveInference: true });
       const result = createMapleLaunchResult({ server: serverState, startedAt });
       appendAgentEvent("maple.launch.completed", "passed", result, { reversible: true });
+      // Background GPU warmup: fire a 1-token inference probe to compile
+      // Metal shaders before the first user message arrives. This makes the
+      // first real inference ~2-5s faster. The probe is best-effort — if it
+      // fails (e.g. the server is loading safetensors), the user's first
+      // inference pays the normal compile cost.
+      probeInference("").catch(() => { /* warmup is best-effort */ });
       return result;
     } catch (error) {
       serverState = { ...serverState, processReady: false, inferenceReady: false };
@@ -2753,7 +2984,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    // undici's default bodyTimeout (300s) aborts a response that sends no
+    // data within 5 minutes — but a local model prefilling under memory
+    // pressure can legitimately exceed that before its first SSE token.
+    // Our AbortController (timeoutMs, default 600s) is the real watchdog;
+    // disable undici's per-read timeouts for these long local streams.
+    let dispatcher;
+    try {
+      const { Agent } = require("undici");
+      dispatcher = new Agent({ bodyTimeout: 0, headersTimeout: Math.max(timeoutMs, 600000) });
+    } catch {
+      dispatcher = undefined;
+    }
+    return await fetch(url, { ...options, signal: controller.signal, ...(dispatcher ? { dispatcher } : {}) });
   } finally {
     clearTimeout(timer);
   }
@@ -2839,7 +3082,7 @@ async function waitForInference(adapterPath = "", timeoutMs = inferenceProbeTime
 async function recoverBaseServer() {
   emitDreamProgress({ stage: "recovering Maple-Preview base server", progress: 96, elapsed: 0, log: "existing adapters and base weights are preserved" });
   await stopServer();
-  startServer();
+  await startServer();
   let processReady = false;
   let inferenceReady = false;
   let error = null;
@@ -2861,7 +3104,7 @@ function recoveryDescription(recovery) {
   return `Base Maple-Preview recovery: server process ${process}; inference ${inference}${detail}. Existing adapter files and base weights were preserved.`;
 }
 
-function runDream(payload) {
+async function runDream(payload) {
   if (dreamProcess) throw new Error("A Dream run is already in progress.");
   if (!fs.existsSync(modelPath)) {
     throw new Error(`Dream cannot start because the Maple-Preview model was not found at ${modelPath}. Set HEMLOCK_MODEL_PATH to a local MLX model directory.`);
@@ -2896,6 +3139,16 @@ function runDream(payload) {
     datasetRows: input.examples.length + input.facts.length + input.conversation.length,
     baseModel: modelPath,
   });
+  // Work-notification boundary (a): standalone Dream runs announce completion.
+  // When this run is nested inside a SIPS cycle (sipsCycleActive), it stays
+  // silent here — the enclosing SIPS cycle emits the single user-facing
+  // notification, so the user gets one ping per long job, not two.
+  const dreamJobId = `dream:${runId}`;
+  const dreamNotifies = !sipsCycleActive;
+  if (dreamNotifies) workNotifier.onJobStarted(dreamJobId, "Dream training");
+  const notifyDreamFinished = (ok, detail) => {
+    if (dreamNotifies) workNotifier.onJobFinished(dreamJobId, { ok, detail });
+  };
   return new Promise((resolve, reject) => {
     emitDreamProgress({ stage: "stopping Maple-Preview server before local training", progress: 4, elapsed: 0, log: "" });
     stopServer().then(() => {
@@ -2942,6 +3195,7 @@ function runDream(payload) {
         const recovery = await recoverBaseServer();
         settled = true;
         appendAgentEvent("dream.failed", "failed", { runId, runDir, error: message, recovery: { processReady: recovery.processReady, inferenceReady: recovery.inferenceReady, error: recovery.error?.message || null } }, { evidenceRefs: [runDir], reversible: true });
+        notifyDreamFinished(false, message);
         reject(new Error(`${message} ${recoveryDescription(recovery)}`));
       };
       dreamProcess.stdout.on("data", (chunk) => consume(chunk));
@@ -2967,7 +3221,11 @@ function runDream(payload) {
           }
           const adapterPath = reportedAdapterPath || path.join(runDir, "adapters");
           emitDreamProgress({ stage: "local adapter saved — checking server process readiness", progress: 94, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "" });
-          startServer();
+          // startServer() adopts an existing server or spawns one; the
+          // waitForServer().then() below owns readiness detection, so this
+          // call is intentionally fire-and-forget (it lives inside a
+          // non-async 'exit' event handler).
+          void startServer();
           waitForServer(readinessTimeoutMs).then(async (processStatus) => {
             emitDreamProgress({ stage: "server process ready — verifying adapter inference", progress: 95, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "HTTP liveness is not an inference result", serverProcessReady: processStatus.processReady, inferenceReady: false });
             try {
@@ -2976,6 +3234,7 @@ function runDream(payload) {
               settled = true;
               const result = { adapterPath, runDir, elapsed: Math.round((Date.now() - startedAt) / 1000), processReady: processStatus.processReady, inferenceReady: inferenceStatus.inferenceReady, trainingReceipt, trainingReceiptPath };
               appendAgentEvent("dream.completed", "passed", { runId, ...result, baseWeightsUnchanged: trainingReceipt.baseWeightsUnchanged === true }, { evidenceRefs: [trainingReceiptPath || runDir], reversible: false });
+              notifyDreamFinished(true, adapterPath);
               resolve(result);
             } catch (adapterError) {
               await rejectWithRecovery(`Dream adapter was saved at ${adapterPath}, but its local inference probe failed: ${adapterError.message}.`);
@@ -2997,7 +3256,7 @@ async function ensureBaseInference() {
     return;
   } catch {
     await stopServer();
-    startServer();
+    await startServer();
     await waitForServer(readinessTimeoutMs);
     await waitForInference("", inferenceProbeTimeoutMs);
   }
@@ -3022,6 +3281,13 @@ async function runSipsCycle(payload) {
   sipsCycleActive = true;
   fs.mkdirSync(runDir, { recursive: true });
   appendAgentEvent("sips.cycle.started", "running", { runId, objective, verifyProfile: profileId, trainingProfile, datasetExamples: examples.length, runDir });
+  // Work-notification boundary (b): the SIPS cycle is the single user-facing
+  // job for this whole pipeline (baseline → dataset → nested Dream run →
+  // comparison), so only the cycle itself notifies; the nested runDream() call
+  // suppresses its own notification while sipsCycleActive is true.
+  const sipsJobId = `sips:${runId}`;
+  workNotifier.onJobStarted(sipsJobId, `SIPS cycle · ${objective.slice(0, 60)}`);
+
   let baselineVerification = null;
   let finalVerification = null;
   let baselineModel = null;
@@ -3094,6 +3360,11 @@ async function runSipsCycle(payload) {
     }
     emitSipsProgress({ stage: receipt.status === "candidate-ready" ? "SIPS cycle complete · candidate ready for review" : "SIPS cycle complete · verification blocked", progress: 100, elapsed: receipt.elapsed, log: receiptPath, receiptPath, status: receipt.status });
     appendAgentEvent("sips.cycle.completed", receipt.status === "candidate-ready" ? "passed" : "blocked", { runId, receipt, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+    // A blocked cycle (verification failed) is not a success for the user.
+    workNotifier.onJobFinished(sipsJobId, {
+      ok: receipt.status === "candidate-ready",
+      detail: receipt.status === "candidate-ready" ? `receipt ${receiptPath}` : `verification blocked · receipt ${receiptPath}`,
+    });
     return { ...receipt, receiptPath };
   } catch (error) {
     const receipt = {
@@ -3116,9 +3387,90 @@ async function runSipsCycle(payload) {
     }
     emitSipsProgress({ stage: "SIPS cycle failed", progress: 100, elapsed: receipt.elapsed, log: error.message, receiptPath, status: "failed" });
     appendAgentEvent("sips.cycle.failed", "failed", { runId, error: error.message, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+    workNotifier.onJobFinished(sipsJobId, { ok: false, detail: error.message });
     throw error;
   } finally {
     sipsCycleActive = false;
+  }
+}
+
+// --- Host UX (Lane B): confirm dialog, notifications, window inventory ------
+//
+// Pure helpers below are exported at the bottom of this file so node:test
+// files can exercise them without launching Electron.
+
+const NOTIFICATION_TITLE_MAX_LENGTH = 80;
+const NOTIFICATION_BODY_MAX_LENGTH = 240;
+// The renderer owns workspace window state: it persists it to localStorage
+// under WINDOWS_KEY ("hemlock-os-windows-v2") in src/main.jsx, and the
+// "agent:windows" handler above already documents that boundary as
+// "renderer-owned". The main process keeps no authoritative copy of that
+// state, so the simplest honest path for windows:list is a read-only pull:
+// executeJavaScript reads the renderer's persisted snapshot and this module
+// normalizes it into {windowId,label,state,zOrder} rows. Nothing is written
+// back; the renderer remains the source of truth.
+const WINDOWS_STORAGE_KEY = "hemlock-os-windows-v2";
+const WINDOW_LABELS = {
+  center: "Command Center",
+  chat: "Chat / Code",
+  artifact: "Artifact Studio",
+  activity: "Activity",
+  receipts: "Receipts",
+  sips: "SIPS Control",
+  memory: "Memory Garden",
+  dream: "Dream Lab",
+  map: "Project Map",
+  settings: "Settings",
+};
+
+function clampNotificationText(value, maxLength) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function mapConfirmChoice(response) {
+  // dialog.showMessageBox resolves with the chosen button index; index 0 is
+  // the confirm button, anything else (cancel/Escape/closed) is a rejection.
+  return response === 0;
+}
+
+function parseWindowListSnapshot(raw) {
+  let source;
+  try {
+    source = JSON.parse(String(raw ?? ""));
+  } catch {
+    return [];
+  }
+  const entries = Array.isArray(source)
+    ? source.map((item) => [item?.windowId, item])
+    : Object.entries(source && typeof source === "object" ? source : []);
+  const windows = [];
+  for (const [key, item] of entries) {
+    if (!item || typeof item !== "object") continue;
+    const windowId = String(item.windowId || key || "");
+    if (!windowId) continue;
+    const state = ["normal", "minimized", "maximized"].includes(item.state) ? item.state : "closed";
+    if (state === "closed") continue; // closed windows are excluded by contract
+    windows.push({
+      windowId,
+      label: WINDOW_LABELS[windowId] || windowId,
+      state,
+      zOrder: Math.max(0, Math.floor(Number(item.zOrder)) || 0),
+    });
+  }
+  return windows.sort((a, b) => a.zOrder - b.zOrder || a.windowId.localeCompare(b.windowId));
+}
+
+async function readWorkspaceWindowList(contents) {
+  const empty = { schema: "hemlock.window.list.v1", source: "unavailable", windows: [] };
+  if (!contents || typeof contents.executeJavaScript !== "function" || contents.isDestroyed?.()) {
+    return { ...empty, error: "No renderer window is available to read workspace window state from." };
+  }
+  try {
+    const raw = await contents.executeJavaScript(`localStorage.getItem(${JSON.stringify(WINDOWS_STORAGE_KEY)})`, true);
+    return { schema: "hemlock.window.list.v1", source: "renderer-localstorage", windows: parseWindowListSnapshot(raw) };
+  } catch (error) {
+    return { ...empty, error: `Unable to read workspace window state: ${error.message}` };
   }
 }
 
@@ -3126,6 +3478,88 @@ ipcMain.handle("providers:status", () => inspectProviders());
 ipcMain.handle("providers:login", (_event, provider) => openProviderLogin(String(provider || ""), "login"));
 ipcMain.handle("providers:logout", (_event, provider) => openProviderLogin(String(provider || ""), "logout"));
 ipcMain.handle("maple:launch", () => runAgentCommand("maple.launch"));
+ipcMain.handle("dialog:pick-directory", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Choose a project directory for the new thread",
+    properties: ["openDirectory", "createDirectory"],
+    buttonLabel: "Use this folder",
+  });
+  if (result.canceled || !result.filePaths?.length) return { canceled: true };
+  return { canceled: false, path: result.filePaths[0] };
+});
+ipcMain.handle("dialog:confirm", async (_event, options = {}) => {
+  const message = typeof options?.message === "string" ? options.message.trim() : "";
+  if (!message) throw new Error("dialog:confirm requires a non-empty message string.");
+  const tone = options.tone === "danger" ? "danger" : "default";
+  const confirmLabel = typeof options.confirmLabel === "string" && options.confirmLabel.trim() ? options.confirmLabel.trim() : tone === "danger" ? "Destroy" : "Confirm";
+  const cancelLabel = typeof options.cancelLabel === "string" && options.cancelLabel.trim() ? options.cancelLabel.trim() : "Cancel";
+  try {
+    const { response } = await dialog.showMessageBox({
+      type: tone === "danger" ? "warning" : "question",
+      message,
+      ...(typeof options.detail === "string" && options.detail.trim() ? { detail: options.detail.trim() } : {}),
+      buttons: [confirmLabel, cancelLabel],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    return mapConfirmChoice(response);
+  } catch (error) {
+    throw new Error(`dialog:confirm failed: ${error.message}`);
+  }
+});
+// Shared routine behind both the renderer-facing "notification:show" IPC
+// channel and main-process work notifications, so every OS notification in the
+// app goes through one validation + clamping path.
+function showHostNotification(payload = {}) {
+  try {
+    const title = clampNotificationText(payload?.title, NOTIFICATION_TITLE_MAX_LENGTH);
+    const body = clampNotificationText(payload?.body, NOTIFICATION_BODY_MAX_LENGTH);
+    if (!title) throw new Error("notification:show requires a non-empty title string (max 80 characters).");
+    const notificationOptions = { title, body };
+    // Electron stamps the host app name/icon onto notifications from the app
+    // bundle; make the app name explicit on macOS via the subtitle slot.
+    if (process.platform === "darwin") notificationOptions.subtitle = app.name || "Hemlock";
+    new Notification(notificationOptions).show();
+    return { shown: true };
+  } catch (error) {
+    return { shown: false, error: error.message };
+  }
+}
+
+ipcMain.handle("notification:show", (_event, payload = {}) => showHostNotification(payload));
+
+// --- Work notifications (Lane B): long-running local jobs announce completion
+//
+// The main process spawns and supervises Dream training and SIPS cycles, so it
+// is the legitimate observer of their lifecycle. The notifier below queues job
+// starts and only fires an OS notification when the job ran at least the
+// configured threshold (default 30s) — short jobs stay silent.
+//
+// FOCUS GUARD: the simplest honest version of "don't ping someone who is
+// already watching" — if the main Hemlock window is focused, the completion is
+// visible in the UI and the OS notification is skipped entirely. There is no
+// renderer flag involved: this is a main-process-only check on
+// mainWindow.isFocused(), so it needs no renderer cooperation and can never go
+// stale. (A richer "renderer says the user is watching the Dream/SIPS pane"
+// signal would require renderer changes, which are out of scope here.)
+const workNotifier = createWorkNotifier({
+  notify: (payload) => {
+    if (mainWindow && typeof mainWindow.isFocused === "function" && mainWindow.isFocused()) {
+      return { shown: false, skipped: "window-focused" };
+    }
+    return showHostNotification(payload);
+  },
+  config: {
+    thresholdMs: Number(process.env.HEMLOCK_WORK_NOTIFY_THRESHOLD_MS) > 0
+      ? Number(process.env.HEMLOCK_WORK_NOTIFY_THRESHOLD_MS)
+      : undefined, // undefined falls back to the module default (30s)
+  },
+});
+
+// See the Host UX comment block above for why this reads renderer-owned
+// localStorage state instead of a main-process window registry.
+ipcMain.handle("windows:list", () => readWorkspaceWindowList(mainWindow?.webContents));
 ipcMain.handle("agent:state", () => getAgentState());
 ipcMain.handle("agent:intent", (_event, payload = {}) => runAgentCommand("intent.submit", payload));
 ipcMain.handle("agent:threads", (_event, payload = {}) => {
@@ -3201,6 +3635,25 @@ ipcMain.handle("agent:cancel", (_event, taskId) => {
   appendAgentEvent("operation.cancelled", "cancelled", { taskId: agentTask.id, operationIds: cancelledOperations }, { reversible: true });
   return getAgentState();
 });
+// Stream-only stop: abort in-flight model streams without cancelling the task,
+// killing dream/SIPS children, or tearing down operations. This is the
+// "stop this reply" affordance in Chat.
+ipcMain.handle("agent:stream-cancel", (_event, payload = {}) => {
+  const reason = "stopped by user";
+  let stopped = 0;
+  const requestedStreamId = payload.streamId ? String(payload.streamId) : null;
+  for (const stream of activeStreams.values()) {
+    if (stream.terminal) continue;
+    if (requestedStreamId && stream.streamId !== requestedStreamId) continue;
+    if (!requestedStreamId && stream.kind !== "model_text") continue;
+    stream.abortReason = reason;
+    stream.controller?.abort(reason);
+    finishStream(stream, { status: "cancelled", stopReason: "stopped_by_user" });
+    stopped += 1;
+  }
+  appendAgentEvent("inference.stopped", "cancelled", { stopped, streamId: requestedStreamId, scope: requestedStreamId ? "stream" : "model_text" }, { reversible: true });
+  return { stopped, state: getAgentState() };
+});
 ipcMain.handle("dream:start", (_event, payload) => runAgentCommand("dream", payload));
 ipcMain.handle("sips:cycle", (_event, payload) => runAgentCommand("cycle", payload));
 ipcMain.handle("sips:command", async (_event, payload) => {
@@ -3209,10 +3662,14 @@ ipcMain.handle("sips:command", async (_event, payload) => {
 });
 
 if (hasSingleInstanceLock) {
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     if (app.isPackaged || process.env.MAPLE_AUTOSTART_SERVER === "1") {
       try {
-        startServer();
+        await startServer();
+        // Adopted/spawned server: confirm readiness now so serverState is
+        // true before the renderer's first getState() hydration, and the
+        // maple.server.ready event lands in THIS session's journal.
+        await waitForServer(readinessTimeoutMs, { preserveInference: false });
       } catch (error) {
         serverProcessError = { message: error.message, code: error.code || null };
         console.error(`[maple-server] unable to launch: ${error.message}`);
@@ -3234,3 +3691,21 @@ app.on("before-quit", () => {
   if (dreamProcess && !dreamProcess.killed) dreamProcess.kill("SIGTERM");
   if (serverProcess && !serverProcess.killed) serverProcess.kill("SIGTERM");
 });
+
+// Test-only exports: pure Lane B host-UX helpers plus the constants they read.
+// Requiring this module in node:test is safe only with a mocked "electron"
+// module and HEMLOCK_DATA_DIR pointed at a temp directory; see
+// electron/host_ux_ipc.test.cjs for the harness that does exactly that.
+module.exports = {
+  WINDOWS_STORAGE_KEY,
+  NOTIFICATION_TITLE_MAX_LENGTH,
+  NOTIFICATION_BODY_MAX_LENGTH,
+  clampNotificationText,
+  mapConfirmChoice,
+  parseWindowListSnapshot,
+  readWorkspaceWindowList,
+  // Work-notification wiring (Lane B): exposed so node:test files can drive
+  // job boundaries without launching Electron.
+  showHostNotification,
+  workNotifier,
+};

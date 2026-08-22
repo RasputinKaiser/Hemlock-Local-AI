@@ -205,6 +205,21 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--ngram-draft",
+        action="store_true",
+        help=(
+            "Use zero-cost n-gram (prompt-lookup) speculative decoding. No second "
+            "model is loaded, so memory stays at the target's footprint. Best for "
+            "repetitive / code / templated output. Output is identical to greedy."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-window",
+        type=int,
+        help="Context window size for n-gram draft lookup.",
+        default=1024,
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
@@ -658,6 +673,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    ngram_draft: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -683,6 +699,9 @@ def stream_generate(
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
+    # These are speculative-decode knobs, not accepted by the stock generate_step.
+    kwargs.pop("ngram_draft", None)
+    kwargs.pop("ngram_window", None)
     if not isinstance(prompt, mx.array):
         if isinstance(prompt, str):
             # Try to infer if special tokens are needed
@@ -696,12 +715,53 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is None and not ngram_draft:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
+        )
+    elif ngram_draft:
+        # Zero-cost n-gram (prompt-lookup) speculative decoding. Correctness is
+        # identical to greedy serial; best speedup on repetitive / code / templated
+        # output, and it loads NO second model so memory stays at the target's.
+        from .speculative import NGramDraft, optimized_speculative_generate
+
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        ng = NGramDraft(window=kwargs.pop("ngram_window", 1024))
+        max_depth = kwargs.pop("num_draft_tokens", 12) or kwargs.pop(
+            "max_depth", 12
+        )
+        sampler = kwargs.pop("sampler", None)
+        result = optimized_speculative_generate(
+            prompt=prompt,
+            model=model,
+            draft_model=None,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            max_depth=max_depth,
+            eos_token_ids=kwargs.pop("eos_token_ids", None),
+            draft_fn=ng,
+            **{
+                k: v
+                for k, v in kwargs.items()
+                if k
+                in (
+                    "prefill_step_size",
+                    "kv_bits",
+                    "kv_group_size",
+                    "quantized_kv_start",
+                    "logits_processors",
+                    "prompt_cache",
+                )
+            },
+        )
+        token_generator = (
+            (t, None, i > 0)
+            for i, t in enumerate(result.tokens)
         )
     else:
         kwargs.pop("max_kv_size", None)
@@ -2191,6 +2251,8 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        ngram_draft=args.ngram_draft,
+        ngram_window=args.ngram_window,
     )
     if not args.verbose:
         print(response)

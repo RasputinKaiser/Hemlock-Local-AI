@@ -28,3 +28,12 @@ test("does not treat visual ideation without a build handoff as a task", () => {
   assert.equal(resolveInteraction({ text: "I have an idea for a new interactive animation artifact: a brass planetarium with a slow eclipse." }).interactionMode, "explore");
   assert.equal(resolveInteraction({ text: "Could you create a visual concept for an animation?" }).interactionMode, "explore");
 });
+
+test("recognizes performance and agenticness requests as improve intent", () => {
+  assert.equal(resolveInteraction({ text: "Make Maple-Preview run faster on HemlockOS" }).intent, "improve");
+  assert.equal(resolveInteraction({ text: "Optimize the inference speed" }).intent, "improve");
+  assert.equal(resolveInteraction({ text: "Improve agenticness and autonomy" }).intent, "improve");
+  assert.equal(resolveInteraction({ text: "Speed up the agent loop" }).intent, "improve");
+  assert.equal(resolveInteraction({ text: "Be more proactive about opportunities" }).intent, "improve");
+  assert.equal(resolveInteraction({ text: "Tell me about hemlock trees" }).intent, "conversation");
+});

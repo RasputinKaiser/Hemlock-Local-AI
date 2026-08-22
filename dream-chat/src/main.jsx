@@ -28,6 +28,16 @@ const DREAM_PROFILE_KEY = "hemlock-dream-profile-v2";
 const MODEL_SELECTION_KEY = "hemlock-model-selection-v1";
 const WINDOWS_KEY = "hemlock-os-windows-v2";
 const ARTIFACT_LAYOUT_KEY = "hemlock-artifact-layout-v1";
+const PRIMER_KEY = "hemlock-primer-v1";
+const UNDERSTORY_KEY = "hemlock-understory-v1";
+
+function readUnderstoryPreference() {
+  try {
+    return JSON.parse(localStorage.getItem(UNDERSTORY_KEY))?.on === true;
+  } catch {
+    return false;
+  }
+}
 // Browser preview has no Electron host to negotiate a per-request ceiling.
 // Keep the same high default used by the local Maple runtime; this is transport
 // capacity, not a prompt-level reasoning limit.
@@ -35,16 +45,17 @@ const DEFAULT_MAPLE_MAX_TOKENS = 16384;
 const DEFAULT_ARTIFACT_LAYOUT = { source: 0.68, diff: 0.88, preview: 1.48, evidence: 168 };
 
 const MODEL_LANES = {
-  maple: { provider: "maple", label: "Maple-Preview", shortLabel: "MAPLE", kind: "local", defaultModel: "default_model", defaultModelLabel: "Maple-Preview local MLX", defaultReasoning: "native", reasoningLevels: ["native"], modelOptions: [{ value: "default_model", label: "Maple-Preview" }] },
+  maple: { provider: "maple", label: "Local", shortLabel: "MAPLE", kind: "local", defaultModel: "default_model", defaultModelLabel: "Local MLX model", defaultReasoning: "on", reasoningLevels: ["on", "off"], modelOptions: [{ value: "default_model", label: "Maple-Preview" }, { value: "lfm25-8b", label: "LFM2.5-8B-A1B (LiquidAI)" }] },
   codex: { provider: "codex", label: "Codex", shortLabel: "CODEX", kind: "subscription", defaultModel: "", defaultModelLabel: "Codex default", defaultReasoning: "high", reasoningLevels: ["low", "medium", "high", "xhigh", "max"], modelOptions: [{ value: "", label: "Default Codex model" }, { value: "gpt-5.6-luna", label: "gpt-5.6-luna" }] },
   claude: { provider: "claude", label: "Claude", shortLabel: "CLAUDE", kind: "subscription", defaultModel: "sonnet", defaultModelLabel: "Claude Sonnet", defaultReasoning: "high", reasoningLevels: ["low", "medium", "high", "xhigh", "max"], modelOptions: [{ value: "sonnet", label: "Claude Sonnet" }, { value: "opus", label: "Claude Opus" }, { value: "haiku", label: "Claude Haiku" }] },
 };
 
 function normalizeModelSelection(value) {
   const lane = MODEL_LANES[value?.provider] || MODEL_LANES.maple;
+  const modelIsValid = typeof value?.model === "string" && lane.modelOptions.some((option) => option.value === value.model);
   return {
     provider: lane.provider,
-    model: typeof value?.model === "string" && lane.provider !== "maple" ? value.model : lane.defaultModel,
+    model: modelIsValid ? value.model : lane.defaultModel,
     reasoning: lane.reasoningLevels.includes(value?.reasoning) ? value.reasoning : lane.defaultReasoning,
   };
 }
@@ -112,6 +123,20 @@ function displayText(value, fallback = "—") {
 function compactPreview(value, maxLength = 150) {
   const text = displayText(value, "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength - 1).trimEnd()}…` : text;
+}
+
+// Spotlight-style matching: every non-space character of the query must appear
+// in order (not necessarily contiguously) in the haystack.
+function fuzzySubsequenceMatch(query, text) {
+  const haystack = String(text).toLowerCase();
+  let cursor = 0;
+  for (const char of String(query).toLowerCase()) {
+    if (char.trim() === "") continue;
+    cursor = haystack.indexOf(char, cursor);
+    if (cursor < 0) return false;
+    cursor += 1;
+  }
+  return true;
 }
 
 function messageChannels(message) {
@@ -280,14 +305,41 @@ function Metric({ value, label, tone = "green" }) {
   return <div className={`metric metric-${tone}`}><strong>{displayText(value)}</strong><span>{displayText(label)}</span></div>;
 }
 
-function EventRow({ event }) {
+// First-run primer: teaches the four load-bearing ideas (verbatim, receipts,
+// bounded, where output lands) in one inline, non-modal card. Shown once;
+// dismissal persists under PRIMER_KEY.
+const PRIMER_LINES = [
+  { term: "Model-verbatim", copy: "Model output is shown exactly as the model wrote it — Hemlock never paraphrases a reply." },
+  { term: "Receipts", copy: "Every consequential action leaves evidence you can open later in Receipts." },
+  { term: "Bounded", copy: "Agent steps are limited to an approved plan before anything runs." },
+  { term: "Where things appear", copy: "Replies stream into Chat; artifacts open in Artifact Studio." },
+];
+
+function PrimerCard({ onDismiss }) {
+  return <section className="primer-card" aria-label="How Hemlock works">
+    <div className="primer-heading">
+      <div>
+        <span className="primer-kicker">HOW HEMLOCK WORKS</span>
+        <h3>The four things worth knowing</h3>
+      </div>
+      <button type="button" className="primer-dismiss" onClick={onDismiss} aria-label="Dismiss the onboarding primer">Got it</button>
+    </div>
+    <dl className="primer-lines">{PRIMER_LINES.map((line) => <div key={line.term}><dt>{line.term}</dt><dd>{line.copy}</dd></div>)}</dl>
+  </section>;
+}
+
+function EventRow({ event, timeLabel }) {
   const eventLabel = displayText(event.type?.replaceAll?.(".", " · "), "local event");
   const payloadText = displayText(event.payload?.stage || event.payload?.command || event.payload?.title || event.payload?.error || event.status, "local observation");
-  return <div className={`event-row event-${event.status}`}>
-    <span className="event-node" />
-    <div className="event-copy"><strong>{eventLabel}</strong><span>{payloadText || "local observation"}</span></div>
-    <time>{formatTime(event.createdAt)}</time>
-  </div>;
+  const payloadKeys = Object.entries(event.payload || {}).filter(([key, value]) => value != null && !["artifact", "repair", "conversation"].includes(key) && typeof value !== "object");
+  return <details className={`event-row event-${event.status}`}>
+    <summary>
+      <span className="event-node" />
+      <div className="event-copy"><strong>{eventLabel}</strong><span>{payloadText || "local observation"}</span></div>
+      <time title={formatTime(event.createdAt)}>{timeLabel || formatTime(event.createdAt)}</time>
+    </summary>
+    {payloadKeys.length ? <div className="event-payload">{payloadKeys.map(([key, value]) => <div key={key}><code>{key}</code><span>{String(value).slice(0, 220)}</span></div>)}</div> : null}
+  </details>;
 }
 
 function conciseAgentNote(event, task) {
@@ -329,6 +381,7 @@ function conciseAgentNote(event, task) {
 
 function App() {
   const isDesktop = Boolean(window.mapleDesktop?.isDesktop);
+  const [understory, setUnderstory] = useState(readUnderstoryPreference);
   const [apiBase, setApiBase] = useState(() => localStorage.getItem(API_KEY) || DEFAULT_API);
   const [modelSelection, setModelSelection] = useState(readModelSelection);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
@@ -341,6 +394,8 @@ function App() {
   const [planCollapsed, setPlanCollapsed] = useState(true);
   const [hostActivityOpen, setHostActivityOpen] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
+  const [thinkingStartedAt, setThinkingStartedAt] = useState(null);
+  const [thinkingElapsed, setThinkingElapsed] = useState(null);
   const [isDreaming, setIsDreaming] = useState(false);
   const [dreamProgress, setDreamProgress] = useState(0);
   const [dreamStage, setDreamStage] = useState("Dream Lab is ready");
@@ -350,6 +405,7 @@ function App() {
   const [trainingDataset, setTrainingDataset] = useState(null);
   const [dreamTrainingProfile, setDreamTrainingProfile] = useState(() => localStorage.getItem(DREAM_PROFILE_KEY) || "quality");
   const [serverProcessReady, setServerProcessReady] = useState(null);
+  const [serverHealthProbe, setServerHealthProbe] = useState(null);
   const [inferenceReady, setInferenceReady] = useState(null);
   const [adapterVerified, setAdapterVerified] = useState(null);
   const [mapleLaunchState, setMapleLaunchState] = useState("idle");
@@ -360,6 +416,8 @@ function App() {
   const [threadRegistry, setThreadRegistry] = useState({ projects: [], threads: [], activeThreadId: null, providerCaps: { maple: 1, codex: 2, claude: 2 } });
   const [suggestions, setSuggestions] = useState([]);
   const [threadPickerOpen, setThreadPickerOpen] = useState(false);
+  const [renamingThreadId, setRenamingThreadId] = useState(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const [events, setEvents] = useState([]);
   const [agentSnapshot, setAgentSnapshot] = useState(null);
   const [agentProjection, setAgentProjection] = useState(null);
@@ -370,6 +428,9 @@ function App() {
   const [artifactFocusPreview, setArtifactFocusPreview] = useState(false);
   const [artifactLayout, setArtifactLayout] = useState(readArtifactLayout);
   const [artifactFreeze, setArtifactFreeze] = useState(false);
+  const [artifactReviseDraft, setArtifactReviseDraft] = useState("");
+  const [artifactCompare, setArtifactCompare] = useState(null);
+  const [artifactReviseBusy, setArtifactReviseBusy] = useState(false);
   const [artifactPinned, setArtifactPinned] = useState(false);
   const [previewSession, setPreviewSession] = useState(null);
   const [previewInspection, setPreviewInspection] = useState(null);
@@ -380,9 +441,19 @@ function App() {
   const [sourcePolicies, setSourcePolicies] = useState([]);
   const [contextSnapshot, setContextSnapshot] = useState(null);
   const [workspaceWindows, setWorkspaceWindows] = useState(initialWindows);
+  const workspaceWindowsRef = useRef(initialWindows);
+  useEffect(() => { workspaceWindowsRef.current = workspaceWindows; }, [workspaceWindows]);
   const [activeWindowId, setActiveWindowId] = useState("center");
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [dockMenu, setDockMenu] = useState(null); // { windowId, x, y }
+  const [activityTypeFilter, setActivityTypeFilter] = useState(null);
+  const [receiptsFilter, setReceiptsFilter] = useState("");
   const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteActiveIndex, setPaletteActiveIndex] = useState(0);
+  const [paletteContentMatches, setPaletteContentMatches] = useState([]);
+  const threadSearchSupportRef = useRef({ available: null });
+  const [confirmState, setConfirmState] = useState(null); // { title, body, confirmLabel, tone, resolve }
+  const [primerDismissed, setPrimerDismissed] = useState(() => readJson(PRIMER_KEY, {}).dismissed === true);
   const [error, setError] = useState("");
   const [factDraft, setFactDraft] = useState("");
   const [sipsObjective, setSipsObjective] = useState(() => readJson(SIPS_KEY, {}).objective || "Improve Hemlock's next coding task with a small verified change.");
@@ -402,12 +473,17 @@ function App() {
   const [sipsError, setSipsError] = useState("");
   const [receiptRecords, setReceiptRecords] = useState([]);
   const [changeSet, setChangeSet] = useState(null);
+  const [exportedChangeSet, setExportedChangeSet] = useState(null);
+  const [changesetApplyBusy, setChangesetApplyBusy] = useState(false);
   const [commandBusy, setCommandBusy] = useState("");
   const endRef = useRef(null);
   const chatPinnedRef = useRef(true);
+  const [chatPinned, setChatPinned] = useState(true);
   const paletteRef = useRef(null);
   const dragRef = useRef(null);
   const resizeRef = useRef(null);
+  const [draggingWindowId, setDraggingWindowId] = useState(null);
+  const [resizingWindowId, setResizingWindowId] = useState(null);
   const artifactPanelResizeRef = useRef(null);
   const artifactLayoutRef = useRef(artifactLayout);
   const conversationResponseIds = useRef(new Set());
@@ -417,7 +493,13 @@ function App() {
   const streamStoreRef = useRef(null);
   const providerRefreshRef = useRef(null);
   const previewConsoleErrorsRef = useRef([]);
+  const [previewConsoleLines, setPreviewConsoleLines] = useState([]);
   const previewReportPartsRef = useRef({});
+  const confirmStateRef = useRef(null);
+  const confirmCancelButtonRef = useRef(null);
+  const confirmAcceptButtonRef = useRef(null);
+  const seenEventCountsRef = useRef(new Map()); // windowId -> events.length at last focus (dock unread truth)
+  const unreadBaselineSeededRef = useRef(false);
   if (!streamStoreRef.current) streamStoreRef.current = createEphemeralStreamStore({ onFlush: setStreamFrames });
 
   function acceptTaskSnapshot(nextTask) {
@@ -528,6 +610,10 @@ function App() {
   }
 
   useEffect(() => { localStorage.setItem(FACTS_KEY, JSON.stringify(facts)); }, [facts]);
+  useEffect(() => {
+    document.documentElement.classList.toggle("understory", understory);
+    localStorage.setItem(UNDERSTORY_KEY, JSON.stringify({ on: understory }));
+  }, [understory]);
   useEffect(() => { localStorage.setItem(API_KEY, apiBase); }, [apiBase]);
   useEffect(() => { localStorage.setItem(MODEL_SELECTION_KEY, JSON.stringify(modelSelection)); }, [modelSelection]);
   useEffect(() => { activeAdapterPath ? localStorage.setItem(ADAPTER_KEY, activeAdapterPath) : localStorage.removeItem(ADAPTER_KEY); }, [activeAdapterPath]);
@@ -552,6 +638,14 @@ function App() {
     window.addEventListener("resize", update);
     return () => { observer?.disconnect(); window.removeEventListener("resize", update); };
   }, []);
+  // The desktop-strip clock must tick on its own: on a quiet session no other
+  // state changes, and a re-render-only clock goes visibly stale.
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNow(Date.now()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     setWorkspaceWindows((current) => Object.fromEntries(Object.entries(current).map(([id, item]) => [id, {
       ...item,
@@ -560,13 +654,23 @@ function App() {
     }])));
   }, [canvasSize.width, canvasSize.height]);
   useEffect(() => {
+    if (!isThinking || !thinkingStartedAt) { setThinkingElapsed(null); return undefined; }
+    const tick = () => setThinkingElapsed(Math.floor((Date.now() - thinkingStartedAt) / 1000));
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [isThinking, thinkingStartedAt]);
+
+  useEffect(() => {
     const node = endRef.current;
     const container = node?.closest(".chat-scroll");
     if (!container) return undefined;
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (chatPinnedRef.current || distanceFromBottom <= 96) container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
     const onScroll = () => {
-      chatPinnedRef.current = container.scrollHeight - container.scrollTop - container.clientHeight <= 96;
+      const pinned = container.scrollHeight - container.scrollTop - container.clientHeight <= 96;
+      chatPinnedRef.current = pinned;
+      setChatPinned((current) => current === pinned ? current : pinned);
     };
     container.addEventListener("scroll", onScroll, { passive: true });
     return () => container.removeEventListener("scroll", onScroll);
@@ -575,6 +679,28 @@ function App() {
   useEffect(() => {
     if (task.status === "waiting_for_approval") setPlanCollapsed(false);
   }, [task.id, task.status]);
+
+  // While waiting on a local inference, probe the server health directly
+  // instead of trusting the stale serverProcessReady flag (which can be false
+  // from an earlier failure while the current request is actually streaming).
+  useEffect(() => {
+    if (!isThinking || !isDesktop) { setServerHealthProbe(null); return undefined; }
+    let disposed = false;
+    const probe = async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4000);
+        const response = await fetch(`${apiBase}/health`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!disposed) setServerHealthProbe(response.ok);
+      } catch {
+        if (!disposed) setServerHealthProbe(false);
+      }
+    };
+    probe();
+    const interval = setInterval(probe, 10000);
+    return () => { disposed = true; clearInterval(interval); };
+  }, [isThinking, isDesktop, apiBase]);
 
   useEffect(() => {
     setHostActivityOpen(false);
@@ -594,6 +720,37 @@ function App() {
     return () => window.removeEventListener("keydown", onShortcut);
   }, []);
 
+  // Thread popover: close on Escape or outside click (standard popover behavior).
+  useEffect(() => {
+    if (!threadPickerOpen) return undefined;
+    const onKey = (event) => { if (event.key === "Escape") setThreadPickerOpen(false); };
+    const onPointer = (event) => {
+      const bar = document.querySelector(".thread-bar");
+      if (bar && !bar.contains(event.target)) setThreadPickerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onPointer, true);
+    return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("pointerdown", onPointer, true); };
+  }, [threadPickerOpen]);
+
+  // First-run primer: Escape dismisses it, but never while a modal overlay
+  // (palette, confirm dialog, dock menu) owns the keystroke.
+  useEffect(() => {
+    if (primerDismissed) return undefined;
+    const onKey = (event) => {
+      if (event.key !== "Escape") return;
+      if (paletteOpen || confirmState || dockMenu) return;
+      dismissPrimer();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [primerDismissed, paletteOpen, confirmState, dockMenu]);
+
+  function dismissPrimer() {
+    setPrimerDismissed(true);
+    try { localStorage.setItem(PRIMER_KEY, JSON.stringify({ dismissed: true, dismissedAt: new Date().toISOString() })); } catch { /* storage unavailable */ }
+  }
+
   useEffect(() => {
     const agent = desktopAgent();
     if (!isDesktop || !agent?.getState) return undefined;
@@ -601,6 +758,15 @@ function App() {
     agent.getState().then((snapshot) => {
       if (disposed) return;
       hydrateAgentSnapshot(snapshot);
+      // The server may still be reaching readiness when the first snapshot
+      // lands (waitForServer runs async at boot). Re-hydrate shortly after so
+      // the heartbeat reflects reality without waiting for the first chat.
+      if (snapshot.server?.processReady !== true) {
+        setTimeout(() => {
+          if (disposed) return;
+          agent.getState().then((next) => { if (!disposed) hydrateAgentSnapshot(next); }).catch(() => {});
+        }, 8000);
+      }
       const activeThreadId = snapshot.threads?.activeThreadId || snapshot.task?.threadId;
       if (activeThreadId && agent.runCommand) {
         agent.runCommand("thread.switch", { threadId: activeThreadId }).then((result) => {
@@ -620,10 +786,31 @@ function App() {
     const stop = agent.subscribe?.((event) => {
       setEvents((current) => current.some((item) => item.id === event.id) ? current : [...current, event].slice(-160));
       if (event.type === "task.updated" && event.payload?.task) acceptTaskSnapshot(event.payload.task);
-      if (event.type === "thread.switched" && event.payload?.threadId) setThreadRegistry((current) => ({ ...current, activeThreadId: event.payload.threadId }));
+      if (event.type === "maple.server.ready" && event.payload?.processReady === true) setServerProcessReady(true);
+      if (event.type === "thread.switched" && event.payload?.threadId) {
+        const switchedThreadId = event.payload.threadId;
+        setThreadRegistry((current) => ({ ...current, activeThreadId: switchedThreadId }));
+        // A thread switch (from any window/path) must swap the visible
+        // transcript to the new thread's stored conversation — otherwise the
+        // old chat bleeds into the new thread's context.
+        setMessages([]);
+        const switchAgent = desktopAgent();
+        if (isDesktop && switchAgent?.runCommand) {
+          switchAgent.runCommand("conversation.history", { threadId: switchedThreadId }).then((history) => {
+            if (Array.isArray(history?.conversation) && history.conversation.length) {
+              setMessages(history.conversation.map((entry) => ({ id: entry.id, role: entry.role, content: entry.content, channels: entry.channels || [], provider: entry.provider, model: entry.model, reasoning: entry.reasoning, rawOutputRef: entry.rawOutputRef, time: entry.createdAt ? formatTime(entry.createdAt) : "" })));
+            }
+          }).catch(() => {});
+        }
+      }
+      if (event.type === "conversation.response" && event.payload?.conversation) {
+        // Ignore responses that belong to another thread — they must not
+        // appear in this thread's transcript or ride along as its context.
+        const responseThreadId = event.payload.threadId || event.payload.conversation.threadId;
+        if (!responseThreadId || responseThreadId === (task.threadId || threadRegistry.activeThreadId)) appendConversationResponse(event.payload.conversation);
+      }
       if (event.type === "suggestion.created" && event.payload?.suggestion) setSuggestions((current) => [...current.filter((item) => item.suggestionId !== event.payload.suggestion.suggestionId), event.payload.suggestion].slice(-32));
       if (event.type === "task.queue.updated" && event.payload?.queue) setQueueState(event.payload.queue);
-      if (event.type === "conversation.response" && event.payload?.conversation) appendConversationResponse(event.payload.conversation);
       if (event.type === "candidate.created" && event.payload?.candidate) setCandidates((current) => [...current.filter((item) => item.id !== event.payload.candidate.id), event.payload.candidate].slice(-120));
       if (event.type === "candidate.accepted" || event.type === "candidate.dismissed") setCandidates((current) => current.map((item) => item.id === event.payload?.candidate?.id ? event.payload.candidate : item));
       if (event.type === "change-set.prepared" || event.type === "change-set.approved" || event.type === "change-set.rejected") setChangeSet(event.payload?.changeSet || null);
@@ -655,6 +842,7 @@ function App() {
         if (event.payload.artifact.revision > 0) {
           previewConsoleErrorsRef.current = [];
           previewReportPartsRef.current = {};
+          setPreviewConsoleLines([]);
         }
         if (event.payload.artifact.revision > 0 && !artifactPeekedRef.current) { artifactPeekedRef.current = true; peekArtifact(); }
       }
@@ -691,6 +879,7 @@ function App() {
       const type = event.data.type;
       if (type === "console") {
         if (event.data.payload?.level === "error") previewConsoleErrorsRef.current = [...previewConsoleErrorsRef.current, event.data.payload].slice(-20);
+        setPreviewConsoleLines((current) => [...current, { level: event.data.payload?.level || "log", message: String(event.data.payload?.message || ""), time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }].slice(-100));
         setPreviewNotice(`${event.data.payload?.level || "log"}: ${event.data.payload?.message || "preview console output"}`);
       }
       if (type === "inspection" || type === "accessibility" || type === "ready" || type === "condition") {
@@ -751,9 +940,41 @@ function App() {
   useEffect(() => {
     if (!isDesktop) return undefined;
     const onKeyDown = (event) => {
+      // A modal confirm dialog owns the keyboard while it is open; OS-level
+      // shortcuts must not fire underneath it.
+      if (confirmStateRef.current) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen(true);
+      }
+      // Direct window focus: Cmd+1..9 targets the Nth open window in z-order,
+      // front-most first. The command palette intercepts digits for its own
+      // result jumps, so stand aside while it is open.
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && /^[1-9]$/.test(event.key)) {
+        if (paletteOpen) return;
+        const openIds = Object.entries(workspaceWindowsRef.current)
+          .filter(([, item]) => item.state !== "closed")
+          .sort(([, a], [, b]) => (b.zOrder || 0) - (a.zOrder || 0))
+          .map(([id]) => id);
+        const targetId = openIds[Number(event.key) - 1];
+        if (targetId) {
+          event.preventDefault();
+          focusWindow(targetId);
+        }
+        return;
+      }
+      // Cycle windows: Cmd+Backtick focuses the next open window in z-order.
+      if ((event.metaKey || event.ctrlKey) && event.key === "`") {
+        event.preventDefault();
+        const openIds = Object.entries(workspaceWindowsRef.current)
+          .filter(([, item]) => item.state !== "closed" && item.state !== "minimized")
+          .sort(([, a], [, b]) => (a.zOrder || 0) - (b.zOrder || 0))
+          .map(([id]) => id);
+        if (openIds.length > 1) {
+          const currentIndex = openIds.indexOf(activeWindowId);
+          focusWindow(openIds[(currentIndex + 1) % openIds.length]);
+        }
+        return;
       }
       if ((event.metaKey || event.ctrlKey) && event.altKey) {
         const command = event.key === "ArrowLeft" ? "half-left" : event.key === "ArrowRight" ? "half-right" : event.key === "ArrowUp" ? "maximize" : event.key === "ArrowDown" ? "restore" : event.key.toLowerCase() === "m" ? "minimize" : null;
@@ -763,19 +984,108 @@ function App() {
         }
       }
       if (event.key === "Escape") {
-        setPaletteOpen(false);
-        if (isDreaming && window.mapleDesktop?.cancelAgentTask) void window.mapleDesktop.cancelAgentTask();
+        // Escape dismisses overlays. It must NEVER cancel running work: the
+        // palette, popovers, and dialogs all close on Escape, which trains a
+        // reflex that would otherwise destroy hours of local training. Cancellation
+        // is an explicit action (the Dream Lab stop control) with its own confirm.
+        if (paletteOpen) setPaletteOpen(false);
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [activeWindowId, canvasSize, isDesktop, isDreaming]);
+  }, [activeWindowId, canvasSize, isDesktop, isDreaming, paletteOpen]);
 
   useEffect(() => {
     if (!paletteOpen) return undefined;
     paletteRef.current?.focus();
-    return undefined;
+    // Focus trap: Tab must cycle inside the palette, not walk into the frozen
+    // desktop behind the backdrop. Focus returns to the trigger on close.
+    const paletteOpener = document.activeElement;
+    const onTrap = (event) => {
+      if (event.key !== "Tab") return;
+      const focusables = document.querySelectorAll(".command-palette input, .command-palette button:not([disabled])");
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onTrap, true);
+    return () => { document.removeEventListener("keydown", onTrap, true); if (paletteOpener instanceof HTMLElement) paletteOpener.focus(); };
   }, [paletteOpen]);
+
+  useEffect(() => {
+    if (!confirmState) return undefined;
+    // Focus trap for the confirm alertdialog: Tab cycles between its two
+    // buttons; Escape/Enter are handled by the dialog's own key handling.
+    const opener = document.activeElement;
+    const dialog = document.querySelector(".confirm-dialog");
+    const firstButton = dialog?.querySelector("button");
+    firstButton?.focus();
+    const onTrap = (event) => {
+      if (event.key === "Escape") { event.stopPropagation(); settleConfirmDialog(false); return; }
+      if (event.key === "Enter" && event.target instanceof HTMLElement && event.target.tagName !== "BUTTON") { event.preventDefault(); settleConfirmDialog(true); return; }
+      if (event.key !== "Tab") return;
+      const focusables = dialog ? [...dialog.querySelectorAll("button:not([disabled])")] : [];
+      if (focusables.length < 2) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onTrap, true);
+    return () => { document.removeEventListener("keydown", onTrap, true); if (opener instanceof HTMLElement) opener.focus(); };
+  }, [confirmState]);
+
+  useEffect(() => { setPaletteActiveIndex(0); }, [paletteQuery, paletteOpen]);
+  // Lane B: thread content search degrades gracefully. `threadManager.searchThreads`
+  // exists in the main process, but `thread.search` is NOT allowlisted in
+  // runAgentCommand (it throws "Hemlock command is not allowlisted"), so today the
+  // palette keeps its instant title matching only. This probe calls the sanctioned
+  // agent:command channel directly — deliberately bypassing runCommand() so a
+  // missing route never raises the error banner or flickers commandBusy. If the
+  // route is ever allowlisted in main.cjs, body matches light up with no renderer
+  // change; until then the probe fails once and is never retried this session.
+  useEffect(() => {
+    const query = paletteQuery.trim();
+    if (!paletteOpen || query.length < 2 || threadSearchSupportRef.current.available === false) {
+      setPaletteContentMatches([]);
+      return undefined;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const agent = desktopAgent();
+      if (!agent?.runCommand) {
+        threadSearchSupportRef.current.available = false;
+        return;
+      }
+      agent.runCommand("thread.search", { query, limit: 6 }).then((result) => {
+        if (cancelled) return;
+        threadSearchSupportRef.current.available = true;
+        const rows = Array.isArray(result) ? result : Array.isArray(result?.results) ? result.results : [];
+        setPaletteContentMatches(rows);
+      }).catch(() => {
+        if (cancelled) return;
+        threadSearchSupportRef.current.available = false;
+        setPaletteContentMatches([]);
+      });
+    }, 200);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [paletteOpen, paletteQuery]);
+
+  useEffect(() => { confirmStateRef.current = confirmState; }, [confirmState]);
+
+  useEffect(() => {
+    if (confirmState) confirmAcceptButtonRef.current?.focus();
+  }, [confirmState]);
+
+  // Dock truthfulness baseline: history that hydrates at boot is not "unread
+  // activity". Only events arriving after this point mark unfocused windows.
+  useEffect(() => {
+    if (unreadBaselineSeededRef.current || !events.length) return;
+    unreadBaselineSeededRef.current = true;
+    Object.keys(WINDOW_META).forEach((id) => { if (!seenEventCountsRef.current.has(id)) seenEventCountsRef.current.set(id, events.length); });
+  }, [events]);
 
   useEffect(() => {
     const move = (event) => {
@@ -798,6 +1108,8 @@ function App() {
       if (action?.id) setWorkspaceWindows((current) => ({ ...current, [action.id]: { ...current[action.id], bounds: clampBounds(current[action.id].bounds, canvasSize, current[action.id].minimumSize) } }));
       dragRef.current = null;
       resizeRef.current = null;
+      setDraggingWindowId(null);
+      setResizingWindowId(null);
     };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
@@ -854,7 +1166,9 @@ function App() {
 
   function focusWindow(id) {
     setActiveWindowId(id);
-    setWorkspaceWindows((current) => focusWindowState(current, id));
+    // Focusing a window acknowledges its unread activity (dock gold dot).
+    seenEventCountsRef.current.set(id, events.length);
+    setWorkspaceWindows((current) => focusWindowState(current, id, undefined, canvasSize));
   }
 
   function openWindow(id) {
@@ -881,6 +1195,8 @@ function App() {
     const state = workspaceWindows[id];
     if (!state || state.state === "maximized" || state.state === "closed") return;
     focusWindow(id);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setDraggingWindowId(id);
     dragRef.current = { id, startX: event.clientX, startY: event.clientY, originBounds: state.bounds };
   }
 
@@ -889,6 +1205,8 @@ function App() {
     const state = workspaceWindows[id];
     if (!state || state.state === "maximized" || state.state === "closed") return;
     focusWindow(id);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setResizingWindowId(id);
     resizeRef.current = { id, edge, startX: event.clientX, startY: event.clientY, originBounds: state.bounds };
   }
 
@@ -984,15 +1302,61 @@ function App() {
     }
   }
 
+  function startThreadRename(threadId, currentTitle) {
+    setRenamingThreadId(threadId);
+    setRenameDraft(currentTitle || "");
+  }
+
+  async function commitThreadRename(threadId) {
+    const title = renameDraft.trim();
+    setRenamingThreadId(null);
+    setRenameDraft("");
+    if (!title) return;
+    const result = await runCommand("thread.rename", { threadId, title });
+    if (result?.thread) await refreshThreadRegistry();
+  }
+
+  async function archiveThread(threadId) {
+    const confirmed = await confirmDialog({ title: "Archive this thread?", body: "The conversation moves to the archived list. You can restore it later from the thread picker.", confirmLabel: "Archive thread", tone: "default" });
+    if (!confirmed) return;
+    const result = await runCommand("thread.archive", { threadId });
+    if (result?.thread) {
+      await refreshThreadRegistry();
+      // If the archived thread was active, move to the most recent remaining one.
+      if (threadId === (task.threadId || threadRegistry.activeThreadId)) {
+        const remaining = (threadRegistry.threads || []).filter((item) => item.id !== threadId && item.status !== "archived");
+        if (remaining.length) await switchThread(remaining[0].id);
+        else setThreadRegistry((current) => ({ ...current, activeThreadId: null }));
+      }
+    }
+  }
+
+  async function restoreThread(threadId) {
+    const result = await runCommand("thread.restore", { threadId });
+    if (result?.thread) await refreshThreadRegistry();
+  }
+
   async function createThread() {
     if (!isDesktop) {
       setError("New threads require the Hemlock desktop control plane.");
       return;
     }
-    const workspaceRoot = window.prompt("Project directory for this Hemlock thread (the path stays local and is not shown in Hemlock UI):", "");
-    if (!workspaceRoot?.trim()) return;
-    const result = await runCommand("thread.create", { workspaceRoot: workspaceRoot.trim(), title: "New Hemlock thread", provider: modelSelection.provider, model: modelSelection.model, reasoning: modelSelection.reasoning, autonomy: "bounded-local" });
-    if (result?.thread) await switchThread(result.thread.id);
+    // Native directory picker (Electron's dialog.showOpenDialog). The old
+    // blocking JS prompt threw silently in Electron and killed the feature.
+    try {
+      const picked = await (window.mapleDesktop?.pickDirectory || window.hemlockAgent?.pickDirectory)?.();
+      if (!picked || picked.canceled || !picked.path) return;
+      const workspaceRoot = picked.path;
+      setCommandBusy("thread.create");
+      setError("");
+      const result = await runCommand("thread.create", { workspaceRoot, title: "New Hemlock thread", provider: modelSelection.provider, model: modelSelection.model, reasoning: modelSelection.reasoning, autonomy: "bounded-local" });
+      if (result?.thread) await switchThread(result.thread.id);
+      else if (result === null) setError("Thread creation failed. Check the error banner and try again.");
+    } catch (createError) {
+      setError(`Could not create thread: ${createError.message}`);
+    } finally {
+      setCommandBusy("");
+    }
   }
 
   async function updateProviderCapacity(provider, value) {
@@ -1023,6 +1387,42 @@ function App() {
     setWorkspaceWindows((current) => openWindowBounds(current, "artifact", canvasSize, { collisionAware: true }));
   }
 
+  async function reviseArtifactWithMaple(instruction) {
+    const text = String(instruction || "").trim();
+    const target = artifacts.find((item) => item.id === activeArtifactId) || artifacts.at(-1);
+    if (!text || !target || artifactReviseBusy) return;
+    if (!isDesktop) { setPreviewNotice("Artifact revision by Maple is available in the desktop runtime."); return; }
+    setArtifactReviseBusy(true);
+    setArtifactReviseDraft("");
+    try {
+      const agent = desktopAgent();
+      await agent.submitIntent({
+        text: `Revise the task artifact "${target.title}" (artifactId: ${target.id}). Instruction: ${text}. Apply the change with artifact.author as a new revision of that artifactId; keep the entrypoint and runtime template unchanged.`,
+        mode: "build",
+        interactionMode: "build",
+        threadId: task.threadId || threadRegistry.activeThreadId || undefined,
+        projectId: task.projectId || undefined,
+        workspaceRoot: task.workspaceRoot || undefined,
+        autonomy: "bounded-local",
+        requestId: crypto.randomUUID(),
+        source: "artifact-studio",
+        apiBase,
+        adapterPath: activeAdapterPath,
+        provider: modelSelection.provider,
+        model: modelSelection.model,
+        reasoning: modelSelection.reasoning,
+        messages: [{ role: "user", content: `Revise artifact ${target.id}: ${text}` }],
+      });
+      // The revision event stream will surface the new revision; open the
+      // studio so the user sees it land.
+      peekArtifact();
+    } catch (reviseError) {
+      setPreviewNotice(cleanErrorText(reviseError.message));
+    } finally {
+      setArtifactReviseBusy(false);
+    }
+  }
+
   async function runArtifact(action, input = {}) {
     const agent = desktopAgent();
     const previewAction = action.startsWith("preview.");
@@ -1045,6 +1445,66 @@ function App() {
     } catch (artifactError) {
       setPreviewNotice(artifactError.message);
       return null;
+    }
+  }
+
+  // Artifact → repository pipeline. Dry-run first (plan in previewNotice),
+  // then a second explicit confirmation performs the real write; every step
+  // leaves a receipt (apply-receipt.json + agent event with branch/SHA).
+  async function planExportedChangeSet() {
+    const agent = desktopAgent();
+    if (!isDesktop || !agent?.runCommand || !exportedChangeSet?.id) {
+      setPreviewNotice("Applying to a repository needs the Electron runtime and a freshly exported change set.");
+      return null;
+    }
+    try {
+      const plan = await agent.runCommand("changeset.apply", { changeSetId: exportedChangeSet.id, dryRun: true });
+      const files = plan?.plan || [];
+      if (!files.length) { setPreviewNotice("The change set carries no files, so there is nothing to apply."); return null; }
+      setPreviewNotice(`Apply plan · ${plan.targetRepo} · branch ${plan.branch}: ${files.map((item) => `${item.path} (+${item.added}/-${item.removed}${item.existed ? "" : ", new file"})`).join(" · ")}`);
+      return plan;
+    } catch (planError) {
+      setPreviewNotice(cleanErrorText(planError.message));
+      return null;
+    }
+  }
+
+  async function applyExportedChangeSet() {
+    const agent = desktopAgent();
+    if (!isDesktop || !agent?.runCommand) {
+      setPreviewNotice("Browser mode is a non-runtime visual preview; repository applies run in Electron only.");
+      return;
+    }
+    const fileCount = Object.keys(exportedChangeSet?.artifactSource || {}).length;
+    const confirmedPlan = await confirmDialog({
+      title: "Apply this change set to the repository?",
+      body: `${fileCount} file${fileCount === 1 ? "" : "s"} will be planned against the active thread workspace on branch hemlock/${exportedChangeSet?.artifactId || "artifact"}. The first pass is a dry run — nothing is written until you confirm the plan.`,
+      confirmLabel: "Show apply plan",
+      tone: "danger",
+    });
+    if (!confirmedPlan) return;
+    const plan = await planExportedChangeSet();
+    if (!plan) return;
+    const confirmedApply = await confirmDialog({
+      title: `Write ${plan.totalFiles} file${plan.totalFiles === 1 ? "" : "s"} to the repository?`,
+      body: `Hemlock will create branch ${plan.branch} in ${plan.targetRepo} and commit "${plan.commitMessage}". The receipt records the commit SHA.`,
+      confirmLabel: "Apply for real",
+      tone: "danger",
+    });
+    if (!confirmedApply) {
+      setPreviewNotice(`Apply cancelled before any write. Change set ${exportedChangeSet.id} stays waiting_for_approval.`);
+      return;
+    }
+    setChangesetApplyBusy(true);
+    try {
+      const receipt = await agent.runCommand("changeset.apply", { changeSetId: exportedChangeSet.id });
+      setPreviewNotice(receipt?.status === "applied"
+        ? `Applied ${receipt.applied.length} file${receipt.applied.length === 1 ? "" : "s"}${receipt.branch ? ` · branch ${receipt.branch}` : ""}${receipt.commitSha ? ` · commit ${String(receipt.commitSha).slice(0, 12)}` : " · no git repo (files written untracked)"} · receipt: ${receipt.receiptPath}`
+        : `Apply did not complete: ${displayText(receipt?.status, "unknown status")}.`);
+    } catch (applyError) {
+      setPreviewNotice(cleanErrorText(applyError.message));
+    } finally {
+      setChangesetApplyBusy(false);
     }
   }
 
@@ -1267,6 +1727,45 @@ function App() {
     }
   }
 
+  function jumpToLatest() {
+    const node = endRef.current;
+    const container = node?.closest(".chat-scroll");
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    chatPinnedRef.current = true;
+    setChatPinned(true);
+  }
+
+  function stopGeneration() {
+    if (!isThinking) return;
+    const agent = desktopAgent();
+    if (agent?.cancelStream) {
+      agent.cancelStream({}).catch(() => {});
+    } else if (agent?.cancel) {
+      agent.cancel(task.id).catch(() => {});
+    }
+    setIsThinking(false);
+    setThinkingStartedAt(null);
+    // A stop is a host action, not model output — record it as a host note so the
+// verbatim-trust boundary stays intact (never styled as what the model said).
+setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "system", content: "Generation stopped by host action.", provider: "host", time: formatTime(), stopped: true }]);
+  }
+
+  function retryLastMessage(targetMessage = null) {
+    if (isThinking || isDreaming) return;
+    const lastUser = targetMessage && targetMessage.role === "user" && (targetMessage.content || "").trim()
+      ? targetMessage
+      : [...messages].reverse().find((item) => item.role === "user" && (item.content || "").trim());
+    if (!lastUser) return;
+    setDraft(lastUser.content.trim());
+    // Reuse the normal send path on the next tick so all guards and state
+    // handling stay in one place.
+    setTimeout(() => {
+      const form = document.querySelector(".chat-compose");
+      form?.requestSubmit?.();
+    }, 0);
+  }
+
   async function sendMessage(event) {
     event?.preventDefault();
     const rawContent = draft.trim();
@@ -1288,6 +1787,8 @@ function App() {
     const nextMessages = [...messages, userMessage];
     setMessages(nextMessages);
     setIsThinking(true);
+    setThinkingStartedAt(Date.now());
+    setThinkingElapsed(null);
     openWindow("chat");
 
     const agent = desktopAgent();
@@ -1335,6 +1836,7 @@ function App() {
         setError(`${requestError.message}. The task remains visible for inspection; no command completion is claimed.`);
       } finally {
         setIsThinking(false);
+        setThinkingStartedAt(null);
       }
       return;
     }
@@ -1394,23 +1896,78 @@ function App() {
 
   function removeFact(id) { setFacts((current) => current.filter((fact) => fact.id !== id)); }
 
-  const commandItems = [
-    { id: "center", label: "Open Command Center", hint: "Focus the Hemlock home surface", icon: "center", action: () => openWindow("center") },
-    { id: "chat", label: "Open Chat / Code", hint: "Continue the local conversation", icon: "chat", action: () => openWindow("chat") },
-    { id: "artifact", label: "Open Artifact Studio", hint: "Inspect task-scoped live artifacts", icon: "artifact", action: () => openWindow("artifact") },
-    { id: "sips", label: "Open SIPS Control", hint: "Inspect the bounded self-improvement loop", icon: "sips", action: () => { openWindow("sips"); void refreshSips(); } },
-    { id: "memory", label: "Open Memory Garden", hint: "Inspect local facts and lessons", icon: "memory", action: () => openWindow("memory") },
-    { id: "dream", label: "Open Dream Lab", hint: "Inspect Dream training and adapter state", icon: "dream", action: () => openWindow("dream") },
-    { id: "activity", label: "Open Activity", hint: "Follow the local event stream", icon: "activity", action: () => openWindow("activity") },
-    { id: "receipts", label: "Open Receipts", hint: "Inspect evidence and verification", icon: "receipt", action: () => void runCommand("receipts.query") },
-    { id: "map", label: "Map the project", hint: "Read the current repository state", icon: "map", action: () => void runCommand("repo-map") },
-    { id: "context", label: "Refresh awareness context", hint: "Check local history providers and focus evidence", icon: "activity", action: () => void runCommand("context.refresh", { reason: "command-palette" }) },
-    { id: "verify", label: "Run UI verification", hint: "Run the selected allowlisted check", icon: "receipt", action: () => void runCommand("verify", { profile: sipsVerifyProfile }) },
-    { id: "prepare-change", label: "Prepare current change set", hint: "Capture a reviewable patch without applying it", icon: "work", action: () => void runCommand("change.prepare") },
-    { id: "selfloop", label: "Start self-loop", hint: "Start a persistent bounded focus", icon: "play", action: () => void runSelfloop("start") },
-    { id: "settings", label: "Open Settings", hint: "Configure local connection and profiles", icon: "settings", action: () => openWindow("settings") },
+  function confirmDialog(options = {}) {
+    return new Promise((resolve) => {
+      setConfirmState({ title: "Confirm", confirmLabel: "Confirm", tone: "default", ...options, resolve });
+    });
+  }
+
+  function settleConfirmDialog(result) {
+    const current = confirmStateRef.current;
+    setConfirmState(null);
+    current?.resolve?.(result);
+  }
+
+  // Command palette as a true launcher: Surfaces (every Hemlock window),
+  // Actions, Threads, and Settings — fuzzy-matched and arrow-key navigable.
+  const exportTargetId = artifacts.find((item) => item.id === activeArtifactId)?.id || artifacts.at(-1)?.id || null;
+  const activeThreadId = task.threadId || threadRegistry.activeThreadId;
+  const surfaceBadge = (id) => id === "artifact" && artifacts.length ? ` · ${artifacts.length} artifact${artifacts.length > 1 ? "s" : ""}` : id === "chat" && messages.some((message) => message.role !== "system") ? ` · ${messages.filter((message) => message.role !== "system").length} messages` : id === "activity" && events.length ? ` · ${events.length} events` : "";
+  const paletteSections = [
+    { id: "surfaces", label: "SURFACES", items: Object.entries(WINDOW_META).filter(([id]) => id !== "settings").map(([id, meta]) => {
+      const state = workspaceWindows[id];
+      const open = Boolean(state && state.state !== "closed");
+      const minimized = state?.state === "minimized";
+      const status = !open ? "closed" : minimized ? "minimized" : activeWindowId === id ? "focused" : "open";
+      return { id: `surface-${id}`, section: "surfaces", label: meta.label, hint: `${status}${surfaceBadge(id)}`, icon: meta.icon, action: () => (!open || minimized || activeWindowId !== id ? openWindow(id) : focusWindow(id)) };
+    }) },
+    { id: "actions", label: "ACTIONS", items: [
+      { id: "action-new-thread", section: "actions", label: "New thread", hint: "Start a fresh local conversation", icon: "plus", action: () => void createThread() },
+      { id: "action-new-artifact", section: "actions", label: "New artifact", hint: "Create a task-scoped draft artifact", icon: "artifact", action: () => void runArtifact("create", { artifactId: `artifact-${Date.now()}`, title: `Task artifact · ${new Date().toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`, kind: "html", entrypoint: "index.html", mime: "text/html" }) },
+      { id: "action-freeze", section: "actions", label: artifactFreeze ? "Unfreeze artifact feed" : "Freeze artifact feed", hint: "Pause or resume live artifact following", icon: "work", action: () => setArtifactFreeze((value) => !value) },
+      { id: "action-pin", section: "actions", label: artifactPinned ? "Unpin artifact" : "Pin artifact", hint: "Keep the studio pinned across switches", icon: "artifact", action: () => setArtifactPinned((value) => !value) },
+      { id: "action-export-change-set", section: "actions", label: "Export change set", hint: exportTargetId ? "Export the current artifact revision for review" : "No task artifact revision is ready to export yet", icon: "receipt", action: () => { if (exportTargetId) void runArtifact("export", { artifactId: exportTargetId }); else setPreviewNotice("No task artifact revision is ready to export yet."); } },
+      { id: "action-context-refresh", section: "actions", label: "Refresh awareness context", hint: "Check local history providers and focus evidence", icon: "activity", action: () => void runCommand("context.refresh", { reason: "command-palette" }) },
+      { id: "action-verify", section: "actions", label: "Run UI verification", hint: "Run the selected allowlisted check", icon: "verify", action: () => void runCommand("verify", { profile: sipsVerifyProfile }) },
+      { id: "action-prepare-change", section: "actions", label: "Prepare current change set", hint: "Capture a reviewable patch without applying it", icon: "work", action: () => void runCommand("change.prepare") },
+      { id: "action-map", section: "actions", label: "Map the project", hint: "Read the current repository state", icon: "map", action: () => void runCommand("repo-map") },
+      { id: "action-receipts", section: "actions", label: "Query receipts", hint: "Inspect evidence and verification records", icon: "receipt", action: () => void runCommand("receipts.query") },
+      { id: "action-selfloop", section: "actions", label: "Start self-loop", hint: "Start a persistent bounded focus", icon: "play", action: () => void runSelfloop("start") },
+    ] },
+    { id: "threads", label: "THREADS", items: (threadRegistry.threads || []).filter((thread) => thread.status !== "archived").slice(-8).reverse().map((thread) => ({ id: `thread-${thread.id}`, section: "threads", label: displayText(thread.title, "Untitled thread"), hint: `${thread.id === activeThreadId ? "active thread" : "switch to"} · ${displayText(thread.provider, "maple")}`, icon: "chat", action: () => void switchThread(thread.id) })) },
+    { id: "settings", label: "SETTINGS", items: [{ id: "surface-settings", section: "settings", label: WINDOW_META.settings.label, hint: "Configure local connection and profiles", icon: WINDOW_META.settings.icon, action: () => openWindow("settings") }] },
   ];
-  const filteredCommands = commandItems.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(paletteQuery.toLowerCase())).slice(0, 8);
+  const paletteQueryTrimmed = paletteQuery.trim();
+  // Lane B: backend content matches are ADDITIVE to the instant title matches.
+  // Threads already surfaced by title matching are not duplicated, and content
+  // rows bypass the fuzzy filter — the backend already decided they match the
+  // query, and a truncated snippet could otherwise drop a real hit.
+  const paletteTitleThreadIds = new Set((threadRegistry.threads || []).filter((thread) => thread.status !== "archived").slice(-8).map((thread) => thread.id));
+  const paletteContentItems = paletteQueryTrimmed.length >= 2
+    ? paletteContentMatches
+      .filter((match) => match?.threadId && !paletteTitleThreadIds.has(String(match.threadId)))
+      .slice(0, 6)
+      .map((match) => ({
+        id: `thread-content-${match.threadId}`,
+        section: "threads",
+        label: displayText(match.title, "Untitled thread"),
+        hint: match.snippet ? `matches · ${displayText(match.snippet).slice(0, 60)}` : "matches · title",
+        icon: "search",
+        action: () => void switchThread(match.threadId),
+      }))
+    : [];
+  const visiblePaletteGroups = paletteSections
+    .map((section) => ({
+      ...section,
+      items: [
+        ...(paletteQueryTrimmed ? section.items.filter((item) => fuzzySubsequenceMatch(paletteQueryTrimmed, `${item.label} ${item.hint}`)) : section.items),
+        ...(section.id === "threads" ? paletteContentItems : []),
+      ],
+    }))
+    .filter((section) => section.items.length);
+  const visiblePaletteItems = visiblePaletteGroups.flatMap((group) => group.items);
+  const visiblePaletteIndexById = new Map(visiblePaletteItems.map((item, index) => [item.id, index]));
+  const safePaletteIndex = visiblePaletteItems.length ? Math.min(Math.max(paletteActiveIndex, 0), visiblePaletteItems.length - 1) : 0;
 
   function chooseCommand(item) {
     item.action();
@@ -1419,7 +1976,7 @@ function App() {
   }
 
   function renderProviderCapacityPanel() {
-    return <section className="scheduler-panel" aria-label="Provider scheduler capacity"><div className="settings-section-heading"><span><span className="cockpit-kicker">PROVIDER SCHEDULER</span><strong>Concurrency caps</strong></span><small>host-owned · no silent fallback</small></div><p>Maple-Preview remains serialized unless you deliberately change its lane cap. Codex and Claude lanes can run independently.</p><div className="provider-cap-grid">{["maple", "codex", "claude"].map((provider) => <label className="provider-cap-field" key={provider}><span>{MODEL_LANES[provider].shortLabel}</span><input type="number" min="1" max="8" value={threadRegistry.providerCaps?.[provider] || 1} onChange={(event) => void updateProviderCapacity(provider, event.target.value)} disabled={!isDesktop} /><small>{provider === "maple" ? "local lane" : "subscription lane"}</small></label>)}</div></section>;
+    return <section className="scheduler-panel" aria-label="Provider scheduler capacity"><div className="settings-section-heading"><span><span className="cockpit-kicker">PROVIDER SCHEDULER</span><strong>Concurrency caps</strong></span><small>host-owned · no silent fallback</small></div><p>Maple-Preview remains serialized unless you deliberately change its lane cap. Codex and Claude lanes can run independently.</p><div className="provider-cap-grid">{["maple", "codex", "claude"].map((provider) => <label className="provider-cap-field" key={provider}><span>{MODEL_LANES[provider].shortLabel}</span><input type="number" min="1" max="8" defaultValue={threadRegistry.providerCaps?.[provider] || 1} key={`${provider}-${threadRegistry.providerCaps?.[provider] || 1}`} onBlur={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next >= 1 && next <= 8 && next !== (threadRegistry.providerCaps?.[provider] || 1)) void updateProviderCapacity(provider, String(next)); else event.target.value = String(threadRegistry.providerCaps?.[provider] || 1); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} disabled={!isDesktop} /><small>{provider === "maple" ? "local lane" : "subscription lane"}</small></label>)}</div></section>;
   }
 
   function renderCenter() {
@@ -1474,24 +2031,28 @@ function App() {
     const phaseClass = (index) => task.status === "completed" ? "is-done" : task.status === "blocked" && index === phaseIndex ? "is-blocked" : index < phaseIndex ? "is-done" : index === phaseIndex ? "is-active" : "";
 
     return <div className="cockpit-shell">
-      <aside className="workstream-rail" aria-label="Hemlock workstreams">
-        <div className="rail-heading"><span className="cockpit-kicker">WORKSTREAMS</span><button type="button" onClick={() => { setDraft("Start a new Hemlock workstream: "); openWindow("chat"); }} aria-label="Start a new workstream"><Icon name="plus" size={15} /></button></div>
-        <div className="workstream-list">{workstreams.map((stream, index) => { const streamStatus = displayText(stream.status, "ready"); const streamMeta = displayText(stream.meta); return <button type="button" key={stream.id} className={`workstream-item ${index === 0 ? "is-selected" : ""}`} title={`${displayText(stream.title)} · ${streamMeta} · ${streamStatus}`} aria-label={`${displayText(stream.title)}. ${streamMeta}. Status: ${streamStatus}.`} onClick={() => stream.id === "sips" ? openWindow("sips") : stream.id === "dream" ? openWindow("dream") : stream.id === "context" ? void runCommand("context.refresh", { reason: "workstream" }) : focusWindow("center")}><span className={`workstream-icon ${stream.id}`}><Icon name={stream.icon} size={17} /></span><span className="workstream-copy"><strong>{displayText(stream.title)}</strong><small>{streamMeta}</small></span><span className={`workstream-state state-${streamStatus.replaceAll(" ", "-")}`}>{streamStatus}</span></button>; })}</div>
-        <div className="rail-footer"><span>LOCAL WORKSPACE</span><strong>{isDesktop ? "Electron control plane" : "Browser preview"}</strong><button type="button" onClick={() => openWindow("map")}><Icon name="map" size={13} /> Project map</button></div>
-      </aside>
 
+      <aside className="workstream-rail" aria-label="Hemlock workstreams">
+                      <div className="rail-heading"><span className="cockpit-kicker">WORKSTREAMS</span><button type="button" onClick={() => { setDraft("Start a new Hemlock workstream: "); openWindow("chat"); }} aria-label="Start a new workstream"><Icon name="plus" size={15} /></button></div>
+                      <div className="workstream-list">{workstreams.map((stream, index) => { const streamStatus = displayText(stream.status, "ready"); const streamMeta = displayText(stream.meta); return <button type="button" key={stream.id} className={`workstream-item ${index === 0 ? "is-selected" : ""}`} title={`${displayText(stream.title)} · ${streamMeta} · ${streamStatus}`} aria-label={`${displayText(stream.title)}. ${streamMeta}. Status: ${streamStatus}.`} onClick={() => stream.id === "sips" ? openWindow("sips") : stream.id === "dream" ? openWindow("dream") : stream.id === "context" ? void runCommand("context.refresh", { reason: "workstream" }) : focusWindow("center")}><span className={`workstream-icon ${stream.id}`}><Icon name={stream.icon} size={17} /></span><span className="workstream-copy"><strong>{displayText(stream.title)}</strong><small>{streamMeta}</small></span><span className={`workstream-state state-${streamStatus.replaceAll(" ", "-")}`}>{streamStatus}</span></button>; })}</div>
+                      <div className="rail-footer"><span>LOCAL WORKSPACE</span><strong>{isDesktop ? "Electron control plane" : "Browser preview"}</strong><button type="button" onClick={() => openWindow("map")}><Icon name="map" size={13} /> Project map</button></div>
+                    </aside>
       <section className="cockpit-workbench" aria-label="Active Hemlock workbench">
         <div className="workbench-topline"><div><span className="cockpit-kicker">ACTIVE WORKSTREAM / {task.intent || "conversation"}</span><span className="workbench-id">{task.id || "local-session"}</span></div><span className={`task-state task-state-${task.status}`}>{task.status || "ready"}</span></div>
-        {renderProviderCapacityPanel()}
+        
         <div className="lifecycle-layout">
           <ol className="lifecycle-rail" aria-label="Task lifecycle">{phases.map((phase, index) => <li className={phaseClass(index)} key={phase.id}><span className="lifecycle-node"><Icon name={phase.icon} size={18} /></span><span><strong>{phase.label}</strong><small>{task.status === "completed" ? "done" : index < phaseIndex ? "done" : index === phaseIndex ? task.status === "blocked" ? "blocked" : "in progress" : "pending"}</small></span></li>)}</ol>
           <div className="workbench-main">
+            <section className="objective-block" aria-label="Current objective"><div className="block-label"><span>CURRENT OBJECTIVE</span><time>updated {formatTime(task.updatedAt || latestEvent?.createdAt)}</time></div><h1>{task.objective || "A quiet place for ambitious work."}</h1><p>Local only. Preserve determinism and auditability. Base Maple weights remain immutable.</p></section>
+            <section className="attention-ribbon" aria-label="Now next why"><div><span>NOW</span><strong>{displayText(task.status === "blocked" ? "Needs attention" : activeStep, "Choose the next bounded action")}</strong><small>{displayText(task.phase || "ready")} · {displayText(task.status || "ready")}</small></div><div><span>NEXT</span><strong>{displayText(nextAction)}</strong><small>{ambientCandidate ? "candidate awaiting review" : "selected from current task state"}</small></div><div><span>WHY</span><strong>{displayText(contextSnapshot?.focusHypotheses?.[0]?.label || "Hemlock workspace")}</strong><small>{displayText(contextSnapshot?.focusHypotheses?.[0]?.evidenceRefs?.[0] || "local task and project evidence")}</small></div></section>
+            
+            <section className="work-note-block" aria-label="Next bounded action"><div className="active-step-card is-primary"><div className="step-card-heading"><span className="step-index">{task.status === "blocked" ? "!" : "→"}</span><div><span className="cockpit-kicker">ACTIVE STEP</span><strong>{displayText(activeStep, "Choose the next bounded action")}</strong></div><span className="step-progress">{taskProgress ? `${Math.round(taskProgress)}%` : "ready"}</span></div><p>{displayText(task.status === "blocked" ? task.blockedReason || "A local operation needs inspection before the task can continue." : "Keep the next action bounded, receipt-backed, and visible to the agent.")}</p><div className="step-card-actions"><button type="button" className="next-action-button" onClick={runNextAction}><Icon name={task.status === "blocked" ? "warning" : "play"} size={14} /> {displayText(nextAction)}</button><button type="button" className="quiet-action" onClick={() => openWindow("activity")}>Activity <Icon name="chevron" size={13} /></button></div></div></section>
             <section className="live-task-panel" aria-label="Live Task"><div className="live-task-heading"><div><span className="cockpit-kicker">LIVE TASK</span><h2>{MODEL_LANES[modelSelection.provider].label} output and host evidence</h2></div><button type="button" className="quiet-action" onClick={() => openWindow("chat")}>Open Chat</button></div><div className="live-task-panel-grid"><section className="maple-output-card"><div className="block-label"><span>{MODEL_LANES[modelSelection.provider].shortLabel} OUTPUT</span><small>model-verbatim · visible by default</small></div>{messages.filter((message) => message.role === "assistant").slice(-1).map((message) => <div key={message.id}>{messageChannels(message).map((channel, index) => <div className={`maple-channel ${channel.name === "content" ? "maple-channel-content" : "maple-channel-secondary"}`} key={`${channel.name}-${index}`}><span className="model-channel-label">{MODEL_LANES[message.provider || channel.source || "maple"]?.label || "Maple-Preview"} · {displayText(channel.name, "content")}</span>{channel.name === "content" ? <p>{displayText(channel.text, "")}</p> : <pre>{displayText(channel.text, "")}</pre>}</div>)}</div>)}{!messages.some((message) => message.role === "assistant") && <p className="empty-copy">Casual conversation and completed responses appear in Chat.</p>}</section><section className="live-action-card"><div className="block-label"><span>LIVE ACTION</span><small>{displayText(activeAction?.status, "idle")}</small></div>{activeAction ? <><strong>{displayText(activeAction.commandId || activeAction.kind)}</strong><p>{displayText(activeAction.shortRationale)}</p><details><summary>Exact envelope and provider output reference</summary><pre>{displayText({ action: activeAction, rawModelOutputRef: activeAction.rawModelOutputRef, modelChannels: activeAction.modelChannels, parseStatus: activeAction.parseStatus, fallbackMode: activeAction.fallbackMode }, "No action envelope recorded.")}</pre></details></> : <p className="empty-copy">No action is active. The host does not turn conversation into a plan.</p>}</section><section className="live-evidence-card"><div className="block-label"><span>EVIDENCE</span><small>{displayText(latestObservation?.status || latestEvent?.status, "waiting")}</small></div><p>{displayText(latestObservation?.summary || latestEvent?.payload?.reason || "Receipts, observations, and stop reasons will appear here.")}</p>{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{receipts.slice(0, 3).map((event) => <div className="evidence-line" key={event.id}><strong>{displayText(event.type.replaceAll(".", " · "))}</strong><small>{displayText(event.evidenceRefs?.[0] || event.payload?.rawOutputRef || "event recorded")}</small></div>)}</section></div></section>
             <details className="full-trace" open={false}><summary>Full trace · lifecycle, command detail, and host interpretation</summary>
-            <section className="objective-block"><div className="block-label"><span>CURRENT OBJECTIVE</span><time>updated {formatTime(task.updatedAt || latestEvent?.createdAt)}</time></div><h1>{task.objective || "A quiet place for ambitious work."}</h1><p>Local only. Preserve determinism and auditability. Base Maple weights remain immutable.</p></section>
-            <section className="attention-ribbon" aria-label="Now next why"><div><span>NOW</span><strong>{displayText(task.status === "blocked" ? "Needs attention" : activeStep, "Choose the next bounded action")}</strong><small>{displayText(task.phase || "ready")} · {displayText(task.status || "ready")}</small></div><div><span>NEXT</span><strong>{displayText(nextAction)}</strong><small>{ambientCandidate ? "candidate awaiting review" : "selected from current task state"}</small></div><div><span>WHY</span><strong>{displayText(contextSnapshot?.focusHypotheses?.[0]?.label || "Hemlock workspace")}</strong><small>{displayText(contextSnapshot?.focusHypotheses?.[0]?.evidenceRefs?.[0] || "local task and project evidence")}</small></div></section>
+            
+            
             <section className="agent-loop-panel" aria-label="Maple host execution loop"><div className="block-label"><span>HOST EXECUTION LOOP</span><span className={`loop-badge ${displayText(task.status, "ready")}`}>{displayText(task.status, "ready")}</span></div><div className="agent-loop-grid"><div><small>PLAN</small><strong>{displayText(activePlan ? activePlan.status.replaceAll("_", " ") : "not proposed")}</strong><span>{activePlan?.steps?.length || 0} bounded steps</span></div><div><small>ACTION</small><strong>{displayText(activeAction?.commandId || activeAction?.kind || "waiting")}</strong><span>{displayText(activeAction?.status || "no action selected")}</span></div><div><small>OBSERVATION</small><strong>{displayText(latestObservation?.status || "pending")}</strong><span>{displayText(latestObservation ? latestObservation.summary : "No command receipt yet")}</span></div><div><small>BUDGET</small><strong>{task.budget?.agentStepsUsed || 0}/{task.budget?.maxAgentSteps || 8}</strong><span>{task.budget?.commandsUsed || 0}/{task.budget?.maxCommands || 12} commands</span></div></div>{(queueState?.count || 0) > 0 && <div className="agent-queue-readout"><span><Icon name="pulse" size={13} /> INTENT QUEUE</span><strong>{queueState.pending?.length || 0} waiting</strong><small>{queueState.active ? `active: ${displayText(queueState.active.payload?.text || "local task")}` : "ready to start"}</small></div>}{planNeedsApproval && activePlan && <div className="agent-loop-decision"><p>{displayText(activePlan.rationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })}>Approve plan</button><button type="button" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Command Center" })}>Reject</button></div></div>}{actionNeedsApproval && activeAction && <div className="agent-loop-decision"><p>{displayText(activeAction.shortRationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("action.accept", { taskId: task.id, actionId: activeAction.id })}>Accept action</button><button type="button" onClick={() => void runCommand("action.reject", { taskId: task.id, actionId: activeAction.id, reason: "Action rejected from Command Center" })}>Reject</button></div></div>}<div className="agent-loop-trace">{actions.slice(-4).reverse().map((action) => <span key={action.id}><i className={`trace-status trace-${action.status}`} /><strong>{displayText(action.commandId || action.kind)}</strong><small>{displayText(action.status)}</small></span>)}</div></section>
-            <section className="work-note-block"><div className="block-label"><span>WORK NOTE</span><time>{latestEvent ? formatTime(latestEvent.createdAt) : "session ready"}</time></div><p>{displayText(isThinking ? `${MODEL_LANES[modelSelection.provider].label} is composing a response.` : isDreaming ? dreamStage : sipsCycleState === "running" ? sipsStage : latestEvent?.payload?.stage || latestEvent?.payload?.command || "Hemlock is waiting for the next bounded action.")}</p><div className="active-step-card"><div className="step-card-heading"><span className="step-index">{task.status === "blocked" ? "!" : "→"}</span><div><span className="cockpit-kicker">ACTIVE STEP</span><strong>{displayText(activeStep, "Choose the next bounded action")}</strong></div><span className="step-progress">{taskProgress ? `${Math.round(taskProgress)}%` : "ready"}</span></div><p>{displayText(task.status === "blocked" ? task.blockedReason || "A local operation needs inspection before the task can continue." : "Keep the next action bounded, receipt-backed, and visible to the agent.")}</p><div className="step-card-actions"><button type="button" className="next-action-button" onClick={runNextAction}><Icon name={task.status === "blocked" ? "warning" : "play"} size={14} /> {displayText(nextAction)}</button><button type="button" className="quiet-action" onClick={() => openWindow("activity")}>Activity <Icon name="chevron" size={13} /></button></div></div></section>
+            <section className="work-note-block"><div className="block-label"><span>WORK NOTE</span><time>{latestEvent ? formatTime(latestEvent.createdAt) : "session ready"}</time></div><p>{displayText(isThinking ? `${MODEL_LANES[modelSelection.provider].label} is composing a response.` : isDreaming ? dreamStage : sipsCycleState === "running" ? sipsStage : latestEvent?.payload?.stage || latestEvent?.payload?.command || "Hemlock is waiting for the next bounded action.")}</p></section>
             <section className="trace-block"><div className="trace-heading"><span>COMMAND TRACE <em>{trace.length}</em></span><button type="button" onClick={() => openWindow("activity")}>View stream <Icon name="chevron" size={12} /></button></div>{trace.length ? <div className="trace-list">{trace.map((event) => <div className="trace-row" key={event.id}><time>{formatTime(event.createdAt)}</time><span>{event.type.replaceAll(".", " · ")}</span><i className={`trace-status trace-${event.status}`}><Icon name={event.status === "failed" ? "warning" : event.status === "running" ? "pulse" : "check"} size={12} /></i><small>{displayText(event.payload?.stage || event.payload?.command || event.status)}</small></div>)}</div> : <p className="empty-copy">No command trace yet. The first request will appear here.</p>}</section>
             </details>
           </div>
@@ -1499,9 +2060,9 @@ function App() {
       </section>
 
       <aside className="evidence-ledger" aria-label="Evidence and context ledger">
-        <section className="ledger-section context-ledger"><div className="ledger-heading"><span>CONTEXT QUALITY</span><button type="button" onClick={() => void runCommand("context.refresh", { reason: "ledger" })} aria-label="Refresh context quality"><Icon name="refresh" size={13} /></button></div><div className="quality-readout"><div className="quality-ring" style={{ "--quality": `${confidence}%` }}><strong>{confidence || "—"}</strong><span>{confidence ? "high" : contextStatus}</span></div><div className="quality-stats"><div><span>Freshness</span><strong>{freshness}</strong></div><div><span>Relevance</span><strong>{quality.relevance == null ? "—" : `${Math.round(quality.relevance * 100)}%`}</strong></div><div><span>Coverage</span><strong>{quality.sourceCoverage == null ? "—" : `${Math.round(quality.sourceCoverage * 100)}%`}</strong></div><div><span>Providers</span><strong>{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length}/{contextSnapshot?.providers?.length || 0}</strong></div></div></div><p className="ledger-note">{contextStatus === "fresh" ? "Fresh local context is available with redaction and provenance." : "Refresh awareness context before relying on day-to-day observations."}</p></section>
-        <section className="ledger-section"><div className="ledger-heading"><span>EVIDENCE LEDGER</span><button type="button" onClick={() => openWindow("receipts")}>View all <Icon name="chevron" size={12} /></button></div>{receipts.length ? <div className="ledger-list">{receipts.map((event) => <button type="button" className="ledger-row" key={event.id} onClick={() => openWindow("receipts")}><Icon name="receipt" size={13} /><span><strong>{event.type.replaceAll(".", " · ")}</strong><small>{displayText(event.evidenceRefs?.[0] || event.payload?.stage || "local receipt")}</small></span><time>{formatTime(event.createdAt)}</time></button>)}</div> : <p className="empty-copy">Receipts will collect here as Hemlock works.</p>}</section>
-        <section className="ledger-section candidate-ledger"><div className="ledger-heading"><span>AMBIENT INBOX</span><span className="ledger-tag">{activeCandidates.length ? `${activeCandidates.length} REVIEW` : "QUIET"}</span></div>{ambientCandidate ? <><strong>{displayText(ambientCandidate.title)}</strong><p>{displayText(ambientCandidate.summary)}</p><small>{displayText(ambientCandidate.reason)} · {Math.round((ambientCandidate.confidence || 0) * 100)}% confidence</small><div className="candidate-actions"><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "accept")}>Accept task</button><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "dismiss")}>Dismiss</button></div></> : candidate ? <><strong>{displayText(candidate.title || "Unreviewed project lesson")}</strong><p>{displayText(candidate.body || "Evidence attached to candidate.")}</p><small>verify before use · {displayText(candidate.event?.evidenceRefs?.[0] || "receipt linked")}</small><div className="candidate-actions"><button type="button" onClick={() => openWindow("memory")}>Review memory</button><button type="button" onClick={() => void transitionMemory(candidate, "demote")}>Demote</button></div></> : <p className="empty-copy">No candidate needs attention. Enabled sources remain quiet.</p>}</section>
+        <section className="ledger-section context-ledger"><div className="ledger-heading"><span>CONTEXT QUALITY</span><button type="button" onClick={() => void runCommand("context.refresh", { reason: "ledger" })} aria-label="Refresh context quality"><Icon name="refresh" size={13} /></button></div><div className="quality-readout"><div className="quality-ring" style={{ "--quality": `${confidence}%` }}><strong>{confidence || "—"}</strong><span>{confidence ? "high" : contextStatus}</span></div><div className="quality-stats"><div><span>Freshness</span><strong>{freshness == null || freshness === "—" ? "measuring…" : freshness}</strong></div><div><span>Relevance</span><strong>{quality.relevance == null ? "measuring…" : `${Math.round(quality.relevance * 100)}%`}</strong></div><div><span>Coverage</span><strong>{quality.sourceCoverage == null ? "measuring…" : `${Math.round(quality.sourceCoverage * 100)}%`}</strong></div><div><span>Providers</span><strong>{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length}/{contextSnapshot?.providers?.length || 0}</strong></div></div></div><p className="ledger-note">{contextStatus === "fresh" ? "Fresh local context is available with redaction and provenance." : "Refresh awareness context before relying on day-to-day observations."}{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length === 0 ? " No providers connected yet — add sources in Settings." : ""}</p></section>
+        <section className="ledger-section"><div className="ledger-heading"><span>EVIDENCE LEDGER</span><button type="button" onClick={() => openWindow("receipts")}>View all <Icon name="chevron" size={12} /></button></div>{receipts.length ? (() => { const groups = new Map(); for (const event of receipts) { const prefix = String(event.type || "event").split(".")[0]; if (!groups.has(prefix)) groups.set(prefix, []); groups.get(prefix).push(event); } const grouped = [...groups.entries()]; return <div className="ledger-list">{grouped.map(([prefix, events]) => { const latest = events[events.length - 1]; return <button type="button" className="ledger-row" key={prefix} onClick={() => openWindow("receipts")} title={events.slice(-4).reverse().map((event) => `${event.type} · ${formatTime(event.createdAt)}`).join("\n")}><Icon name="receipt" size={13} /><span><strong>{prefix} · {events.length}</strong><small>{events.length === 1 ? displayText(latest.evidenceRefs?.[0] || latest.payload?.stage || "local receipt") : `${latest.type.replaceAll(".", " · ")} + ${events.length - 1} more`}</small></span><time>{formatTime(latest.createdAt)}</time></button>; })}</div>; })() : <p className="empty-copy">Receipts will collect here as Hemlock works.</p>}</section>
+        <section className="ledger-section candidate-ledger"><div className="ledger-heading"><span>AMBIENT INBOX</span><span className="ledger-tag">{activeCandidates.length ? `${activeCandidates.length} REVIEW` : "QUIET"}</span></div>{ambientCandidate ? <><strong>{displayText(ambientCandidate.title)}</strong><p>{displayText(ambientCandidate.summary)}</p><small>{displayText(ambientCandidate.reason)} · {Math.round((ambientCandidate.confidence || 0) * 100)}% confidence</small><div className="candidate-actions"><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "accept")}>Accept task</button><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "dismiss")}>Dismiss</button></div></> : candidate ? <><strong>{displayText(candidate.title || "Unreviewed project lesson")}</strong><p>{displayText(candidate.body || "Evidence attached to candidate.")}</p><small>verify before use · {displayText(candidate.event?.evidenceRefs?.[0] || "receipt linked")}</small><div className="candidate-actions"><button type="button" onClick={() => openWindow("memory")}>Review memory</button><button type="button" onClick={async () => { const confirmed = await confirmDialog({ title: "Demote this lesson?", body: "The lesson returns to candidate status and stops feeding recall until it is verified again.", confirmLabel: "Demote lesson", tone: "danger" }); if (confirmed) void transitionMemory(candidate, "demote"); }}>Demote</button></div></> : <p className="empty-copy">No candidate needs attention. Enabled sources remain quiet.</p>}</section>
         <section className={`ledger-section blocker-ledger ${blockers.length || task.status === "blocked" ? "has-blocker" : ""}`}><div className="ledger-heading"><span>BLOCKERS</span>{blockers.length || task.status === "blocked" ? <span className="ledger-tag alert">ATTENTION</span> : <span className="ledger-tag good">CLEAR</span>}</div>{task.status === "blocked" ? <p><Icon name="warning" size={14} /> {displayText(task.blockedReason || "The current task is blocked.")}</p> : blockers.length ? blockers.map((event) => <p key={event.id}><Icon name="warning" size={14} /> {displayText(event.payload?.error || event.payload?.stage || event.type)}</p>) : <p><Icon name="check" size={14} /> No active blockers in the current task.</p>}</section>
       </aside>
 
@@ -1515,15 +2076,51 @@ function App() {
     </div>;
   }
 
+  function formatRelativeTime(iso) {
+    if (!iso) return "";
+    const deltaMs = Date.now() - new Date(iso).getTime();
+    if (!Number.isFinite(deltaMs)) return "";
+    const minutes = Math.floor(deltaMs / 60000);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  }
+
   function renderThreadBar() {
-    const activeThread = (threadRegistry.threads || []).find((item) => item.id === (task.threadId || threadRegistry.activeThreadId));
-    return <section className="thread-bar" aria-label="Hemlock threads"><div className="thread-bar-main"><button type="button" className="thread-switcher" onClick={() => setThreadPickerOpen((value) => !value)} aria-expanded={threadPickerOpen}><Icon name="chat" size={14} /><span className="thread-context-label">{interactionMode === "build" ? "Build context" : "Conversation context"}</span><span className="thread-context-copy"><strong>{displayText(task.objective || activeThread?.title || "Hemlock thread")}</strong><small>{displayText(activeThread?.workspaceRoot || task.workspaceRoot || "No project directory")}</small></span><StatusLamp state={task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={displayText(task.status, "ready")} /><Icon name="chevron" size={12} /></button><button type="button" className="quiet-action" onClick={() => void createThread()}><Icon name="plus" size={13} /> New thread</button></div>{threadPickerOpen && <div className="thread-popover"><div className="thread-popover-heading"><span>THREADS</span><button type="button" onClick={() => void refreshThreadRegistry()}><Icon name="refresh" size={12} /> Refresh</button></div>{(threadRegistry.threads || []).filter((item) => item.status !== "archived").map((thread) => <button type="button" className={`thread-row ${thread.id === (task.threadId || threadRegistry.activeThreadId) ? "is-active" : ""}`} key={thread.id} onClick={() => void switchThread(thread.id)}><span><strong>{displayText(thread.title)}</strong><small>{displayText(thread.workspaceRoot)} · {displayText(thread.provider, "maple")}</small></span><StatusLamp state={thread.status === "running" ? "working" : thread.status === "blocked" ? "down" : "ready"} label={displayText(thread.status, "ready")} /></button>)}{!(threadRegistry.threads || []).length && <p className="empty-copy">No durable threads yet.</p>}</div>}</section>;
+    const activeThreadId = task.threadId || threadRegistry.activeThreadId;
+    const activeThread = (threadRegistry.threads || []).find((item) => item.id === activeThreadId);
+    const openThreads = (threadRegistry.threads || []).filter((item) => item.status !== "archived");
+    const archivedThreads = (threadRegistry.threads || []).filter((item) => item.status === "archived");
+    const renderThreadRow = (thread) => (
+      <div className={`thread-row-wrap ${thread.id === activeThreadId ? "is-active" : ""}`} key={thread.id}>
+        {renamingThreadId === thread.id ? (
+          <form className="thread-row thread-rename" onSubmit={(event) => { event.preventDefault(); void commitThreadRename(thread.id); }}>
+            <input value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} autoFocus aria-label="Thread name" onKeyDown={(event) => { if (event.key === "Escape") { setRenamingThreadId(null); setRenameDraft(""); } }} />
+            <button type="submit" className="thread-rename-save">Save</button>
+          </form>
+        ) : (
+          <>
+            <button type="button" className="thread-row" aria-current={thread.id === activeThreadId ? "true" : undefined} onClick={() => void switchThread(thread.id)}>
+              <span><strong>{displayText(thread.title)}</strong><small>{formatRelativeTime(thread.updatedAt || thread.lastOpenedAt)}{thread.workspaceRoot ? ` · ${displayText(thread.workspaceRoot)}` : ""} · {displayText(thread.provider, "maple")}</small></span>
+              <StatusLamp state={thread.status === "running" ? "working" : thread.status === "blocked" ? "down" : "ready"} label={displayText(thread.status, "ready")} />
+            </button>
+            <span className="thread-row-actions">
+              <button type="button" title="Rename thread" aria-label={`Rename ${displayText(thread.title)}`} onClick={() => startThreadRename(thread.id, thread.title)}><Icon name="pencil" size={12} /></button>
+              <button type="button" title="Archive thread" aria-label={`Archive ${displayText(thread.title)}`} onClick={() => void archiveThread(thread.id)}><Icon name="archive" size={12} /></button>
+            </span>
+          </>
+        )}
+      </div>
+    );
+    return <section className="thread-bar" aria-label="Hemlock threads"><div className="thread-bar-main"><button type="button" className="thread-switcher" onClick={() => setThreadPickerOpen((value) => !value)} aria-expanded={threadPickerOpen}><Icon name="chat" size={14} /><span className="thread-context-label">{interactionMode === "build" ? "Build context" : "Conversation context"}</span><span className="thread-context-copy"><strong>{displayText(task.objective || activeThread?.title || "Hemlock thread")}</strong><small>{displayText(activeThread?.workspaceRoot || task.workspaceRoot || "No project directory")}</small></span><StatusLamp state={task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={displayText(task.status, "ready")} /><Icon name="chevron" size={12} /></button><button type="button" className="quiet-action" onClick={() => void createThread()}><Icon name="plus" size={13} /> New thread</button></div>{threadPickerOpen && <div className="thread-popover" role="dialog" aria-label="Thread list"><div className="thread-popover-heading"><span>THREADS</span><button type="button" onClick={() => void refreshThreadRegistry()}><Icon name="refresh" size={12} /> Refresh</button></div>{openThreads.map(renderThreadRow)}{!openThreads.length && <p className="empty-copy">No open threads. Create one to start a fresh conversation.</p>}{archivedThreads.length > 0 && <details className="thread-archived"><summary>Archived ({archivedThreads.length})</summary>{archivedThreads.map((thread) => <div className="thread-row-wrap is-archived" key={thread.id}><button type="button" className="thread-row" onClick={() => void restoreThread(thread.id)}><span><strong>{displayText(thread.title)}</strong><small>archived {formatRelativeTime(thread.archivedAt)} · select to restore</small></span></button><span className="thread-row-actions"><button type="button" title="Restore thread" aria-label={`Restore ${displayText(thread.title)}`} onClick={() => void restoreThread(thread.id)}><Icon name="refresh" size={12} /></button></span></div>)}</details>}</div>}</section>;
   }
 
   function renderSuggestionCards() {
     const visible = suggestions.filter((item) => item.status === "unread").slice().reverse().slice(0, 4);
     if (!visible.length) return null;
-    return <section className="suggestion-stack" aria-label="Hemlock suggestions"><div className="card-kicker"><span>HEMLOCK SUGGESTIONS</span><small>host-generated · never runs automatically</small></div>{visible.map((suggestion) => <article className="suggestion-card" key={suggestion.suggestionId}><div><strong>{displayText(suggestion.title)}</strong><p>{displayText(suggestion.summary)}</p><small>{displayText(suggestion.reason)}</small>{suggestion.evidenceRefs?.[0] && <code>{displayText(suggestion.evidenceRefs[0])}</code>}</div><div className="suggestion-actions"><button type="button" onClick={() => void transitionSuggestion(suggestion, "accepted")}>Review / act</button><button type="button" className="quiet-action" onClick={() => void transitionSuggestion(suggestion, "dismissed")}>Dismiss</button></div></article>)}</section>;
+    return <section className="suggestion-stack" aria-label="Hemlock suggestions"><div className="card-kicker"><span>HEMLOCK SUGGESTIONS{visible.length > 1 ? ` · ${visible.length}` : ""}</span><small>host-generated · never runs automatically</small></div>{visible.map((suggestion) => <article className="suggestion-card" key={suggestion.suggestionId}><div><strong>{displayText(suggestion.title)}</strong><p>{displayText(suggestion.summary)}</p><small>{displayText(suggestion.reason)}</small>{suggestion.recommendedAction?.command && <em className="suggestion-recommended">suggests: {displayText(String(suggestion.recommendedAction.command).replaceAll(".", " · "))}</em>}{suggestion.evidenceRefs?.[0] && <code>{displayText(suggestion.evidenceRefs[0])}</code>}</div><div className="suggestion-actions"><button type="button" onClick={() => void transitionSuggestion(suggestion, "accepted")}>Review / act</button><button type="button" className="quiet-action" onClick={() => void transitionSuggestion(suggestion, "snoozed")}>Snooze</button><button type="button" className="quiet-action" onClick={() => void transitionSuggestion(suggestion, "dismissed")}>Dismiss</button></div></article>)}</section>;
   }
 
   function renderChat() {
@@ -1553,35 +2150,57 @@ function App() {
     const objectiveSummary = objectiveIsLong ? compactPreview(objective) : objective;
     const liveStream = liveStreams.at(-1) || null;
     const liveStreamRate = formatTokensPerSecond(liveStream?.usage, liveStream?.startedAt ? Date.now() - new Date(liveStream.startedAt).getTime() : null);
-    const channelProviderName = (provider) => MODEL_LANES[provider]?.label || (provider ? String(provider).toUpperCase() : "Maple-Preview");
+    const channelProviderName = (provider) => MODEL_LANES[provider]?.label || (provider ? String(provider).toUpperCase() : "Local");
+    // Electron IPC wraps handler errors as `Error invoking remote method 'X': Error: <real message>`.
+    // Strip the wrapper so users see the actual cause, not transport jargon.
+    const cleanErrorText = (text) => String(text || "").replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, "").trim();
+    const serverDownWhileWaiting = isThinking && isDesktop && serverHealthProbe === false;
+    // One honest DM Mono line above the composer: what the user is talking to.
+    const composerModelLine = (() => {
+      const optionLabel = selectedLane.modelOptions.find((option) => option.value === modelSelection.model)?.label || modelSelection.model || "";
+      if (!optionLabel) return "local · ready";
+      const laneLabel = selectedLane.kind === "local" ? "local lane" : `${selectedLane.label.toLowerCase()} lane`;
+      const ceiling = `${Math.round(DEFAULT_MAPLE_MAX_TOKENS / 1024)}k ceiling`;
+      const readiness = serverState === "ready" ? "ready" : serverState === "down" ? "server down" : "readiness unchecked";
+      return `${optionLabel} · ${laneLabel} · ${ceiling} · ${readiness}`;
+    })();
     const renderChannels = (message) => {
       const channels = messageChannels(message);
       const providerName = channelProviderName(message.provider || channels[0]?.source);
-      if (!channels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName} · no prose channel returned</span><p>The model response contained no text channel. The host record remains available in Full trace.</p></div>;
-      return channels.map((channel, index) => {
+      const visibleChannels = channels.filter((channel) => (channel.text || "").trim().length > 0)
+        // Reasoning toggle ("Thinking: off") hides the CoT channel entirely.
+        // Local models always emit <think> internally; this is a display
+        // control, and the full trace still records the reasoning.
+        .filter((channel) => !(modelSelection.reasoning === "off" && (channel.name === "reasoning" || channel.name === "reasoning_content")));
+      if (!visibleChannels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName}</span><p>The model finished without returning any text. This usually means it hit its token limit while reasoning. Try again, or raise the token ceiling in a longer task.</p></div>;
+      return visibleChannels.map((channel, index) => {
         const label = `${channelProviderName(channel.source || message.provider)} · ${displayText(channel.name, "content")}`;
         if (channel.name === "content" || index === 0 && channels.length === 1) return <div className="maple-channel maple-channel-content" key={`${channel.name}-${index}`}><span className="model-channel-label">{label}</span><div className="message-content">{displayText(channel.text, "")}{message.streaming && <span className="stream-caret" aria-label={`${providerName} response still arriving`}>▍</span>}</div></div>;
-        return <details className="maple-channel maple-channel-secondary" open key={`${channel.name}-${index}`}><summary className="model-channel-label">{label} · emitted by {channelProviderName(channel.source || message.provider)}</summary><pre>{displayText(channel.text, "")}</pre></details>;
+        const isReasoning = channel.name === "reasoning" || channel.name === "reasoning_content";
+        const reasoningLabel = isReasoning ? `${providerName} · thinking` : label;
+        return <details className={`maple-channel maple-channel-secondary ${isReasoning ? "maple-channel-reasoning" : ""}`} open={Boolean(message.streaming) && !message.stopped} key={`${channel.name}-${index}-${message.streaming ? "live" : "done"}`}><summary className="model-channel-label">{reasoningLabel}{isReasoning ? (message.streaming ? " · streaming…" : ` · ${Math.round((channel.text || "").length / 4)} tokens of thought`) : ` · model channel`}{isReasoning && !message.streaming && (channel.text || "").length > 0 ? <span className="reasoning-preview">{displayText(channel.text.replace(/\s+/g, " ").trim().slice(0, 110))}{channel.text.length > 110 ? "…" : ""}</span> : null}</summary><pre>{displayText(channel.text, "")}</pre></details>;
       });
     };
-    const evidenceRail = <details className="chat-evidence-rail" open={Boolean(evidenceRefs.length || task.status === "blocked")}><summary><span className="host-summary-label">EVIDENCE</span><span className={`host-summary-status host-summary-${evidenceStatus}`}>{displayText(evidenceStatus, "waiting")}</span><Icon name="chevron" size={12} /></summary><div className="chat-evidence-body"><p>{displayText(evidenceSummary)}</p>{evidenceRefs.length > 0 && <ul>{evidenceRefs.slice(0, 3).map((ref) => <li key={ref}>{displayText(ref)}</li>)}</ul>}{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{(task.blockedReason || latestActionEvent?.payload?.stopReason) && <p className="evidence-stop">Stop reason: {displayText(task.blockedReason || latestActionEvent.payload.stopReason)}</p>}{task.artifactRepair?.status === "exhausted" && <div className="repair-actions"><button type="button" onClick={() => void runCommand("artifact.repair.retry", { taskId: task.id })}>Retry repair</button>{task.artifactRepair?.lastGoodRevision && <button type="button" onClick={() => void runCommand("artifact.repair.use-last-good", { taskId: task.id })}>Use last good revision</button>}</div>}</div></details>;
+    const evidenceRail = <details className="chat-evidence-rail" open={Boolean(evidenceRefs.length || task.status === "blocked")}><summary><span className="host-summary-label" title="Receipts: host-recorded evidence from validated actions and observations in this task.">EVIDENCE</span><span className={`host-summary-status host-summary-${evidenceStatus}`}>{displayText(evidenceStatus, "waiting")}</span><Icon name="chevron" size={12} /></summary><div className="chat-evidence-body"><p>{displayText(evidenceSummary)}</p>{evidenceRefs.length > 0 && <ul>{evidenceRefs.slice(0, 3).map((ref) => <li key={ref}>{displayText(ref)}</li>)}</ul>}{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{(task.blockedReason || latestActionEvent?.payload?.stopReason) && <p className="evidence-stop">Stop reason: {displayText(task.blockedReason || latestActionEvent.payload.stopReason)}</p>}{task.artifactRepair?.status === "exhausted" && <div className="repair-actions"><button type="button" onClick={() => void runCommand("artifact.repair.retry", { taskId: task.id })}>Retry repair</button>{task.artifactRepair?.lastGoodRevision && <button type="button" onClick={() => void runCommand("artifact.repair.use-last-good", { taskId: task.id })}>Use last good revision</button>}</div>}</div></details>;
     const hostActivity = <section className="chat-host-rail" aria-label="Host activity"><details className="chat-host-details" open={hostActivityOpen} onToggle={(event) => setHostActivityOpen(event.currentTarget.open)}><summary className="chat-host-summary"><span className="host-summary-label">HOST ACTIVITY</span><strong>{activeAction ? displayText(activeAction.commandId || activeAction.kind) : planNeedsApproval ? "Waiting for plan approval" : "No active action"}</strong><span className={`host-summary-status host-summary-${evidenceStatus}`}>{activeAction ? displayText(activeAction.status, "proposed") : displayText(evidenceStatus, "waiting")}</span><Icon name="chevron" size={12} /></summary><section className="live-task-surface"><div className="live-task-heading"><span>LIVE TASK</span><small>host detail beside {selectedLane.label} output</small></div><div className="live-task-grid"><section className="live-action-card"><div className="card-kicker"><span>LIVE ACTION</span><small>{displayText(activeAction?.status, planNeedsApproval ? "not started" : "idle")}</small></div>{activeAction ? <><strong>{displayText(activeAction.commandId || activeAction.kind)}</strong><p>{displayText(activeAction.shortRationale)}</p><details><summary>Exact validated action envelope</summary><pre>{displayText(activeAction, "No action envelope recorded.")}</pre></details>{(activeAction.modelChannels?.length || activeAction.rawModelOutputRef) && <details><summary>Raw provider output reference</summary><pre>{displayText({ rawModelOutputRef: activeAction.rawModelOutputRef, modelChannels: activeAction.modelChannels, parseStatus: activeAction.parseStatus, fallbackMode: activeAction.fallbackMode }, "No raw output reference.")}</pre></details>}</> : <p className="empty-copy">{planNeedsApproval ? "No model action has run yet. Approve the plan to let Maple start choosing and streaming work." : "No validated action is active. Casual conversation stays in Chat."}</p>}</section><section className="live-evidence-card"><div className="card-kicker"><span>EVIDENCE</span><small>{displayText(evidenceStatus, "waiting")}</small></div><p>{displayText(evidenceSummary)}</p>{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{evidenceRefs.length > 0 && <ul>{evidenceRefs.slice(0, 5).map((ref) => <li key={ref}>{displayText(ref)}</li>)}</ul>}{(task.blockedReason || latestActionEvent?.payload?.stopReason) && <p className="evidence-stop">Stop reason: {displayText(task.blockedReason || latestActionEvent.payload.stopReason)}</p>}{task.artifactRepair?.status === "exhausted" && <div className="repair-actions"><button type="button" onClick={() => void runCommand("artifact.repair.retry", { taskId: task.id })}>Retry repair</button>{task.artifactRepair?.lastGoodRevision && <button type="button" onClick={() => void runCommand("artifact.repair.use-last-good", { taskId: task.id })}>Use last good revision</button>}</div>}</section></div></section></details>{workNotes.length > 0 && <details className="host-trace" open={false}><summary>Full trace · decisions, tools, observations, repairs, and receipts</summary><div className="agent-notes-list">{workNotes.map(({ event, note }) => <div className={`agent-note agent-note-${event.status}`} key={event.id}><i /><span>{note}</span><time>{formatTime(event.createdAt)}</time></div>)}</div></details>}</section>;
-    const planCard = (activePlan || planStateMissing || task.status === "waiting_for_approval") && <section className={`chat-plan-card ${planNeedsApproval || planStateMissing ? "is-awaiting" : "is-approved"} ${planCollapsed ? "is-collapsed" : ""}`} aria-label="Plan and approval"><div className="chat-plan-heading"><div><span className="card-kicker">PLAN / APPROVAL</span><strong>{planNeedsApproval ? "Review before Maple starts" : planStateMissing ? "Plan state needs refresh" : "Bounded plan"}</strong></div><div className="chat-plan-heading-actions"><StatusLamp state={planNeedsApproval || planStateMissing ? "working" : "ready"} label={planNeedsApproval ? "waiting for approval" : planStateMissing ? "not loaded" : activePlan?.status || "ready"} />{activePlan && <button type="button" className={`plan-collapse-toggle ${planCollapsed ? "is-collapsed" : ""}`} onClick={() => setPlanCollapsed((value) => !value)} aria-expanded={!planCollapsed} aria-controls="hemlock-plan-body"><Icon name="chevron" size={14} /> <span>{planCollapsed ? "Expand plan" : "Collapse plan"}</span></button>}</div></div>{activePlan ? <><div id="hemlock-plan-body" className="chat-plan-scroll" hidden={planCollapsed}><div className="chat-plan-meta"><span>HOST-PREPARED CAPABILITY BOUNDARY</span><small>{activePlan.steps?.length || 0} steps · no source mutation has run</small></div><p className="chat-plan-rationale">{displayText(activePlan.rationale, "Hemlock prepared this bounded plan from the request.")}</p><ol className="chat-plan-steps">{(activePlan.steps || []).map((step) => <li key={`${activePlan.id}-${step.step}`} className={step.status === "ready" ? "is-ready" : ""}><span>{step.step}</span><div><strong>{displayText(step.label || step.commandId || step.kind)}</strong><small>{displayText(step.expectedEvidence?.join?.(" · ") || "Host receipt after this step")}</small></div></li>)}</ol><p className="chat-plan-boundary"><strong>{planNeedsApproval ? "Maple has not run yet." : planIsApproved ? "Maple is free to choose the next useful action inside this approved boundary." : "The host has not claimed work outside this plan."}</strong> Safeguards still own scope, approvals, verification, and completion.</p></div>{planNeedsApproval && <div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })} disabled={commandBusy === "plan.approve"}><Icon name="check" size={14} /> {commandBusy === "plan.approve" ? "Approving…" : "Approve plan"}</button><button type="button" className="quiet-action" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Chat" })} disabled={Boolean(commandBusy)}>Reject</button></div>}</> : <><p className="chat-plan-rationale">{evidenceSummary}</p><div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void refreshAgentState()} disabled={commandBusy === "agent.state"}><Icon name="refresh" size={14} /> {commandBusy === "agent.state" ? "Refreshing…" : "Refresh task state"}</button></div></>}</section>;
-    const chatStatusBar = <div className="chat-status-bar" aria-label="Chat status"><StatusLamp state={task.status === "running" || liveStreams.length ? "working" : task.status === "blocked" ? "down" : "ready"} label={task.status === "running" ? "WORKING" : displayText(task.status, "READY")} /><span>{messages.length ? `${messages.at(-1)?.role === "user" ? "You" : MODEL_LANES[messages.at(-1)?.provider || modelSelection.provider]?.shortLabel || "MODEL"} ${displayText(messages.at(-1)?.time, formatTime())}` : "Ready"}</span><span>{selectedLane.label} (live) · {liveStreamRate}</span><span>Hemlock Local · Electron Runtime</span></div>;
-    return <div className="chat-surface">{renderThreadBar()}<div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary className="chat-context-summary"><span className="chat-context-label">{interactionMode === "build" ? "BUILD CONTEXT" : "CONVERSATION CONTEXT"}</span><span>{objectiveSummary}</span></summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={modelActivity} /></div>{renderSuggestionCards()}{(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" onClick={() => void desktopAgent()?.cancelQueued?.(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}</div>}
+    const planCard = (activePlan || planStateMissing || task.status === "waiting_for_approval") && <section className={`chat-plan-card ${planNeedsApproval || planStateMissing ? "is-awaiting" : "is-approved"} ${planCollapsed ? "is-collapsed" : ""}`} aria-label="Plan and approval"><div className="chat-plan-heading"><div><span className="card-kicker">PLAN / APPROVAL</span><strong title="Bounded: the agent may only run the limited steps listed here — each step is approved by you before anything executes.">{planNeedsApproval ? "Review before Maple starts" : planStateMissing ? "Plan state needs refresh" : "Bounded plan"}</strong></div><div className="chat-plan-heading-actions"><StatusLamp state={planNeedsApproval || planStateMissing ? "working" : "ready"} label={planNeedsApproval ? "waiting for approval" : planStateMissing ? "not loaded" : activePlan?.status || "ready"} />{activePlan && <button type="button" className={`plan-collapse-toggle ${planCollapsed ? "is-collapsed" : ""}`} onClick={() => setPlanCollapsed((value) => !value)} aria-expanded={!planCollapsed} aria-controls="hemlock-plan-body"><Icon name="chevron" size={14} /> <span>{planCollapsed ? "Expand plan" : "Collapse plan"}</span></button>}</div></div>{activePlan ? <><div id="hemlock-plan-body" className="chat-plan-scroll" hidden={planCollapsed}><div className="chat-plan-meta"><span title="Bounded: only these allowlisted, host-prepared steps can run — no source mutation outside them.">HOST-PREPARED CAPABILITY BOUNDARY</span><small>{activePlan.steps?.length || 0} steps · no source mutation has run</small></div><p className="chat-plan-rationale">{displayText(activePlan.rationale, "Hemlock prepared this bounded plan from the request.")}</p><ol className="chat-plan-steps">{(activePlan.steps || []).map((step) => <li key={`${activePlan.id}-${step.step}`} className={step.status === "ready" ? "is-ready" : ""}><span>{step.step}</span><div><strong>{displayText(step.label || step.commandId || step.kind)}</strong><small>{displayText(step.expectedEvidence?.join?.(" · ") || "Host receipt after this step")}</small></div></li>)}</ol><p className="chat-plan-boundary"><strong>{planNeedsApproval ? "Maple has not run yet." : planIsApproved ? "Maple is free to choose the next useful action inside this approved boundary." : "The host has not claimed work outside this plan."}</strong> Safeguards still own scope, approvals, verification, and completion.</p></div>{planNeedsApproval && <div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })} disabled={commandBusy === "plan.approve"}><Icon name="check" size={14} /> {commandBusy === "plan.approve" ? "Approving…" : "Approve plan"}</button><button type="button" className="quiet-action" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Chat" })} disabled={Boolean(commandBusy)}>Reject</button></div>}</> : <><p className="chat-plan-rationale">{evidenceSummary}</p><div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void refreshAgentState()} disabled={commandBusy === "agent.state"}><Icon name="refresh" size={14} /> {commandBusy === "agent.state" ? "Refreshing…" : "Refresh task state"}</button></div></>}</section>;
+    const chatStatusBar = <div className="chat-status-bar" aria-label="Chat status"><StatusLamp state={task.status === "running" || liveStreams.length ? "working" : task.status === "blocked" ? "down" : "ready"} label={task.status === "running" ? "WORKING" : displayText(task.status, "READY")} /><span>{messages.length ? `${messages.at(-1)?.role === "user" ? "You" : MODEL_LANES[messages.at(-1)?.provider || modelSelection.provider]?.shortLabel || "MODEL"} ${displayText(messages.at(-1)?.time, formatTime())}` : "Ready"}</span><span>{liveStreams.length ? `${selectedLane.label} (live) · ${liveStreamRate}` : (() => { const lastAssistant = [...messages].reverse().find((item) => item.role === "assistant" && item.telemetry?.completionTokens != null); return lastAssistant ? `${selectedLane.label} · ${lastAssistant.telemetry.completionTokens} tokens last reply` : selectedLane.label; })()}</span><span>Hemlock Local · Electron Runtime</span></div>;
+    return <div className="chat-surface">{renderThreadBar()}{error && <div className="runtime-alert chat-error" role="alert"><Icon name="activity" size={15} /><span>{cleanErrorText(error)}</span><button type="button" className="error-dismiss" onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}<div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary className="chat-context-summary"><span className="chat-context-label">{interactionMode === "build" ? "BUILD CONTEXT" : "CONVERSATION CONTEXT"}</span><span>{objectiveSummary}</span></summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={modelActivity} /></div>{renderSuggestionCards()}{(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" onClick={() => void desktopAgent()?.cancelQueued?.(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}</div>}
       {planCard}
       <div className="chat-scroll">
-      {liveStreams.length > 0 && <section className="chat-live-stream" aria-label="Live model stream" aria-live="polite"><div className="chat-live-stream-heading"><div><span className="card-kicker">LIVE MODEL STREAM</span><strong>{MODEL_LANES[liveStream?.provider || modelSelection.provider]?.label || "Maple-Preview"} is working</strong></div><small>{Math.round((liveStream?.text || "").length)} chars · {liveStreamRate} · {displayText(liveStream?.status, "streaming")}</small></div>{liveStreams.slice(-1).map((stream) => <div className="chat-live-stream-body" key={stream.streamId}>{Object.entries(stream.channels || {}).filter(([, text]) => text).map(([channel, text]) => <div className="chat-live-channel" key={`${stream.streamId}-${channel}`}><span>{displayText(channel, "content")}</span><pre>{text}</pre></div>)}</div>)}</section>}
+      {!primerDismissed && <PrimerCard onDismiss={dismissPrimer} />}
+      {liveStreams.length > 0 && <section className="chat-live-stream" aria-label="Live model stream" aria-live="polite"><div className="chat-live-stream-heading"><div><span className="card-kicker">LIVE MODEL STREAM</span><strong>{channelProviderName(liveStream?.provider || modelSelection.provider)} is working</strong></div><small>{Math.round((liveStream?.text || "").length)} chars{liveStreamRate !== "tok/s —" ? ` · ${liveStreamRate}` : ""} · {displayText(liveStream?.status, "streaming")}</small></div>{liveStreams.slice(-1).map((stream) => <div className="chat-live-stream-body" key={stream.streamId}>{Object.entries(stream.channels || {}).filter(([, text]) => text).map(([channel, text]) => <div className="chat-live-channel" key={`${stream.streamId}-${channel}`}><span>{displayText(channel, "content")}</span><pre>{text}</pre></div>)}</div>)}</section>}
       {!messages.length && !workNotes.length && <div className="empty-work"><span className="empty-symbol"><Icon name="leaf" size={26} /></span><h3>Start with {MODEL_LANES[modelSelection.provider].label}</h3><p>Conversation comes first. Exact model channels, live actions, and evidence will appear here as the task develops.</p></div>}
-      {messages.map((message) => { const messageProvider = message.provider || message.channels?.[0]?.source || "maple"; const messageProviderName = channelProviderName(messageProvider); return <article className={`work-message ${message.role}`} key={message.id}><div className="message-meta"><span>{displayText(message.role === "user" ? "YOU" : messageProviderName.toUpperCase())}{message.streaming ? " · LIVE" : ""}</span><time>{displayText(message.time)}</time></div>{message.role === "assistant" ? <section className="maple-output-card" aria-label={`${messageProviderName} emitted response`}><div className="card-kicker"><span>{messageProviderName.toUpperCase()} OUTPUT</span><small>{message.displayMode || "model-verbatim"}</small></div>{renderChannels(message)}</section> : <div className="message-content">{displayText(message.content)}</div>}{message.telemetry && <details className="host-telemetry" open={message.role === "assistant"}><summary>Host telemetry</summary><p>{message.telemetry.provider ? `${message.telemetry.provider} · ${message.telemetry.reasoning || "native"} · ` : ""}{message.telemetry.elapsedMs != null ? `${Math.round(message.telemetry.elapsedMs / 100) / 10}s` : "timing unavailable"}{message.telemetry.completionTokens != null ? ` · ${message.telemetry.completionTokens} output tokens` : ""} · {formatTokensPerSecond(message.telemetry, message.telemetry.elapsedMs)}{message.telemetry.finishReason ? ` · stop: ${message.telemetry.finishReason}` : ""}{message.telemetry.outputDigest ? ` · ${displayText(message.telemetry.outputDigest)}` : ""}{message.telemetry.streamId ? ` · stream ${displayText(message.telemetry.streamId)}` : ""}{message.telemetry.bufferedFallback ? " · buffered fallback" : message.telemetry.streaming ? " · SSE stream" : ""}{message.rawOutputRef ? ` · raw ${displayText(message.rawOutputRef)}` : ""}</p></details>}</article>; })}
-      {isThinking && <div className="live-note"><span className="pulse" /> Host is waiting for {selectedLane.label} response <span>···</span></div>}
+      {messages.map((message, messageIndex) => { const messageProvider = message.provider || message.channels?.[0]?.source || "maple"; const messageProviderName = channelProviderName(messageProvider); const messageText = message.content || (message.channels || []).find((channel) => channel.name === "content")?.text || ""; return <article className={`work-message ${message.role}`} key={message.id}><div className="message-meta"><span>{displayText(message.role === "user" ? "YOU" : messageProviderName.toUpperCase())}{message.streaming ? " · LIVE" : ""}</span><time>{displayText(message.time)}</time><span className="message-actions"><button type="button" title="Copy message (Option-click to include provenance)" aria-label="Copy message (Option-click to include provenance)" onClick={(event) => { const text = message.content || (message.channels || []).find((channel) => channel.name === "content")?.text || ""; if (!text.trim()) return; if (event.altKey) { const provenance = `[${(message.provider || "maple").toUpperCase()} · ${displayText(message.time, "")}${message.rawOutputRef ? ` · ${message.rawOutputRef}` : ""}]\n\n`; navigator.clipboard?.writeText(provenance + text.trim()); } else { navigator.clipboard?.writeText(text.trim()); } }}>copy</button><button type="button" title={`Ask again · resends this message${messageIndex < messages.length - 1 ? " as the newest prompt" : ""}`} aria-label={`Ask again, resend this message`} onClick={() => retryLastMessage(message)} disabled={isThinking}>retry</button></span></div>{message.role === "assistant" ? <section className="maple-output-card" aria-label={`${messageProviderName} emitted response`}><div className="card-kicker"><span>{messageProviderName.toUpperCase()} OUTPUT</span><small title="Verbatim: this is the model’s exact output — Hemlock never paraphrases or edits what the model said.">{message.displayMode || "model-verbatim"}</small></div>{renderChannels(message)}</section> : <div className="message-content">{displayText(message.content)}</div>}{message.telemetry && <details className="host-telemetry" open={message.role === "assistant"}><summary>Host telemetry</summary><p>{message.telemetry.provider ? `${message.telemetry.provider} · ${message.telemetry.reasoning || "native"} · ` : ""}{message.telemetry.elapsedMs != null ? `${Math.round(message.telemetry.elapsedMs / 100) / 10}s` : "timing unavailable"}{message.telemetry.completionTokens != null ? ` · ${message.telemetry.completionTokens} output tokens` : ""} · {formatTokensPerSecond(message.telemetry, message.telemetry.elapsedMs)}{message.telemetry.finishReason ? ` · stop: ${message.telemetry.finishReason}` : ""}{message.telemetry.outputDigest ? ` · ${displayText(message.telemetry.outputDigest)}` : ""}{message.telemetry.streamId ? ` · stream ${displayText(message.telemetry.streamId)}` : ""}{message.telemetry.bufferedFallback ? " · buffered fallback" : message.telemetry.streaming ? " · SSE stream" : ""}{message.rawOutputRef ? ` · raw ${displayText(message.rawOutputRef)}` : ""}</p></details>}</article>; })}
+      {!chatPinned && (isThinking || liveStreams.length > 0) && <button type="button" className="chat-jump-latest" onClick={jumpToLatest}><Icon name="chevron" size={12} /> New activity</button>}
+      {serverDownWhileWaiting ? <div className="live-note is-stalled"><span className="pulse" /> The local model server is not responding. Open Settings → Check local readiness, or restart Hemlock.</div> : isThinking && (() => { const liveFrame = liveStreams.at(-1) || null; const reasoningText = liveFrame?.channels?.reasoning || liveFrame?.channels?.reasoning_content || ""; const contentText = liveFrame?.channels?.content || ""; const reasoningTokens = reasoningText ? Math.round(reasoningText.length / 4) : 0; const phase = contentText ? "writing the answer" : reasoningTokens > 0 ? "thinking" : serverHealthProbe === null ? "loading model weights" : "warming up"; return <div className="live-note live-note-thinking"><span className="pulse" /> {selectedLane.label} is {phase}{serverHealthProbe === null && phase === "loading model weights" ? " — first load can take a moment" : ""}{thinkingElapsed != null ? <span className="thinking-timer">{thinkingElapsed < 60 ? `${thinkingElapsed}s` : `${Math.floor(thinkingElapsed / 60)}m ${thinkingElapsed % 60}s`}</span> : null}{reasoningTokens > 0 && !contentText ? <span className="thinking-reasoning-chars">{reasoningTokens} tokens reasoned</span> : null}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></div>; })()}
       <div ref={endRef} />
-      </div><aside className="chat-work-rail" aria-label="Hemlock work rail">{hostActivity}{planCard}{evidenceRail}<div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode"><span className="interaction-mode-label">WORK MODE</span><button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button><button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")}><Icon name="artifact" size={13} /> Build</button><small>{interactionMode === "build" ? "Build mode: one plan approval, then scratch-artifact autopilot." : "Explore mode: conversation stays conversational until you hand off to Build."}</small></div><form className="chat-compose" onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : "Continue the conversation or task…"} rows="2" aria-label="Continue Hemlock task" disabled={isDreaming} /><button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button></form></aside>{chatStatusBar}</div>;
+      </div><aside className="chat-work-rail" aria-label="Hemlock work rail">{hostActivity}{evidenceRail}<div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode"><span className="interaction-mode-label">WORK MODE</span><button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button><button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")}><Icon name="artifact" size={13} /> Build</button><small>{interactionMode === "build" ? "Build mode: one plan approval, then scratch-artifact autopilot." : "Explore mode: conversation stays conversational until you hand off to Build."}</small></div><div className="composer-model-line">{composerModelLine}</div><form className="chat-compose" onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : "Continue the conversation or task…"} rows="2" aria-label="Continue Hemlock task" disabled={isDreaming} /><button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button></form></aside>{chatStatusBar}</div>;
   }
 
   function renderSips() {
     const selfloop = sipsStatus?.selfloop || { status: "idle" };
-    return <div className="sips-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="sips" size={13} /> LOCAL CONTROL ROOM</span><h2>SIPS / self-improvement</h2></div><StatusLamp state={selfloop.status === "active" ? "working" : "ready"} label={selfloop.status} /></div><p className="surface-copy">A bounded loop for inspect, recall, verify, Dream, compare, and remember. Every consequential state stays attached to a receipt.</p><div className="sips-metrics"><Metric value={sipsStatus?.records ?? "—"} label="lessons" /><Metric value={sipsStatus?.datasetRows ?? "—"} label="data rows" tone="gold" /><Metric value={sipsStatus?.cycleCount ?? "—"} label="cycles" tone="violet" /></div><section className="surface-section"><SectionTitle icon="command" right="allowlisted">Commands</SectionTitle><div className="inline-search"><input value={sipsRecallQuery} onChange={(event) => setSipsRecallQuery(event.target.value)} placeholder="Recall a project lesson…" aria-label="Recall project lesson" /><button onClick={() => void runCommand("recall", { query: sipsRecallQuery })} aria-label="Recall lesson"><Icon name="search" size={15} /></button></div><div className="quick-command-grid"><button onClick={() => void refreshSips()} disabled={Boolean(commandBusy)}><Icon name="activity" size={13} /> Status</button><button onClick={() => void runCommand("repo-map")} disabled={Boolean(commandBusy)}><Icon name="map" size={13} /> Map</button><button onClick={() => void runCommand("verify", { profile: sipsVerifyProfile })} disabled={Boolean(commandBusy)}><Icon name="receipt" size={13} /> Verify</button><button onClick={() => openWindow("receipts")}><Icon name="receipt" size={13} /> Receipts</button></div></section><section className="surface-section cycle-section"><SectionTitle icon="dream" right={sipsCycleState}>{sipsObjective}</SectionTitle><textarea className="setting-control" value={sipsObjective} onChange={(event) => setSipsObjective(event.target.value)} rows="2" disabled={sipsCycleState === "running"} aria-label="SIPS objective" /><div className="split-controls"><label>Verify<select value={sipsVerifyProfile} onChange={(event) => setSipsVerifyProfile(event.target.value)}><option value="app-build">UI build</option><option value="diff-check">Git diff</option><option value="python-tests">MLX tests</option></select></label><label>Dream<select value={sipsTrainingProfile} onChange={(event) => setSipsTrainingProfile(event.target.value)}><option value="smoke">Smoke</option><option value="balanced">Balanced</option><option value="quality">Quality</option></select></label></div><div className="cycle-strip"><span className="done">BASE</span><span className={sipsCycleState === "running" ? "active" : ""}>DATA</span><span className={sipsStage.toLowerCase().includes("dream") ? "active" : ""}>DREAM</span><span className={sipsStage.toLowerCase().includes("verify") ? "active" : ""}>VERIFY</span></div><div className="progress-bar"><span style={{ width: `${sipsCycleState === "running" ? sipsProgress : sipsReceipt ? 100 : 0}%` }} /></div><p className="stage-copy">{sipsStage}{sipsLog ? ` · ${sipsLog}` : ""}</p><button className="wide-action" onClick={() => void runSipsCycle()} disabled={sipsCycleState === "running" || isDreaming}>{sipsCycleState === "running" ? "Cycle running…" : "Run one bounded cycle"}</button></section><section className="surface-section loop-section"><SectionTitle icon="play" right={selfloop.status}>Persistent focus</SectionTitle><p className="surface-copy">{selfloop.focus || sipsObjective}</p><div className="loop-actions"><button onClick={() => void runSelfloop("start")} disabled={selfloop.status === "active"}><Icon name="play" size={13} /> Start</button><button onClick={() => void runSelfloop("pause")} disabled={selfloop.status !== "active"}><Icon name="pause" size={13} /> Pause</button><button onClick={() => void runSelfloop("resume")} disabled={selfloop.status !== "paused"}>Resume</button><button onClick={() => void runSelfloop("complete")} disabled={!(["active", "paused"].includes(selfloop.status))}>Complete</button></div></section>{sipsError && <div className="runtime-alert"><Icon name="activity" size={15} />{sipsError}</div>}</div>;
+    return <div className="sips-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="sips" size={13} /> LOCAL CONTROL ROOM</span><h2>SIPS / self-improvement</h2></div><StatusLamp state={selfloop.status === "active" ? "working" : "ready"} label={selfloop.status} /></div><p className="surface-copy" title="Bounded: this loop runs a fixed, allowlisted set of steps and stops for review — never unbounded autonomous action.">A bounded loop for inspect, recall, verify, Dream, compare, and remember. Every consequential state stays attached to a receipt.</p><div className="sips-metrics"><Metric value={sipsStatus?.records ?? "—"} label="lessons" /><Metric value={sipsStatus?.datasetRows ?? "—"} label="data rows" tone="gold" /><Metric value={sipsStatus?.cycleCount ?? "—"} label="cycles" tone="violet" /></div><section className="surface-section"><SectionTitle icon="command" right="allowlisted">Commands</SectionTitle><div className="inline-search"><input value={sipsRecallQuery} onChange={(event) => setSipsRecallQuery(event.target.value)} placeholder="Recall a project lesson…" aria-label="Recall project lesson" /><button onClick={() => void runCommand("recall", { query: sipsRecallQuery })} aria-label="Recall lesson"><Icon name="search" size={15} /></button></div><div className="quick-command-grid"><button onClick={() => void refreshSips()} disabled={Boolean(commandBusy)}><Icon name="activity" size={13} /> Status</button><button onClick={() => void runCommand("repo-map")} disabled={Boolean(commandBusy)}><Icon name="map" size={13} /> Map</button><button onClick={() => void runCommand("verify", { profile: sipsVerifyProfile })} disabled={Boolean(commandBusy)}><Icon name="receipt" size={13} /> Verify</button><button onClick={() => openWindow("receipts")}><Icon name="receipt" size={13} /> Receipts</button></div></section><section className="surface-section cycle-section"><SectionTitle icon="dream" right={sipsCycleState}>{sipsObjective}</SectionTitle><textarea className="setting-control" value={sipsObjective} onChange={(event) => setSipsObjective(event.target.value)} rows="2" disabled={sipsCycleState === "running"} aria-label="SIPS objective" /><div className="split-controls"><label>Verify<select value={sipsVerifyProfile} onChange={(event) => setSipsVerifyProfile(event.target.value)}><option value="app-build">UI build</option><option value="diff-check">Git diff</option><option value="python-tests">MLX tests</option></select></label><label>Dream<select value={sipsTrainingProfile} onChange={(event) => setSipsTrainingProfile(event.target.value)}><option value="smoke">Smoke</option><option value="balanced">Balanced</option><option value="quality">Quality</option></select></label></div><div className="cycle-strip"><span className="done">BASE</span><span className={sipsCycleState === "running" ? "active" : ""}>DATA</span><span className={sipsStage.toLowerCase().includes("dream") ? "active" : ""}>DREAM</span><span className={sipsStage.toLowerCase().includes("verify") ? "active" : ""}>VERIFY</span></div><div className="progress-bar"><span style={{ transform: `scaleX(${(sipsCycleState === "running" ? sipsProgress : sipsReceipt ? 100 : 0) / 100})` }} /></div><p className="stage-copy">{sipsStage}{sipsLog ? ` · ${sipsLog}` : ""}</p><button className="wide-action" onClick={() => void runSipsCycle()} disabled={sipsCycleState === "running" || isDreaming}>{sipsCycleState === "running" ? "Cycle running…" : "Run one bounded cycle"}</button></section><section className="surface-section loop-section"><SectionTitle icon="play" right={selfloop.status}>Persistent focus</SectionTitle><p className="surface-copy">{selfloop.focus || sipsObjective}</p><div className="loop-actions"><button onClick={() => void runSelfloop("start")} disabled={selfloop.status === "active"}><Icon name="play" size={13} /> Start</button><button onClick={() => void runSelfloop("pause")} disabled={selfloop.status !== "active"}><Icon name="pause" size={13} /> Pause</button><button onClick={() => void runSelfloop("resume")} disabled={selfloop.status !== "paused"}>Resume</button><button onClick={() => void runSelfloop("complete")} disabled={!(["active", "paused"].includes(selfloop.status))}>Complete</button></div></section>{sipsError && <div className="runtime-alert"><Icon name="activity" size={15} />{sipsError}</div>}</div>;
   }
 
   function renderMemory() {
@@ -1592,7 +2211,7 @@ function App() {
     const stepCount = { smoke: 1, balanced: 4, quality: 8 }[dreamTrainingProfile] || 8;
     const mapleRuntimeState = mapleLaunchState === "launching" ? "working" : serverProcessReady === true ? "ready" : serverProcessReady === false || mapleLaunchState === "failed" ? "down" : "idle";
     const mapleRuntimeLabel = mapleLaunchState === "launching" ? "starting" : serverProcessReady === true ? "running" : isDesktop ? "not running" : "desktop only";
-    return <div className="dream-surface"><div className="dream-hero"><div className="dream-moon-large"><Icon name="dream" size={36} /></div><div><span className="eyebrow">LOCAL TRAINING WINDOW</span><h2>Dream Lab</h2><p>{isDreaming ? dreamStage : dreamReceipt ? "Candidate adapter receipt is available." : "Prepare an isolated LoRA adapter without touching the base Maple weights."}</p></div><StatusLamp state={isDreaming ? "working" : dreamReceipt ? "ready" : "idle"} label={isDreaming ? `${dreamProgress}%` : "idle"} /></div><div className="dream-progress"><div className="progress-bar"><span style={{ width: `${dreamProgress}%` }} /></div><div><span>{dreamLog || "The live heartbeat appears here during MLX work."}</span><strong>{formatElapsed(dreamElapsed)}</strong></div></div><div className="dream-runtime-launch"><div><span className="eyebrow">LOCAL RUNTIME</span><strong>Maple / Dream</strong><small>Starts the MLX server and checks HTTP health. It does not run inference or training.</small></div><StatusLamp state={mapleRuntimeState} label={mapleRuntimeLabel} /><button className="wide-action" onClick={() => void launchMapleDream()} disabled={!isDesktop || mapleLaunchState === "launching"} title={!isDesktop ? "Open the Electron desktop app to launch Maple/Dream" : "Start Maple and verify process health only"}><Icon name="play" size={15} />{mapleLaunchState === "launching" ? "Starting Maple…" : serverProcessReady === true ? "Check Maple / Dream" : "Launch Maple / Dream"}</button></div>{mapleLaunchError && <div className="runtime-alert">Maple launch failed: {mapleLaunchError}</div>}<div className="dream-chart"><div className="chart-lines"><i /><i /><i /><i /></div><svg viewBox="0 0 620 150" preserveAspectRatio="none" aria-label="Dream loss preview"><polyline points="0,110 40,88 78,102 116,66 154,82 192,54 230,75 268,61 306,72 344,47 382,63 420,50 458,58 496,42 534,52 572,44 620,50" /><polyline className="faint" points="0,126 40,113 78,124 116,92 154,103 192,84 230,98 268,87 306,95 344,76 382,90 420,80 458,87 496,72 534,82 572,75 620,80" /></svg><div className="chart-labels"><span>step 1</span><span>step {Math.max(1, Math.ceil((dreamProgress / 100) * stepCount))}</span></div></div><div className="dream-metrics"><Metric value={`${Math.round((dreamProgress / 100) * stepCount)}/${stepCount}`} label="steps" tone="gold" /><Metric value={trainingDataset?.sourceRows ?? facts.length + messages.length} label="dataset rows" /><Metric value={dreamReceipt?.baseWeightsUnchanged === true ? "safe" : "—"} label="base weights" tone="violet" /><Metric value={dreamReceipt?.inferenceReady === true ? "ready" : "—"} label="adapter" /></div><div className="dream-controls"><label>Profile<select value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)} disabled={isDreaming}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void startDream()} disabled={isDreaming || (!facts.length && !messages.length)}><Icon name="dream" size={15} />{isDreaming ? "Dreaming locally…" : "Prepare dataset + start Dream"}</button>{isDreaming && <button className="quiet-action" onClick={() => void window.mapleDesktop?.cancelAgentTask?.()}><Icon name="stop" size={13} /> Stop</button>}</div>{trainingDataset && <div className="proof-callout"><SectionTitle icon="database" right="ready">Dataset holdout</SectionTitle><span>{trainingDataset.trainingRows} train · {trainingDataset.validationRows} validation · {trainingDataset.sourceRows} source rows</span><small>The dataset is prepared before the explicit training operation; no weights changed during preparation.</small></div>}{dreamReceipt && <div className="proof-callout"><SectionTitle icon="receipt" right={dreamReceipt.baseWeightsUnchanged === true ? "verified" : "unproven"}>Latest training proof</SectionTitle><span>Profile: {dreamReceipt.profile || "—"} · rows: {dreamReceipt.dataset?.sourceRows ?? dreamReceipt.dataset?.examples ?? "—"} · holdout: {dreamReceipt.dataset?.validationHoldout === true ? "yes" : "no"}</span><small>The integrity receipt proves isolation; it does not claim a general model-quality gain.</small></div>}{recoveryNotice && <div className="runtime-alert">{recoveryNotice}</div>}</div>;
+    return <div className="dream-surface"><div className="dream-hero"><div className="dream-moon-large"><Icon name="dream" size={36} /></div><div><span className="eyebrow">LOCAL TRAINING WINDOW</span><h2>Dream Lab</h2><p>{isDreaming ? dreamStage : dreamReceipt ? "Candidate adapter receipt is available." : "Prepare an isolated LoRA adapter without touching the base Maple weights."}</p></div><StatusLamp state={isDreaming ? "working" : dreamReceipt ? "ready" : "idle"} label={isDreaming ? `${dreamProgress}%` : "idle"} /></div><div className="dream-progress"><div className="progress-bar"><span style={{ transform: `scaleX(${dreamProgress / 100})` }} /></div><div><span>{dreamLog || "The live heartbeat appears here during MLX work."}</span><strong>{formatElapsed(dreamElapsed)}</strong></div></div><div className="dream-runtime-launch"><div><span className="eyebrow">LOCAL RUNTIME</span><strong>Maple / Dream</strong><small>Starts the MLX server and checks HTTP health. It does not run inference or training.</small></div><StatusLamp state={mapleRuntimeState} label={mapleRuntimeLabel} /><button className="wide-action" onClick={() => void launchMapleDream()} disabled={!isDesktop || mapleLaunchState === "launching"} title={!isDesktop ? "Open the Electron desktop app to launch Maple/Dream" : "Start Maple and verify process health only"}><Icon name="play" size={15} />{mapleLaunchState === "launching" ? "Starting Maple…" : serverProcessReady === true ? "Check Maple / Dream" : "Launch Maple / Dream"}</button></div>{mapleLaunchError && <div className="runtime-alert">Maple launch failed: {mapleLaunchError}</div>}<div className="dream-chart"><div className="chart-lines"><i /><i /><i /><i /></div><svg viewBox="0 0 620 150" preserveAspectRatio="none" aria-label="Dream loss preview"><polyline points="0,110 40,88 78,102 116,66 154,82 192,54 230,75 268,61 306,72 344,47 382,63 420,50 458,58 496,42 534,52 572,44 620,50" /><polyline className="faint" points="0,126 40,113 78,124 116,92 154,103 192,84 230,98 268,87 306,95 344,76 382,90 420,80 458,87 496,72 534,82 572,75 620,80" /></svg><div className="chart-labels"><span>step 1</span><span>step {Math.max(1, Math.ceil((dreamProgress / 100) * stepCount))}</span></div></div><div className="dream-metrics"><Metric value={`${Math.round((dreamProgress / 100) * stepCount)}/${stepCount}`} label="steps" tone="gold" /><Metric value={trainingDataset?.sourceRows ?? facts.length + messages.length} label="dataset rows" /><Metric value={dreamReceipt?.baseWeightsUnchanged === true ? "safe" : "—"} label="base weights" tone="violet" /><Metric value={dreamReceipt?.inferenceReady === true ? "ready" : "—"} label="adapter" /></div><div className="dream-controls"><label>Profile<select value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)} disabled={isDreaming}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void startDream()} disabled={isDreaming || (!facts.length && !messages.length)}><Icon name="dream" size={15} />{isDreaming ? "Dreaming locally…" : "Prepare dataset + start Dream"}</button>{isDreaming && <button className="quiet-action" onClick={() => void window.mapleDesktop?.cancelAgentTask?.()}><Icon name="stop" size={13} /> Stop</button>}</div>{trainingDataset && <div className="proof-callout"><SectionTitle icon="database" right="ready">Dataset holdout</SectionTitle><span>{trainingDataset.trainingRows} train · {trainingDataset.validationRows} validation · {trainingDataset.sourceRows} source rows</span><small>The dataset is prepared before the explicit training operation; no weights changed during preparation.</small></div>}{dreamReceipt && <div className="proof-callout"><SectionTitle icon="receipt" right={dreamReceipt.baseWeightsUnchanged === true ? "verified" : "unproven"}>Latest training proof</SectionTitle><span>Profile: {dreamReceipt.profile || "—"} · rows: {dreamReceipt.dataset?.sourceRows ?? dreamReceipt.dataset?.examples ?? "—"} · holdout: {dreamReceipt.dataset?.validationHoldout === true ? "yes" : "no"}</span><small>The integrity receipt proves isolation; it does not claim a general model-quality gain.</small></div>}{recoveryNotice && <div className="runtime-alert">{recoveryNotice}</div>}</div>;
   }
 
   function beginArtifactPanelResize(event, axis) {
@@ -1682,31 +2301,61 @@ function App() {
       frame?.contentWindow?.postMessage({ source: "hemlock-preview", action, input }, "*");
     };
     return <div className="artifact-studio-surface">
-      <div className="artifact-toolbar"><div><span className="eyebrow"><Icon name="artifact" size={13} /> TASK-SCOPED ARTIFACT</span><h2>{artifact?.title || "Artifact Studio"}</h2></div><div className="artifact-toolbar-actions"><button type="button" className="quiet-action" onClick={() => void runArtifact("create", { artifactId: `artifact-${Date.now()}`, title: "Eastern Hemlock night garden", kind: "html", entrypoint: "index.html", mime: "text/html" })}>New artifact</button>{artifact && !artifact.revision && <button type="button" className="quiet-action" onClick={() => void runArtifact("author", { artifactId: artifact.id, kind: "html", filename: "index.html", runtimeTemplate: "html", objective: "Create an ambitious Eastern Hemlock night-garden single page", source: { "index.html": "<main data-preview-id=\"garden\"><h1>Eastern Hemlock Night Garden</h1><p>A living task-local draft.</p></main>" } })}>Author starter</button>}<span className={`artifact-status status-${artifact?.status || "drafting"}`}>{artifact?.status || "drafting"}</span><button type="button" className="quiet-action" onClick={() => setArtifactFreeze((value) => !value)}>{artifactFreeze ? "Follow live" : "Freeze"}</button><button type="button" className="quiet-action" onClick={() => setArtifactPinned((value) => !value)}>{artifactPinned ? "Unpin" : "Pin"}</button><button type="button" className="quiet-action" onClick={() => setArtifactView("diff")} disabled={!artifact?.revision}>Compare revisions</button><button type="button" className="quiet-action" onClick={() => setPreviewNotice("Evidence is the Electron artifact manifest, revision digest, and preview interaction receipts.")}>Open evidence</button><button type="button" className="quiet-action" onClick={() => setArtifactView("source")} disabled={!artifact?.revision}>Reveal source</button><button type="button" className="quiet-action" onClick={() => void runArtifact("preview.open", { artifactId: artifact?.id })} disabled={!artifact?.revision}>Open preview</button><button type="button" className="quiet-action" onClick={() => void runArtifact("preview.stop", { sessionId: previewSession?.id, reason: "agent_input_paused" })} disabled={!previewSession}>Pause agent input</button></div></div>
+      <div className="artifact-toolbar"><div><span className="eyebrow"><Icon name="artifact" size={13} /> TASK-SCOPED ARTIFACT</span><h2>{artifact?.title || "Artifact Studio"}</h2></div><div className="artifact-toolbar-actions"><button type="button" className="quiet-action" onClick={() => void runArtifact("create", { artifactId: `artifact-${Date.now()}`, title: `Task artifact · ${new Date().toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`, kind: "html", entrypoint: "index.html", mime: "text/html" })}>New artifact</button>{artifact && !artifact.revision && <button type="button" className="quiet-action" onClick={() => void runArtifact("author", { artifactId: artifact.id, kind: "html", filename: "index.html", runtimeTemplate: "html", objective: "Create an ambitious Eastern Hemlock night-garden single page", source: { "index.html": "<main data-preview-id=\"garden\"><h1>Eastern Hemlock Night Garden</h1><p>A living task-local draft.</p></main>" } })}>Author starter</button>}<span className={`artifact-status status-${artifact?.status || "drafting"}`}>{artifact?.status || "drafting"}</span><button type="button" className="quiet-action" onClick={() => setArtifactFreeze((value) => !value)}>{artifactFreeze ? "Follow live" : "Freeze"}</button><button type="button" className="quiet-action" onClick={() => setArtifactPinned((value) => !value)}>{artifactPinned ? "Unpin" : "Pin"}</button><button type="button" className="quiet-action" onClick={() => setArtifactView("diff")} disabled={!artifact?.revision}>Compare revisions</button><details className="artifact-more-menu"><summary className="quiet-action">More <Icon name="chevron" size={12} /></summary><div className="artifact-more-panel" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}><button type="button" onClick={() => { setPreviewNotice("Evidence is the Electron artifact manifest, revision digest, and preview interaction receipts."); }}>Open evidence</button><button type="button" onClick={() => { setArtifactView("source"); }} disabled={!artifact?.revision}>Reveal source</button><button type="button" onClick={() => { void runArtifact("preview.open", { artifactId: artifact?.id }); }} disabled={!artifact?.revision}>Open preview</button><button type="button" onClick={() => { void runArtifact("preview.stop", { sessionId: previewSession?.id, reason: "agent_input_paused" }); }} disabled={!previewSession}>Pause agent input</button></div></details></div></div>
+      <div className="artifact-quick-asks">{["Add a dark mode toggle", "Polish spacing and typography", "Make it responsive on mobile"].map((ask) => <button key={ask} type="button" disabled={!artifact || artifactReviseBusy || isThinking} onClick={() => void reviseArtifactWithMaple(ask)}>{ask}</button>)}</div>
+      <form className="artifact-revise-bar" onSubmit={(event) => { event.preventDefault(); void reviseArtifactWithMaple(artifactReviseDraft); }}>
+        <Icon name="artifact" size={14} />
+        <input value={artifactReviseDraft} onChange={(event) => setArtifactReviseDraft(event.target.value)} placeholder={artifact ? "Tell Maple what to change in this artifact…" : "Create an artifact first, then direct Maple here."} aria-label="Artifact revision instruction for Maple" disabled={!artifact || artifactReviseBusy || isThinking} />
+        {artifactReviseBusy ? <span className="artifact-revise-status"><span className="pulse" /> Maple is revising…</span> : <button className="primary-action" type="submit" disabled={!artifactReviseDraft.trim() || !artifact || isThinking}>Revise with Maple</button>}
+        {artifact?.revision ? <small>r{artifact.revision} · {artifact.status}</small> : null}
+      </form>
       {previewNotice && <div className="artifact-notice" role="status">{previewNotice}</div>}
-      <div className="artifact-revisions"><span>Revision</span>{revisionOptions.map((revision) => <button key={revision.id} type="button" className={revision.revision === artifact?.revision ? "is-selected" : ""} onClick={() => setPreviewNotice(`Revision r${revision.revision} · ${revision.digest}`)}>r{revision.revision}</button>)}<span className="artifact-layout-hint">Drag dividers · use arrows · scroll for all panels</span>{artifact?.digest && <small className="artifact-digest">{artifact.digest}</small>}</div>
+      <div className="artifact-revisions"><span>Revision</span>{revisionOptions.map((revision) => <button key={revision.id} type="button" className={revision.revision === artifact?.revision ? "is-selected" : ""} title={revision.revision === artifact?.revision ? `Current · ${revision.digest}` : `Restore r${revision.revision}`} onClick={() => { if (revision.revision === artifact?.revision) { setPreviewNotice(`Current revision r${revision.revision} · ${revision.digest}`); return; } void confirmDialog({ title: `Restore revision r${revision.revision}?`, body: "The current source will be replaced by this revision.", confirmLabel: "Restore revision", tone: "danger" }).then((confirmed) => { if (confirmed) void runArtifact("restore", { artifactId: artifact.id, revision: revision.revision }); }); }}>r{revision.revision}</button>)}<span className="artifact-layout-hint">Drag dividers · use arrows · scroll for all panels</span>{artifact?.digest && <small className="artifact-digest">{artifact.digest}</small>}</div>
       <div className="artifact-tabs" role="tablist" aria-label="Artifact Studio panes">{["source", "diff", "preview", "output", "inspect"].map((tab) => <button key={tab} type="button" role="tab" aria-selected={artifactView === tab} className={artifactView === tab ? "is-selected" : ""} onClick={() => setArtifactView(tab)}>{tab === "source" ? "Source" : tab[0].toUpperCase() + tab.slice(1)}</button>)}</div>
       <div className={`artifact-workspace ${artifactFocusPreview ? "is-preview-focused" : ""}`} style={{ "--artifact-source-fr": `${artifactLayout.source}fr`, "--artifact-diff-fr": `${artifactLayout.diff}fr`, "--artifact-preview-fr": `${artifactLayout.preview}fr`, "--artifact-evidence-row": `${artifactLayout.evidence}px` }}>
         <section className={`artifact-pane artifact-source-pane ${artifactView === "source" ? "is-visible" : ""}`}><div className="pane-heading"><span>Source</span><button type="button" onClick={() => void runArtifact("artifact.inspect", { artifactId: artifact?.id })}>Reveal source</button></div><pre>{sourceText}</pre></section>
-        <section className={`artifact-pane artifact-diff-pane ${artifactView === "diff" ? "is-visible" : ""}`}><div className="pane-heading"><span>Diff</span><button type="button" onClick={() => void runArtifact("compare", { artifactId: artifact?.id, from: Math.max(1, (artifact?.revision || 1) - 1), to: artifact?.revision })}>Compare revisions</button></div><p>{artifact?.revision > 1 ? "Select Compare revisions to request a durable source diff." : "The first complete revision has no parent diff."}</p></section>
+        <section className={`artifact-pane artifact-diff-pane ${artifactView === "diff" ? "is-visible" : ""}`}><div className="pane-heading"><span>Diff{artifactCompare ? ` · r${artifactCompare.from} → r${artifactCompare.to}` : ""}</span><button type="button" onClick={async () => { if (!artifact?.revision || artifact.revision < 2) return; const result = await runArtifact("compare", { artifactId: artifact.id, from: artifact.revision - 1, to: artifact.revision }); if (result?.files) setArtifactCompare(result); }}>Compare revisions</button></div>{artifactCompare ? <div className="artifact-diff-result">{artifactCompare.files.map((file) => <details key={file.file} open={file.before !== file.after}><summary>{file.file}{file.before === file.after ? " · unchanged" : " · changed"}</summary>{(() => { const beforeLines = String(file.before ?? "").split("\n"); const afterLines = String(file.after ?? "").split("\n"); const maxLen = Math.max(beforeLines.length, afterLines.length); return <div className="diff-lines">{Array.from({ length: maxLen }, (_, index) => { const before = beforeLines[index] ?? ""; const after = afterLines[index] ?? ""; if (before === after) return <div className="diff-line is-same" key={index}><span> </span><code>{before}</code></div>; return <React.Fragment key={index}>{before && <div className="diff-line is-removed"><span>-</span><code>{before}</code></div>}{after && <div className="diff-line is-added"><span>+</span><code>{after}</code></div>}</React.Fragment>; })}</div>; })()}</details>)}</div> : <p>{artifact?.revision > 1 ? "Click Compare revisions to diff the last two revisions inline." : "The first complete revision has no parent diff."}</p>}</section>
         <section className={`artifact-pane artifact-preview-pane ${artifactView === "preview" ? "is-visible" : ""}`}><div className="pane-heading"><span>Live Preview <small>{isDesktop ? "Electron sandbox" : "Browser visual preview · non-runtime"}</small></span><div className="preview-pane-actions"><button type="button" onClick={() => previewCommand("inspect")}>Inspect</button><button type="button" onClick={() => previewCommand("accessibility")}>A11y</button><button type="button" className="preview-focus-action" onClick={() => setArtifactFocusPreview((value) => !value)}>{artifactFocusPreview ? "Workspace" : "Focus preview"}</button></div></div>{artifact?.revision ? <iframe className="artifact-preview-frame" title="Isolated artifact preview" sandbox="allow-scripts allow-forms" referrerPolicy="no-referrer" srcDoc={previewSrc} /> : <div className="artifact-empty"><Icon name="artifact" size={22} /><strong>The first renderable revision will peek here.</strong><span>Authoring stays scoped to this task and never writes repository source.</span></div>}</section>
-        <section className={`artifact-pane artifact-output-pane ${artifactView === "output" ? "is-visible" : ""}`}><div className="pane-heading"><span>Output / Console</span><button type="button" onClick={() => setPreviewNotice("Console is sourced from preview harness messages and host receipts.")}>Open evidence</button></div><pre>{previewInspection ? JSON.stringify(previewInspection, null, 2) : "No preview console output yet."}</pre></section>
-        <section className={`artifact-pane artifact-inspect-pane ${artifactView === "inspect" ? "is-visible" : ""}`}><div className="pane-heading"><span>Inspection</span><button type="button" onClick={() => previewCommand("wait", { ms: 250 })}>Wait 250ms</button></div><pre>{previewInspection ? JSON.stringify(previewInspection, null, 2) : "Inspection follows the latest registered preview command."}</pre></section>
+        <section className={`artifact-pane artifact-output-pane ${artifactView === "output" ? "is-visible" : ""}`}><div className="pane-heading"><span>Output / Console{previewConsoleLines.length ? ` · ${previewConsoleLines.length}` : ""}</span><button type="button" onClick={() => setPreviewConsoleLines([])} disabled={!previewConsoleLines.length}>Clear</button></div>{previewConsoleLines.length ? <div className="console-lines">{previewConsoleLines.map((line, index) => <div key={index} className={`console-line console-${line.level}`}><time>{line.time}</time><span className="console-level">{line.level}</span><code>{line.message}</code></div>)}</div> : <p className="empty-copy">Console output from the live preview appears here — logs, warnings, and errors.</p>}{previewInspection && <details className="artifact-inspection-dump"><summary>Last inspection payload</summary><pre>{JSON.stringify(previewInspection, null, 2)}</pre></details>}</section>
+        <section className={`artifact-pane artifact-inspect-pane ${artifactView === "inspect" ? "is-visible" : ""}`}>
+          <div className="pane-heading"><span>Inspection</span><div className="preview-pane-actions"><button type="button" onClick={() => previewCommand("inspect")}>Inspect DOM</button><button type="button" onClick={() => previewCommand("accessibility")}>A11y tree</button><button type="button" onClick={() => previewCommand("wait", { ms: 250 })}>Wait 250ms</button></div></div>
+          {(() => {
+            const dom = previewInspection?.dom || null;
+            const a11y = previewInspection?.landmarks ? previewInspection : (previewInspection?.accessibility || null);
+            if (!dom && !a11y) return <p className="empty-copy">Run "Inspect DOM" or "A11y tree" to capture a structured snapshot of the live preview. The snapshot also feeds the host verification report.</p>;
+            return <div className="inspection-report">
+              {dom && <>
+                <div className="inspection-block"><strong>Document</strong><span>{dom.title || "untitled"} · {dom.elements?.length || 0} elements · {(dom.bodyText || "").length} chars of text</span></div>
+                {dom.elements?.length ? <div className="inspection-list">{dom.elements.filter((el) => el.text || el.previewId || el.id).slice(0, 40).map((el, index) => <div className="inspection-row" key={index}><span className="inspection-tag">{el.tag}</span>{el.previewId && <code>#{el.previewId}</code>}{el.id && !el.previewId && <code>#{el.id}</code>}{el.role && <em role="badge">{el.role}</em>}<small>{(el.text || "").slice(0, 90) || "—"}</small></div>)}</div> : null}
+              </>}
+              {a11y?.landmarks && <>
+                <div className="inspection-block"><strong>Landmarks</strong><span>{a11y.landmarks.length} regions</span></div>
+                <div className="inspection-list">{a11y.landmarks.map((landmark, index) => <div className="inspection-row" key={index}><span className="inspection-tag">{landmark.tag}</span>{landmark.role && <em>{landmark.role}</em>}{landmark.label && <code>{landmark.label}</code>}<small>{(landmark.text || "").slice(0, 90) || "—"}</small></div>)}</div>
+                {a11y.controls?.length ? <><div className="inspection-block"><strong>Controls</strong><span>{a11y.controls.length} interactive</span></div><div className="inspection-list">{a11y.controls.map((control, index) => <div className="inspection-row" key={index}><span className="inspection-tag">{control.tag}</span>{control.disabled ? <em className="is-disabled">disabled</em> : null}<small>{control.label || "(no accessible label)"}</small></div>)}</div></> : null}
+              </>}
+              {previewInspection && <details className="artifact-inspection-dump"><summary>Raw payload</summary><pre>{JSON.stringify(previewInspection, null, 2)}</pre></details>}
+            </div>;
+          })()}
+        </section>
         <button type="button" className="artifact-resize-handle artifact-resize-source-diff" aria-label="Resize Source and Diff panels" title="Drag to resize Source and Diff panels" onPointerDown={(event) => beginArtifactPanelResize(event, "source-diff")} onPointerMove={updateArtifactPanelResize} onPointerUp={endArtifactPanelResize} onPointerCancel={endArtifactPanelResize} onKeyDown={(event) => handleArtifactPanelResizeKey(event, "source-diff")} />
         <button type="button" className="artifact-resize-handle artifact-resize-diff-preview" aria-label="Resize Diff and Live Preview panels" title="Drag to resize Diff and Live Preview panels" onPointerDown={(event) => beginArtifactPanelResize(event, "diff-preview")} onPointerMove={updateArtifactPanelResize} onPointerUp={endArtifactPanelResize} onPointerCancel={endArtifactPanelResize} onKeyDown={(event) => handleArtifactPanelResizeKey(event, "diff-preview")} />
         <button type="button" className="artifact-resize-handle artifact-resize-evidence" aria-label="Resize Output and Inspection panels" title="Drag to resize Output and Inspection panels" onPointerDown={(event) => beginArtifactPanelResize(event, "evidence")} onPointerMove={updateArtifactPanelResize} onPointerUp={endArtifactPanelResize} onPointerCancel={endArtifactPanelResize} onKeyDown={(event) => handleArtifactPanelResizeKey(event, "evidence")} />
       </div>
-      <div className="artifact-footer"><span>{artifact ? `${artifact.kind} · ${artifact.mime} · ${artifact.entrypoint}` : "No artifact selected"}</span><span>{previewSession ? `preview ${previewSession.status} · ${previewSession.actions}/24 actions` : "preview session idle"}</span><button type="button" className="quiet-action" onClick={() => void runArtifact("export", { artifactId: artifact?.id })} disabled={!artifact?.revision}>Export to change set</button></div>
+      <div className="artifact-footer"><span>{artifact ? `${artifact.kind} · ${artifact.mime} · ${artifact.entrypoint}` : "No artifact selected"}</span><span>{previewSession ? `preview ${previewSession.status} · ${previewSession.actions}/24 actions` : "preview session idle"}</span><button type="button" className="quiet-action" title="Change set: a bundled set of prepared edits held for your approval — nothing touches the repository until you approve it." onClick={() => { void runArtifact("export", { artifactId: artifact?.id }).then((result) => { if (result?.changeSet) setExportedChangeSet(result.changeSet); }); }} disabled={!artifact?.revision}>Export to change set</button>{exportedChangeSet && (!artifact?.id || exportedChangeSet.artifactId === artifact.id) && <button type="button" className="quiet-action" title="Dry-run the change set against the thread workspace first; a second confirmation writes and commits with a receipt." onClick={() => void applyExportedChangeSet()} disabled={changesetApplyBusy || !exportedChangeSet?.artifactSource}>{changesetApplyBusy ? "Applying…" : `Apply to repository… (${Object.keys(exportedChangeSet.artifactSource || {}).length})`}</button>}</div>
     </div>;
   }
 
   function renderActivity() {
-    return <div className="activity-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="activity" size={13} /> LOCAL EVENT STREAM</span><h2>Activity</h2></div><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : "quiet"} /></div><div className="event-stream">{events.length ? events.slice().reverse().slice(0, 22).map((event) => <EventRow event={event} key={event.id} />) : <p className="empty-copy">Hemlock events will appear here as the workspace works.</p>}</div><section className="stream-records"><SectionTitle icon="pulse" right={`${streamFrames.length} buffered`}>Ephemeral streams</SectionTitle>{streamFrames.slice(-8).reverse().map((stream) => { const streamKind = displayText(stream.kind, "stream"); const streamStatus = displayText(stream.status, "buffered"); const streamText = typeof stream.text === "string" ? stream.text.slice(-160) : stream.text; return <div className="stream-record" key={displayText(stream.streamId, `${streamKind}-${streamStatus}`)}><span className={`stream-kind stream-kind-${streamKind}`}>{streamKind}</span><strong>{streamStatus}</strong><small>{displayText(streamText)}</small></div>; })}</section></div>;
+    return <div className="activity-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="activity" size={13} /> LOCAL EVENT STREAM</span><h2>Activity</h2></div><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : "quiet"} /></div>{(() => {
+      const types = [...new Set(events.map((event) => String(event.type || "").split(".")[0]))].filter(Boolean).sort();
+      return types.length > 1 ? <div className="event-filter">{types.map((type) => <button key={type} type="button" className={activityTypeFilter === type ? "is-selected" : ""} onClick={() => setActivityTypeFilter((current) => current === type ? null : type)}>{type}</button>)}{activityTypeFilter && <button type="button" className="event-filter-clear" onClick={() => setActivityTypeFilter(null)}>clear</button>}</div> : null;
+    })()}
+    <div className="event-stream">{(() => { const filtered = activityTypeFilter ? events.filter((event) => String(event.type || "").startsWith(`${activityTypeFilter}.`)) : events; return filtered.length ? filtered.slice().reverse().slice(0, 22).map((event) => <EventRow event={event} key={event.id} timeLabel={formatRelativeTime(event.createdAt) || formatTime(event.createdAt)} />) : <p className="empty-copy">{activityTypeFilter ? `No ${activityTypeFilter} events yet.` : "Hemlock events will appear here as the workspace works."}</p>; })()}</div><section className="stream-records"><SectionTitle icon="pulse" right={`${streamFrames.length} buffered`}>Ephemeral streams</SectionTitle>{streamFrames.slice(-8).reverse().map((stream) => { const streamKind = displayText(stream.kind, "stream"); const streamStatus = displayText(stream.status, "buffered"); const streamText = typeof stream.text === "string" ? stream.text.slice(-160) : stream.text; return <div className="stream-record" key={displayText(stream.streamId, `${streamKind}-${streamStatus}`)}><span className={`stream-kind stream-kind-${streamKind}`}>{streamKind}</span><strong>{streamStatus}</strong><small>{displayText(streamText)}</small></div>; })}</section></div>;
   }
 
   function renderReceipts() {
     const storedReceipts = receiptRecords.slice(0, 8);
-    return <div className="receipts-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="receipt" size={13} /> PROOF STORE</span><h2>Receipts</h2></div><button className="quiet-action" type="button" onClick={() => void runCommand("receipts.query")}>Refresh</button></div><p className="surface-copy">A visible state is only a receipt-backed claim when it links to evidence.</p>{changeSet && <section className="proof-callout change-set-callout"><SectionTitle icon="work" right={displayText(changeSet.status)}>Prepared change set</SectionTitle><strong>{displayText(changeSet.id)}</strong><small>{displayText(changeSet.claimBoundary)}</small><div className="candidate-actions"><button type="button" onClick={() => void runCommand("change.approve", { changeSetId: changeSet.id, confirm: true })} disabled={changeSet.status !== "waiting_for_approval"}>Approve and apply</button><button type="button" onClick={() => void runCommand("change.reject", { changeSetId: changeSet.id, note: "Rejected from Receipts" })} disabled={changeSet.status !== "waiting_for_approval"}>Reject</button></div></section>}<section className="receipt-section"><SectionTitle icon="database" right={`${storedReceipts.length} stored`}>Runtime receipts</SectionTitle>{storedReceipts.length ? <div className="receipt-stack">{storedReceipts.map((item) => <div className="receipt-card" key={item.path}><div><strong>{displayText(item.receipt?.schema, "local receipt")}</strong><span className={`receipt-state ${displayText(item.receipt?.status, "recorded")}`}>{displayText(item.receipt?.status, "recorded")}</span></div><p>{displayText(item.receipt?.objective || item.receipt?.error, "Persistent runtime evidence.")}</p><small>{displayText(item.relativePath)}</small></div>)}</div> : <p className="empty-copy">Stored Dream and SIPS receipts will appear after the first runtime query.</p>}</section><section className="receipt-section"><SectionTitle icon="activity" right="current session">Event evidence</SectionTitle><div className="receipt-stack">{events.filter((event) => event.evidenceRefs?.length || event.type.includes("completed") || event.type.includes("failed")).slice().reverse().slice(0, 12).map((event) => <div className="receipt-card" key={event.id}><div><strong>{displayText(event.type?.replaceAll?.(".", " · "), "local event")}</strong><span className={`receipt-state ${displayText(event.status, "recorded")}`}>{displayText(event.status, "recorded")}</span></div><p>{displayText(event.payload?.stage || event.payload?.error || event.payload?.command, "Local runtime event recorded.")}</p><small>{displayText(event.evidenceRefs?.join?.(" · "), "session event evidence")}</small></div>)}</div></section>{latestReceiptEvent && <div className="proof-callout"><SectionTitle icon="receipt" right="latest">Selected evidence</SectionTitle><span>{displayText(latestReceiptEvent.type?.replaceAll?.(".", " · "), "local event")} · {displayText(latestReceiptEvent.status, "recorded")}</span><small>{displayText(latestReceiptEvent.evidenceRefs?.[0], "Event is recorded in the current local session.")}</small></div>}</div>;
+    return <div className="receipts-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="receipt" size={13} /> PROOF STORE</span><h2>Receipts</h2></div><button className="quiet-action" type="button" onClick={() => void runCommand("receipts.query")}>Refresh</button></div><p className="surface-copy" title="Receipt: recorded evidence for a consequential action — what ran, when, and what it produced.">A visible state is only a receipt-backed claim when it links to evidence.</p>{changeSet && <section className="proof-callout change-set-callout"><SectionTitle icon="work" right={displayText(changeSet.status)}>Prepared change set</SectionTitle><strong>{displayText(changeSet.id)}</strong><small>{displayText(changeSet.claimBoundary)}</small><div className="candidate-actions"><button type="button" onClick={() => void runCommand("change.approve", { changeSetId: changeSet.id, confirm: true })} disabled={changeSet.status !== "waiting_for_approval"}>Approve and apply</button><button type="button" onClick={() => void runCommand("change.reject", { changeSetId: changeSet.id, note: "Rejected from Receipts" })} disabled={changeSet.status !== "waiting_for_approval"}>Reject</button></div></section>}<section className="receipt-section"><SectionTitle icon="database" right={`${storedReceipts.length} stored`}>Runtime receipts</SectionTitle>{storedReceipts.length ? <div className="receipt-stack">{storedReceipts.map((item) => <div className="receipt-card" key={item.path}><div><strong>{displayText(item.receipt?.schema, "local receipt")}</strong><span className={`receipt-state ${displayText(item.receipt?.status, "recorded")}`}>{displayText(item.receipt?.status, "recorded")}</span></div><p>{displayText(item.receipt?.objective || item.receipt?.error, "Persistent runtime evidence.")}</p><small>{displayText(item.relativePath)}</small></div>)}</div> : <p className="empty-copy">Stored Dream and SIPS receipts will appear after the first runtime query.</p>}</section><section className="receipt-section"><SectionTitle icon="activity" right="current session">Event evidence</SectionTitle><div className="inline-search receipts-search"><input value={receiptsFilter} onChange={(event) => setReceiptsFilter(event.target.value)} placeholder="Filter evidence by type, status, or path…" aria-label="Filter event evidence" /><Icon name="search" size={14} /></div>{(() => { const evidenceEvents = events.filter((event) => event.evidenceRefs?.length || event.type.includes("completed") || event.type.includes("failed")).slice().reverse(); const query = receiptsFilter.trim().toLowerCase(); const filtered = query ? evidenceEvents.filter((event) => JSON.stringify({ t: event.type, s: event.status, p: event.evidenceRefs, m: event.payload?.stage || event.payload?.error || event.payload?.command }).toLowerCase().includes(query)) : evidenceEvents; return filtered.length ? <div className="receipt-stack">{filtered.slice(0, 12).map((event) => <div className="receipt-card" key={event.id}><div><strong>{displayText(event.type?.replaceAll?.(".", " · "), "local event")}</strong><span className={`receipt-state ${displayText(event.status, "recorded")}`}>{displayText(event.status, "recorded")}</span></div><p>{displayText(event.payload?.stage || event.payload?.error || event.payload?.command, "Local runtime event recorded.")}</p><small>{displayText(event.evidenceRefs?.join?.(" · "), "session event evidence")}</small>{event.evidenceRefs?.length ? <button type="button" className="receipt-copy-path" onClick={() => { navigator.clipboard?.writeText(event.evidenceRefs.join("\n")); setPreviewNotice("Evidence path copied to clipboard."); }}>Copy path</button> : null}</div>)}</div> : <p className="empty-copy">{query ? `No evidence matches "${receiptsFilter}".` : "Evidence-bearing events will appear here."}</p>; })()}</section>{latestReceiptEvent && <div className="proof-callout"><SectionTitle icon="receipt" right="latest">Selected evidence</SectionTitle><span>{displayText(latestReceiptEvent.type?.replaceAll?.(".", " · "), "local event")} · {displayText(latestReceiptEvent.status, "recorded")}</span><small>{displayText(latestReceiptEvent.evidenceRefs?.[0], "Event is recorded in the current local session.")}</small></div>}</div>;
   }
 
   function renderMap() {
@@ -1740,7 +2389,7 @@ function App() {
         <div className="model-picker-heading"><span>MODEL LANE</span><small>{selectedLane.kind === "subscription" ? "uses your provider subscription" : "runs on this Mac"}</small></div>
         <div className="model-picker-options">{Object.values(MODEL_LANES).map((lane) => { const status = providerStatuses.find((item) => item.provider === lane.provider); return <button type="button" key={lane.provider} className={lane.provider === modelSelection.provider ? "is-selected" : ""} onClick={() => setModelLane(lane.provider)}><span><strong>{lane.label}</strong><small>{lane.kind === "subscription" ? status?.authenticated ? "login detected" : "login required" : "local MLX"}</small></span><Icon name={lane.provider === modelSelection.provider ? "check" : "chevron"} size={13} /></button>; })}</div>
         <label className="model-picker-field">Model<select value={modelSelection.model} onChange={(event) => updateModelSelection({ model: event.target.value })}>{selectedLane.modelOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>
-        <label className="model-picker-field">Reasoning<select value={modelSelection.reasoning} onChange={(event) => updateModelSelection({ reasoning: event.target.value })} disabled={selectedLane.provider === "maple"}>{selectedLane.reasoningLevels.map((level) => <option value={level} key={level}>{level === "native" ? "Native Maple reasoning" : level}</option>)}</select></label>
+        <label className="model-picker-field">Reasoning<select value={modelSelection.reasoning} onChange={(event) => updateModelSelection({ reasoning: event.target.value })}>{selectedLane.reasoningLevels.map((level) => <option value={level} key={level}>{level === "on" ? "Thinking on" : level === "off" ? "Thinking off (faster)" : level}</option>)}</select></label>
         {selectedLane.provider !== "maple" && !selectedProviderStatus?.authenticated && <button type="button" className="model-picker-login" onClick={() => { setModelPickerOpen(false); openWindow("settings"); }}>Open Settings to log in</button>}
         <p className="model-picker-note">{selectedLane.provider === "maple" ? "Local conversation and Dream stay on this Mac." : `Hemlock invokes the ${selectedLane.label} CLI with this model and reasoning level; credentials remain in the provider's own account store.`}</p>
       </section>}
@@ -1751,19 +2400,34 @@ function App() {
     const inventory = agentSnapshot?.storageInventory;
     const formatBytes = (bytes) => bytes == null ? "—" : bytes > 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GiB` : bytes > 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MiB` : `${Math.round(bytes / 1024)} KiB`;
     const providerStatusById = Object.fromEntries(providerStatuses.map((status) => [status.provider, status]));
-    return <div className="settings-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="settings" size={13} /> LOCAL CONFIGURATION</span><h2>Settings</h2></div></div><label>Maple-Preview server URL<input className="setting-control" value={apiBase} onChange={(event) => { setApiBase(event.target.value); setReadinessCheck("idle"); setServerProcessReady(null); setInferenceReady(null); }} /></label><p className="surface-copy">Hemlock sends requests through the Electron control plane. A healthy process is not the same as a completed inference response.</p><div className="readiness-box"><StatusLamp state={serverState} label={`process: ${serverState}`} /><StatusLamp state={inferenceReady ? "ready" : inferenceReady === false ? "down" : "idle"} label={`inference: ${inferenceReady ? "verified" : inferenceReady === false ? "not verified" : "not checked"}`} /></div><label>Regular Dream profile<select className="setting-control" value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void checkReadiness()} disabled={readinessCheck === "checking"}>{readinessCheck === "checking" ? "Checking local inference…" : "Check local readiness"}</button><section className="settings-providers"><div className="settings-section-heading"><SectionTitle icon="command" right={isDesktop ? "CLI account status" : "desktop only"}>Subscription providers</SectionTitle><button type="button" className="quiet-action" onClick={() => void refreshProviderStatuses()} disabled={!isDesktop}>Refresh</button></div><p className="surface-copy">Log in through each provider's own CLI. Hemlock never asks for or stores API keys, OAuth tokens, or subscription credentials.</p>{["codex", "claude"].map((provider) => { const lane = MODEL_LANES[provider]; const status = providerStatusById[provider]; const authenticated = status?.authenticated === true; return <div className="provider-account-row" key={provider}><div className="provider-account-copy"><div><strong>{lane.label}</strong><StatusLamp state={authenticated ? "ready" : status?.installed === false ? "down" : "unknown"} label={authenticated ? "login detected" : status?.installed === false ? "not installed" : "login required"} /></div><small>{authenticated ? status.accountLabel : `${lane.label} subscription via ${provider === "codex" ? "ChatGPT" : "Claude Code"}`}</small></div><div className="provider-account-actions"><button type="button" onClick={() => void providerAuthAction(provider, "login")} disabled={!isDesktop || status?.installed === false}>{authenticated ? "Re-authenticate" : "Log in"}</button>{authenticated && <button type="button" className="quiet-action" onClick={() => void providerAuthAction(provider, "logout")}>Log out</button>}</div></div>; })}</section><section className="settings-sources"><SectionTitle icon="activity" right="explicit opt-in">Context sources</SectionTitle><p className="surface-copy">Hemlock only uses enabled sources. Every surfaced observation retains its source and freshness.</p>{sourcePolicies.length ? sourcePolicies.map((source) => <label className="source-policy" key={source.sourceId}><span><strong>{displayText(source.displayName)}</strong><small>{displayText(source.sourceId)} · {displayText(source.retention)} · {displayText(source.permissionState)}</small></span><input type="checkbox" checked={source.enabled !== false} onChange={(event) => void setSourceEnabled(source, event.target.checked)} disabled={!isDesktop || source.sourceId === "local-project"} /></label>) : <p className="empty-copy">Source policies will appear after the desktop runtime resumes.</p>}</section><section className="settings-runtime"><SectionTitle icon="database" right="application data">Runtime storage</SectionTitle><p>{displayText(inventory?.root || agentProjection?.storage?.root || agentSnapshot?.runtime?.root, "Hemlock application data")}</p><div className="storage-metrics"><span>Model<strong>{formatBytes(inventory?.modelBytes)}</strong></span><span>Runtime<strong>{formatBytes(inventory?.totalRuntimeBytes)}</strong></span><span>Free<strong>{formatBytes(inventory?.freeBytes)}</strong></span></div><small>Models, adapters, datasets, receipts, and event projections stay outside the Git worktree. Inventory is informational; cleanup remains an explicit future operation.</small></section></div>;
+    return <div className="settings-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="settings" size={13} /> LOCAL CONFIGURATION</span><h2>Settings</h2></div></div><label>Maple-Preview server URL<input className="setting-control" value={apiBase} onChange={(event) => { setApiBase(event.target.value); setReadinessCheck("idle"); setServerProcessReady(null); setInferenceReady(null); }} /></label><p className="surface-copy">Hemlock sends requests through the Electron control plane. A healthy process is not the same as a completed inference response.</p>
+{renderProviderCapacityPanel()}<div className="readiness-box"><StatusLamp state={serverState} label={`process: ${serverState}`} /><StatusLamp state={inferenceReady ? "ready" : inferenceReady === false ? "down" : "idle"} label={`inference: ${inferenceReady ? "verified" : inferenceReady === false ? "not verified" : "not checked"}`} /></div><label>Regular Dream profile<select className="setting-control" value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void checkReadiness()} disabled={readinessCheck === "checking"}>{readinessCheck === "checking" ? "Checking local inference…" : "Check local readiness"}</button><section className="settings-providers"><div className="settings-section-heading"><SectionTitle icon="command" right={isDesktop ? "CLI account status" : "desktop only"}>Subscription providers</SectionTitle><button type="button" className="quiet-action" onClick={() => void refreshProviderStatuses()} disabled={!isDesktop}>Refresh</button></div><p className="surface-copy">Log in through each provider's own CLI. Hemlock never asks for or stores API keys, OAuth tokens, or subscription credentials.</p>{["codex", "claude"].map((provider) => { const lane = MODEL_LANES[provider]; const status = providerStatusById[provider]; const authenticated = status?.authenticated === true; return <div className="provider-account-row" key={provider}><div className="provider-account-copy"><div><strong>{lane.label}</strong><StatusLamp state={authenticated ? "ready" : status?.installed === false ? "down" : "unknown"} label={authenticated ? "login detected" : status?.installed === false ? "not installed" : "login required"} /></div><small>{authenticated ? status.accountLabel : `${lane.label} subscription via ${provider === "codex" ? "ChatGPT" : "Claude Code"}`}</small></div><div className="provider-account-actions"><button type="button" onClick={() => void providerAuthAction(provider, "login")} disabled={!isDesktop || status?.installed === false}>{authenticated ? "Re-authenticate" : "Log in"}</button>{authenticated && <button type="button" className="quiet-action" onClick={() => void providerAuthAction(provider, "logout")}>Log out</button>}</div></div>; })}</section><section className="settings-sources"><SectionTitle icon="activity" right="explicit opt-in">Context sources</SectionTitle><p className="surface-copy">Hemlock only uses enabled sources. Every surfaced observation retains its source and freshness.</p>{sourcePolicies.length ? sourcePolicies.map((source) => <label className="source-policy" key={source.sourceId}><span><strong>{displayText(source.displayName)}</strong><small>{displayText(source.sourceId)} · {displayText(source.retention)} · {displayText(source.permissionState)}</small></span><input type="checkbox" checked={source.enabled !== false} onChange={(event) => void setSourceEnabled(source, event.target.checked)} disabled={!isDesktop || source.sourceId === "local-project"} /></label>) : <p className="empty-copy">Source policies will appear after the desktop runtime resumes.</p>}</section><section className="settings-runtime"><SectionTitle icon="database" right="application data">Runtime storage</SectionTitle><p>{displayText(inventory?.root || agentProjection?.storage?.root || agentSnapshot?.runtime?.root, "Hemlock application data")}</p><div className="storage-metrics"><span>Model<strong>{formatBytes(inventory?.modelBytes)}</strong></span><span>Runtime<strong>{formatBytes(inventory?.totalRuntimeBytes)}</strong></span><span>Free<strong>{formatBytes(inventory?.freeBytes)}</strong></span></div><small>Models, adapters, datasets, receipts, and event projections stay outside the Git worktree. Inventory is informational; cleanup remains an explicit future operation.</small></section></div>;
   }
 
   const windowContent = { center: renderCenter, chat: renderChat, artifact: renderArtifactStudio, sips: renderSips, memory: renderMemory, dream: renderDream, activity: renderActivity, receipts: renderReceipts, map: renderMap, settings: renderSettings };
 
   return <main className="hemlock-os">
     <div className="ambient-branch branch-a" /><div className="ambient-branch branch-b" />
-    <header className="system-bar"><div className="system-brand" onClick={() => openWindow("center")} role="button" tabIndex="0"><span className="brand-mark"><Icon name="tree" size={28} /></span><strong>Hemlock</strong><span>OS</span></div><div className="system-context"><span className="system-path">active task / <strong>{task.intent || "conversation"}</strong></span><span className="system-task">{task.objective}</span></div><div className="system-health">{renderModelPicker()}<div className="system-health-chip"><StatusLamp state={sipsStatus?.selfloop?.status === "active" ? "working" : "ready"} label={sipsStatus?.selfloop?.status === "active" ? "active" : "idle"} /><span>SIPS</span></div><div className="system-health-chip system-activity-chip"><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : `${events.length} events`} /><span>ACTIVITY</span></div><button className="system-palette" onClick={() => setPaletteOpen(true)} aria-label="Open command palette"><Icon name="command" size={15} /><kbd>⌘K</kbd></button><button className="system-settings" onClick={() => openWindow("settings")} aria-label="Open settings"><Icon name="settings" size={16} /></button></div></header>
-    <div className="desktop-strip"><span className="strip-label">UNDERSTORY / {task.status}</span><span className="strip-line" /><span className="strip-event">{latestEvent ? latestEvent.type.replaceAll(".", " · ") : "session ready"}</span><span className="strip-time">{formatTime()}</span></div>
-    <section ref={canvasRef} className="desktop-canvas" aria-label="Hemlock desktop workspace">{Object.keys(WINDOW_META).map((id) => { const windowState = workspaceWindows[id]; if (!windowState || windowState.state === "closed") return null; const content = windowState.state === "minimized" ? null : windowContent[id](); return <WindowFrame key={id} windowState={windowState} meta={WINDOW_META[id]} active={activeWindowId === id} onFocus={focusWindow} onDragStart={startDrag} onResizeStart={startResize} onMinimize={minimizeWindow} onMaximize={maximizeWindow} onClose={closeWindow}>{content}</WindowFrame>; })}</section>
-    <nav className="understory-dock" aria-label="Hemlock surfaces">{Object.entries(WINDOW_META).map(([id, meta]) => { const state = workspaceWindows[id]; const open = state?.state !== "closed"; const minimized = state?.state === "minimized"; return <button type="button" key={id} className={`dock-item ${open ? "open" : ""} ${activeWindowId === id ? "active" : ""}`} onClick={() => open && !minimized ? focusWindow(id) : openWindow(id)} aria-label={`${open && !minimized ? "Focus" : "Open"} ${meta.label}`}><span className={`dock-icon glyph-${meta.tone}`}><Icon name={meta.icon} size={17} /></span><span>{meta.label}</span>{(id === "activity" && events.length > 0) || (id === "artifact" && artifacts.length > 0) || (id === "dream" && isDreaming) || (id === "sips" && sipsCycleState === "running") ? <i className="dock-notification" /> : null}</button>; })}<button className="dock-item dock-command" onClick={() => setPaletteOpen(true)} aria-label="Open command palette"><span className="dock-icon"><Icon name="command" size={17} /></span><span>Command palette</span></button></nav>
-    {paletteOpen && <div className="palette-backdrop" onClick={() => setPaletteOpen(false)}><section className="command-palette" onClick={(event) => event.stopPropagation()}><div className="palette-top"><Icon name="command" size={16} /><input ref={paletteRef} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)} placeholder="Search the Hemlock operating environment…" aria-label="Search Hemlock commands" /><kbd>ESC</kbd></div><div className="palette-list">{filteredCommands.map((item) => <button key={item.id} onClick={() => chooseCommand(item)}><span className="palette-icon"><Icon name={item.icon} size={16} /></span><span><strong>{item.label}</strong><small>{item.hint}</small></span><span className="palette-arrow">↵</span></button>)}{!filteredCommands.length && <p className="empty-copy">No local command matches that search.</p>}</div><div className="palette-foot"><span>Only allowlisted local actions appear here.</span><span>Hemlock OS</span></div></section></div>}
+    <header className="system-bar"><div className="system-brand" onClick={() => openWindow("center")} role="button" tabIndex="0"><span className="brand-mark"><Icon name="tree" size={28} /></span><strong>Hemlock</strong><span>OS</span></div><div className="system-context"><span className="system-path">active task / <strong>{task.intent || "conversation"}</strong></span><span className="system-task">{task.objective}</span></div><div className="system-health">{renderModelPicker()}<div className="system-health-chip"><StatusLamp state={sipsStatus?.selfloop?.status === "active" ? "working" : "ready"} label={sipsStatus?.selfloop?.status === "active" ? "active" : "idle"} /><span>SIPS</span></div><button className="system-understory" onClick={() => setUnderstory((current) => !current)} aria-label="Toggle understory mode" aria-pressed={understory} title="Understory mode · dim panels for night work"><Icon name="dream" size={15} /></button><div className="system-health-chip system-activity-chip"><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : `${events.length} events`} /><span>ACTIVITY</span></div><button className="system-palette" onClick={() => setPaletteOpen(true)} aria-label="Open command palette"><Icon name="command" size={15} /><kbd>⌘K</kbd></button><button className="system-settings" onClick={() => openWindow("settings")} aria-label="Open settings"><Icon name="settings" size={16} /></button></div></header>
+    <div className="desktop-strip"><span className="strip-label">UNDERSTORY / {task.status}</span><span className="strip-line" /><span className="strip-event">{latestEvent ? latestEvent.type.replaceAll(".", " · ") : "session ready"}</span><span className="strip-time">{formatTime(clockNow)}</span></div>
+    <section ref={canvasRef} className="desktop-canvas" aria-label="Hemlock desktop workspace">{Object.keys(WINDOW_META).map((id) => { const windowState = workspaceWindows[id]; if (!windowState || windowState.state === "closed") return null; const content = windowState.state === "minimized" ? null : windowContent[id](); return <WindowFrame key={id} windowState={windowState} meta={WINDOW_META[id]} active={activeWindowId === id} dragging={draggingWindowId === id} resizing={resizingWindowId === id} onFocus={focusWindow} onDragStart={startDrag} onResizeStart={startResize} onMinimize={minimizeWindow} onMaximize={maximizeWindow} onClose={closeWindow}>{content}</WindowFrame>; })}</section>
+    <nav className="understory-dock" aria-label="Hemlock surfaces">{Object.entries(WINDOW_META).map(([id, meta]) => { const state = workspaceWindows[id]; const open = state?.state !== "closed"; const minimized = state?.state === "minimized"; const active = activeWindowId === id; // Unread truth: an event arrived since this window was last focused while it could not be seen.
+const lastSeenEvents = seenEventCountsRef.current.get(id); const hasUnread = events.length > (lastSeenEvents ?? events.length) && (!state || state.state === "closed" || !active); return <button type="button" key={id} aria-pressed={active} className={`dock-item ${open ? "open" : ""} ${active ? "active" : ""}`} onClick={() => open && !minimized ? focusWindow(id) : openWindow(id)} onContextMenu={(event) => { if (!open) return; event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); setDockMenu({ windowId: id, x: rect.left, y: rect.top - 8 }); }} aria-label={`${meta.label}, ${active ? "focused" : minimized ? "minimized" : open ? "open, inactive" : "closed"}${hasUnread ? ", unread activity" : ""}`}><span className={`dock-icon glyph-${meta.tone}`}><Icon name={meta.icon} size={17} /></span><span>{meta.label}</span>{hasUnread ? <i className="dock-unread" title="New activity since last focus" /> : null}</button>; })}<button className="dock-item dock-command" onClick={() => setPaletteOpen(true)} aria-label="Open command palette" title="⌘K palette · ⌘1-9 windows · ⌘` cycle"><span className="dock-icon"><Icon name="command" size={17} /></span><span>Command palette</span></button></nav>
+    {dockMenu && <div className="dock-menu-backdrop" onClick={() => setDockMenu(null)} onContextMenu={(event) => { event.preventDefault(); setDockMenu(null); }}><div className="dock-menu" style={{ left: dockMenu.x, top: dockMenu.y }} role="menu" aria-label={`${WINDOW_META[dockMenu.windowId]?.label || "Window"} actions`}><strong>{WINDOW_META[dockMenu.windowId]?.label}</strong><button type="button" role="menuitem" onClick={() => { focusWindow(dockMenu.windowId); setDockMenu(null); }}>Focus</button><button type="button" role="menuitem" onClick={() => { setWorkspaceWindows((current) => ({ ...current, [dockMenu.windowId]: keyboardPlacement(current[dockMenu.windowId], "minimize", canvasSize) })); setDockMenu(null); }}>Minimize</button><button type="button" role="menuitem" className="is-destructive" onClick={async () => { const id = dockMenu.windowId; setDockMenu(null); if (id === "center") { setWorkspaceWindows((current) => ({ ...current, [id]: { ...current[id], state: "closed", focus: false } })); return; } const confirmed = await confirmDialog({ title: `Close ${WINDOW_META[id]?.label || "this window"}?`, body: "The window closes. Its state is kept — reopen it any time from the dock.", confirmLabel: "Close window" }); if (confirmed) setWorkspaceWindows((current) => ({ ...current, [id]: { ...current[id], state: "closed", focus: false } })); }}>Close</button></div></div>}
+    {paletteOpen && <div className="palette-backdrop" onClick={() => setPaletteOpen(false)}><section className="command-palette" role="dialog" aria-label="Command palette" onClick={(event) => event.stopPropagation()}><div className="palette-top"><Icon name="command" size={16} /><input ref={paletteRef} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (!visiblePaletteItems.length) return;
+          if (event.key === "ArrowDown") { event.preventDefault(); setPaletteActiveIndex((safePaletteIndex + 1) % visiblePaletteItems.length); }
+          else if (event.key === "ArrowUp") { event.preventDefault(); setPaletteActiveIndex((safePaletteIndex - 1 + visiblePaletteItems.length) % visiblePaletteItems.length); }
+          else if (event.key === "Enter") { event.preventDefault(); chooseCommand(visiblePaletteItems[safePaletteIndex]); }
+          else if ((event.metaKey || event.ctrlKey) && /^[1-9]$/.test(event.key)) { event.preventDefault(); const pick = visiblePaletteItems[Number(event.key) - 1]; if (pick) chooseCommand(pick); }
+        }}
+        placeholder="Search the Hemlock operating environment…" aria-label="Search Hemlock commands" aria-activedescendant={visiblePaletteItems[safePaletteIndex] ? `palette-item-${safePaletteIndex}` : undefined} /><kbd>ESC</kbd></div><div className="palette-list" role="listbox">{visiblePaletteGroups.map((group) => <React.Fragment key={group.id}><div className="palette-section-label">{group.label}</div>{group.items.map((item) => { const flatIndex = visiblePaletteIndexById.get(item.id); return <button key={item.id} id={`palette-item-${flatIndex}`} role="option" aria-selected={flatIndex === safePaletteIndex} className={flatIndex === safePaletteIndex ? "is-active" : ""} onClick={() => chooseCommand(item)}><span className="palette-icon"><Icon name={item.icon} size={16} /></span><span><strong>{item.label}</strong><small>{item.hint}</small></span><span className="palette-arrow">↵</span></button>; })}</React.Fragment>)}{!visiblePaletteItems.length && <p className="empty-copy">No local command matches that search.</p>}</div><div className="palette-foot"><span>Only allowlisted local actions appear here.</span><span>Hemlock OS</span></div></section></div>}
+    {confirmState && <div className="palette-backdrop confirm-backdrop" onClick={() => settleConfirmDialog(false)}><section className="command-palette confirm-dialog" role="alertdialog" aria-modal="true" aria-label={confirmState.title} onClick={(event) => event.stopPropagation()}><div className="confirm-dialog-body"><strong>{confirmState.title}</strong>{confirmState.body && <p>{confirmState.body}</p>}</div><div className="confirm-dialog-actions"><button type="button" className="quiet-action" autoFocus={confirmState.tone === "danger"} onClick={() => settleConfirmDialog(false)}>Cancel</button><button type="button" className={confirmState.tone === "danger" ? "danger-action" : "primary-action"} autoFocus={confirmState.tone !== "danger"} onClick={() => settleConfirmDialog(true)}>{confirmState.confirmLabel}</button></div></section></div>}
   </main>;
 }
+
+// Apply understory mode before first paint so a night session never flashes bright paper.
+if (readUnderstoryPreference()) document.documentElement.classList.add("understory");
 
 createRoot(document.getElementById("root")).render(<App />);

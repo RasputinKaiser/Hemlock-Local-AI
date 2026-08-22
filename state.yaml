@@ -58,6 +58,34 @@ verification:
   strong_agent_tool_use_dream_receipt: "~/Library/Application Support/Hemlock/workspace-runtime/dream-runs/strong-agent-tool-use-smoke-20260814/training-receipt.json"
   strong_agent_tool_use_dream_metrics: "1 optimizer step; train loss 6.882; validation loss 6.502; 11.608M trainable parameters"
   strong_agent_tool_use_dream_base_digest_unchanged: true
+models:
+  launcher:
+    prod_flow: "double-click / --app now runs electron directly against dist/ with HEMLOCK_PROD_UI=1 — no Vite dev server, no concurrently (saves ~7GB RAM, no terminal window)"
+    dev_flow: "scripts/launch-hemlock.zsh --dev restores old Vite+HMR flow"
+    rebuild_ui: "cd dream-chat && npm run build (required once before prod flow; dist/ ships prebuilt)"
+  maple_2bit:
+    directory: /Users/ianzvirbulis/Models/Hemlock/maple-2bit-mlx
+    role: default local chat model ("default_model")
+  lfm25_8b_a1b:
+    repo: LiquidAI/LFM2.5-8B-A1B-MLX-4bit
+    directory: /Users/ianzvirbulis/Models/Hemlock/LFM2.5-8B-A1B-mlx-4bit
+    model_type: lfm2_moe (native mlx-lm support)
+    params: "8B total, ~1.5B active (24 layers, 32 experts, 4 active, 2 dense)"
+    dtype: 4-bit group-64 (official LiquidAI MLX quant, 4.5 GB)
+    size_gb: 4.5
+    role: selectable local model in Hemlock picker (maple lane, option "lfm25-8b")
+    picker_value: lfm25-8b
+    request_routing: main.cjs resolveLocalModelPath() maps picker value -> model dir; mlx_lm server lazy-loads per request
+    smoke_test: "server on :8099 healthy; chat completion returned reasoning channel + 'LFM2.5 is alive' (finish=stop, 139 tokens)"
+    bf16_note: "bf16 original (16.9GB) deleted - exceeded 16GB Mac GPU wired limit (GPU timeout) and filled disk"
+  lfm25_dspark_draft:
+    repo: LiquidAI/LFM2.5-8B-A1B-DSpark
+    directory: /Users/ianzvirbulis/Models/Hemlock/LFM2.5-8B-A1B-DSpark-mlx
+    model_type: dspark (custom mlx_lm/models/dspark.py wrapper; MODEL_REMAPPING lfm2_dspark->dspark)
+    params: 327.7M (matches LiquidAI blog spec exactly)
+    architecture: "DFlash-style 5-layer attention-only backbone fed by fc(10240->2048) on concat hidden states from target layers [2,6,10,14,18]; rank-256 factorized Markov head; confidence head on 2304->1"
+    verified: "loads via mlx_lm.load_model; forward + draft heads produce (B,L,128000) logits and (B,L) confidence"
+    limitation: "mlx-lm speculative_generate_step drives draft models with token ids; DSpark consumes target hidden states, so stock mlx-lm speculative decoding cannot use it. Day-one runtimes are llama.cpp + SGLang. On-device (M-series) speedup for the 8B MoE is ~18% per LiquidAI benchmarks."
   strong_agent_tool_use_dream_candidate_status: training_completed_candidate_pending
   strong_agent_candidate_inference_probe: blocked
   strong_agent_candidate_inference_reason: "The trained adapter server was healthy, but the structured-action probes did not yield a valid hemlock.agent.action.v1 envelope: the first spent its completion on reasoning/prose and hit the token limit; a no-thinking retry returned an invented list_directory action. No candidate quality or activation claim made."
@@ -782,3 +810,18 @@ chat_fullscreen_visual_polish_2026_08_16:
     diff_check: passed
     design_qa: "design-qa.md result passed"
   claim_boundary: "This is a renderer/layout polish pass validated against the supplied screenshot and a live Electron capture. It does not claim a new Maple inference or artifact-quality result."
+
+electron_host_ux_lane_b_2026_08_21:
+  status: implemented_verified
+  plan: docs/plans/2026-08-21-os-feel-ux-pass.md
+  channels:
+    dialog_confirm: "dialog.showMessageBox wrapper; tone-mapped danger/default buttons; returns boolean via mapConfirmChoice; empty message rejects honestly."
+    notification_show: "Main-process Notification with whitespace-collapsed, length-clamped title (80) / body (240); darwin subtitle stamps app name; structured {shown,error} on failure."
+    windows_list: "hemlock.window.list.v1 read-only pull of renderer-owned hemlock-os-windows-v2 localStorage snapshot; closed windows excluded, rows sorted by zOrder; honest unavailable payload when no renderer."
+    preload: "mapleDesktop/hemlockAgent expose confirmDialog, notify, and windowsList."
+  tests:
+    host_ux_ipc: "dream-chat/electron/host_ux_ipc.test.cjs: 11 passed"
+    electron_suite: "node --test dream-chat/electron/*.test.cjs: 95 passed"
+    renderer_tests: "windowManager + styles tests: 16 passed"
+    vite_build: "passed (dist rebuilt for HEMLOCK_PROD_UI flow)"
+  claim_boundary: "IPC handlers and preload surfaces are verified against mocked Electron. No live desktop relaunch or real macOS notification delivery was exercised in this pass; consumers of notify() remain future work per plan."

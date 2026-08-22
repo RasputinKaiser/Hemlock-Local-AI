@@ -92,5 +92,7 @@ test("Displayed workspace paths redact the macOS home-directory identity", () =>
   assert.match(mainSource, /replace\(\/.*Users/);
   assert.match(mainSource, /redactUserPaths\(value\)/);
   assert.match(mainSource, /displayText\(message\.rawOutputRef\)/);
-  assert.match(mainSource, /the path stays local and is not shown in Hemlock UI/);
+  // New-thread flow now uses the native directory picker; the privacy promise
+  // moved into the picker dialog title in electron/main.cjs.
+  assert.doesNotMatch(mainSource, /window\.prompt\(/);
 });
