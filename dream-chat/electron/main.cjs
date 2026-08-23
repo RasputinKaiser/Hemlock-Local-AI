@@ -18,6 +18,7 @@ const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
+const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
 const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
 const {
@@ -411,6 +412,7 @@ let sipsCycleActive = false;
 const activeChildren = new Set();
 let serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
 let serverLaunchPromise = null;
+let mapleCrashTimestamps = []; // bounded respawn budget (crash_policy.cjs)
 let agentInferenceEndpoint = serverUrl;
 const providerStatusCache = new Map();
 const activeStreams = new Map();
@@ -1899,6 +1901,9 @@ async function runInference(payload = {}) {
       if (!reason && isMapleTransportError(error) && mapleTransportRetries < 1 && !stream.text.trim()) {
         mapleTransportRetries += 1;
         finishStream(stream, { status: "restarting", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
+        // T7.5-R2: recovery must be visible, not silent — the receipt rides
+        // the existing HOST ACTIVITY rail via conciseAgentNote.
+        appendAgentEvent("maple.recovery", "degraded", { attempt: mapleTransportRetries, reason: error.message, streamId: stream.streamId }, { reversible: true });
         await restartMapleRuntime(error.message || "Maple transport failed during inference.");
         stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
         rawPayloads = [];
@@ -2410,7 +2415,7 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "training.prepare") result = prepareTrainingDataset(payload);
     else if (command === "training.start") result = await runDream(payload);
-    else if (command === "maple.launch") result = await launchMapleRuntime();
+    else if (command === "maple.launch") result = await launchMapleRuntime({ resetCrashLoop: true });
     else if (command === "status") result = await runSipsRuntime({ action: "status" });
     else if (command === "context.refresh") result = await contextBroker.refresh({ reason: payload.reason || "command" });
     else if (command === "context.search") result = contextBroker.search(payload.query || "");
@@ -3073,9 +3078,24 @@ async function startServer(adapterPath = "") {
     if (serverProcess === child) {
       if (!serverState.processReady) serverProcessError = { message: `Maple server exited before readiness (code=${code ?? "-"}, signal=${signal ?? "-"}).`, code, signal };
       serverProcess = null;
-      serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
+      serverState = child.mapleStopRequested === true
+        ? { processReady: false, inferenceReady: false, adapterPath: "" }
+        : handleUnexpectedMapleExit();
     }
   });
+}
+
+// Unexpected maple death (not our own stopServer path — e.g. MLX Metal
+// GPU-timeout SIGABRT): record the crash against a bounded budget. Under
+// budget, fall through to the normal lazy respawn (ensure/restart on next
+// use). Over budget, stop respawning and surface an honest degraded state.
+function handleUnexpectedMapleExit() {
+  mapleCrashTimestamps = recordCrash(mapleCrashTimestamps, Date.now());
+  const verdict = shouldRespawn({ crashTimestamps: mapleCrashTimestamps });
+  if (verdict.respawn) return { processReady: false, inferenceReady: false, adapterPath: "" };
+  serverState = { processReady: false, inferenceReady: false, adapterPath: "", crashLooped: true, crashLoopReason: verdict.reason };
+  appendAgentEvent("maple.crashloop.detected", "blocked", { reason: verdict.reason, crashes: mapleCrashTimestamps.length }, { reversible: true });
+  return serverState;
 }
 
 function stopServer() {
@@ -3086,6 +3106,9 @@ function stopServer() {
       return;
     }
     const child = serverProcess;
+    // Mark OUR termination intent on the child itself so its exit handler can
+    // tell a deliberate stop from a real crash (SIGABRT/SIGKILL from MLX).
+    child.mapleStopRequested = true;
     const timeout = setTimeout(() => {
       if (!child.killed) child.kill("SIGKILL");
       serverProcess = null;
@@ -3129,8 +3152,17 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
   throw new Error(`The local Maple-Preview server process did not become ready: ${lastError?.message || "timeout"}.`);
 }
 
-async function launchMapleRuntime() {
+async function launchMapleRuntime({ resetCrashLoop = false } = {}) {
   if (serverLaunchPromise) return serverLaunchPromise;
+  // A user-initiated maple.launch clears the crash-loop degraded state and
+  // resets the budget — a human explicitly decided to try again. Auto-recovery
+  // (restartMapleRuntime) deliberately does NOT pass this flag so crashes keep
+  // accumulating toward the loop verdict.
+  if (resetCrashLoop) {
+    mapleCrashTimestamps = [];
+    const { crashLooped: _clearedLooped, crashLoopReason: _clearedReason, ...rest } = serverState;
+    serverState = rest;
+  }
   serverLaunchPromise = (async () => {
     const startedAt = Date.now();
     try {
@@ -3172,6 +3204,15 @@ async function ensureMapleRuntime() {
 }
 
 async function restartMapleRuntime(reason = "Maple runtime recovery requested.") {
+  // Bounded auto-respawn gate: once the crash budget is spent, refuse to
+  // relaunch (a poison prompt would otherwise thrash forever) and keep the
+  // degraded state visible instead.
+  const crashVerdict = shouldRespawn({ crashTimestamps: mapleCrashTimestamps });
+  if (!crashVerdict.respawn) {
+    serverState = { processReady: false, inferenceReady: false, adapterPath: "", crashLooped: true, crashLoopReason: crashVerdict.reason };
+    appendAgentEvent("maple.crashloop.detected", "blocked", { reason: crashVerdict.reason, crashes: mapleCrashTimestamps.length }, { reversible: true });
+    return createMapleLaunchResult({ server: serverState });
+  }
   appendAgentEvent("maple.runtime.restarting", "running", { reason, cachePolicy: { size: maplePromptCacheSize, bytes: maplePromptCacheBytes, promptConcurrency: maplePromptConcurrency, decodeConcurrency: mapleDecodeConcurrency } }, { reversible: true });
   await stopServer();
   serverProcessError = null;

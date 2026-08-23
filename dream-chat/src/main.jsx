@@ -398,6 +398,7 @@ function conciseAgentNote(event, task) {
     case "plan.approved": return "Plan approved; the selected provider may continue through the registered host loop.";
     case "plan.rejected": return `Plan rejected: ${String(payload.reason || "user decision").slice(0, 220)}`;
     case "task.steering.received": return `Steering accepted for the next bounded decision; an already-running inference is not rewritten: ${String(payload.steering?.content || "update received").slice(0, 180)}`;
+    case "maple.recovery": return `Connection to ${providerLabel} dropped; the runtime restarted and your prompt is being re-run (attempt ${payload.attempt || 1}).`;
     case "inference.started": return payload.mode === "structured-action" ? `${providerLabel} is selecting one registered action from the current evidence.` : `${providerLabel} is composing a response.`;
     case "inference.failed": return `${providerLabel} inference needs attention: ${String(payload.error || "no usable output").slice(0, 220)}`;
     case "action.inference.failed": return `${providerLabel} action output was not usable; one repair prompt is being attempted.`;
@@ -2302,7 +2303,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
         // control, and the full trace still records the reasoning.
         .filter((channel) => !(modelSelection.reasoning === "off" && (channel.name === "reasoning" || channel.name === "reasoning_content")));
       const streamDied = message.telemetry?.finishReason === "error" || message.streamDied === true || message.errorCode === "CANCELLED";
-      if (!visibleChannels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName}</span>{streamDied ? <p>The connection to the local model dropped mid-reply (the server likely restarted after a GPU hiccup). The reply was not completed — try again; Hemlock usually recovers this automatically on retry.</p> : <p>The model finished without returning any text. This usually means it hit its token limit while reasoning. Try again, or raise the token ceiling in a longer task.</p>}</div>;
+      if (!visibleChannels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName}</span>{streamDied ? <><p>The connection to the local model dropped mid-reply (the server likely restarted after a GPU hiccup). The reply was not completed.</p><div className="repair-actions"><button type="button" onClick={() => retryLastMessage()}>Re-run this prompt</button></div></> : <p>The model finished without returning any text. This usually means it hit its token limit while reasoning. Try again, or raise the token ceiling in a longer task.</p>}</div>;
       return visibleChannels.map((channel, index) => {
         const label = `${channelProviderName(channel.source || message.provider)} · ${displayText(channel.name, "content")}`;
         if (channel.name === "content" || index === 0 && channels.length === 1) return <div className="maple-channel maple-channel-content" key={`${channel.name}-${index}`}><span className="model-channel-label">{label}</span><div className="message-content">{displayText(channel.text, "")}{message.streaming && <span className="stream-caret" aria-label={`${providerName} response still arriving`}>▍</span>}</div></div>;

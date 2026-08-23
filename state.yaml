@@ -917,3 +917,27 @@ tranche7_seamless_loop_2026_08_22:
     - "Live eval lane not yet run against a live Maple server (receipt path verified by unit tests only)"
   claim_boundary: "All verification is deterministic host-side. The ask_user loop, budget grants, and comparison fixes are unit-verified; a live end-to-end ask-answer-resume session and a live tool-use eval run against Maple were not exercised in this pass."
 
+tranche7_5_chat_reliability_2026_08_23:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-23_tranche75-chat-reliability.md
+  trigger: "Real incident 2026-08-23: MLX Metal GPU-timeout (kIOGPUCommandBufferCallbackErrorTimeout) SIGABRT'd the maple server mid-stream 7 times; undici surfaced bare 'TypeError: terminated' which was not classified as a transport error, so the bounded auto-retry never fired."
+  changes:
+    transport_classification:
+      what: "isMapleTransportError recognizes 'terminated'/premature-close (undici's error when the SSE server dies mid-stream) — the bounded restart+retry now fires on server-death kills. Committed separately as 76756e7 with honest empty-reply renderer copy distinguishing dropped-connection from token-limit."
+    crash_loop_policy:
+      what: "crash_policy.cjs (pure): recordCrash appends+prunes a rolling window; shouldRespawn blocks at ≥3 crashes in 10min (fails open on garbage). main.cjs: stopServer stamps child.mapleStopRequested so our own stops are not crashes; unexpected deaths (SIGABRT/SIGKILL) record + consult the policy — over budget skips respawn, sets serverState crashLooped/crashLoopReason, emits maple.crashloop.detected. maple.launch resets the loop. Recovery is lazy (next inference), so the gate sits at restartMapleRuntime entry."
+    visible_recovery:
+      what: "Transport retry emits maple.recovery (degraded) receipt; conciseAgentNote renders 'Connection to {provider} dropped; the runtime restarted and your prompt is being re-run (attempt N)' in HOST ACTIVITY."
+    rerun_on_dead_reply:
+      what: "Dead replies (streamDied) render honest copy + a Re-run-this-prompt button reusing retryLastMessage (same helper as per-message retry); token-limit branch unchanged."
+    ipc_clone_errors_cleared:
+      what: "All 6 'object could not be cloned' errors in launch.log date to Aug 15 (before the stability-pass fix); zero occurrences since. Historical — no live bug."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 200 passed (190 + 10 crash_policy incl. source wiring guards)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed"
+    reviews: "Batched review APPROVED. Reviewer verified: stopServer SIGKILL-fallback classifies as our-stop (no false crash), crashLooped reaches renderer via getAgentState server snapshot, maple.launch reset path correct, R2 fires once per retry, R3 reuses retryLastMessage with no duplicated send logic."
+  known_exemption:
+    - "recoverBaseServer (dream-run failure recovery) and ensureBaseInference (SIPS baseline) call stopServer+startServer directly, bypassing the shouldRespawn gate — INTENTIONAL: both are user-initiated training flows, not auto-retry loops; thrash risk accepted and documented."
+  claim_boundary: "All verification is deterministic host-side (unit suites, builds, log analysis). The crash-loop gate, visible recovery note, and re-run button were not exercised against a live mid-generation server kill in this pass; the GPU-timeout itself is upstream mlx/Metal."
+
