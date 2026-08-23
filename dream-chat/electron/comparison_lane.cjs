@@ -28,11 +28,16 @@ function lastUserMessage(conversation = []) {
   return content || null;
 }
 
-function buildComparisonRecord({ targetProvider = "", answer = "", telemetry = null } = {}) {
+function buildComparisonRecord({ targetProvider = "", promptText = "", answer = "", contextApplied = false, telemetry = null } = {}) {
   return {
     schema: COMPARISON_SCHEMA,
     targetProvider: String(targetProvider || ""),
+    // T7-S4 FIX 1: pin the exact prompt the lane re-ran so the compare view can
+    // show it verbatim and flag when newer turns have superseded it.
+    promptText: String(promptText || ""),
     answer: String(answer || ""),
+    // T7-S4 FIX 2: honest flag — did a grounded-memory system block reach both lanes?
+    contextApplied: Boolean(contextApplied),
     telemetry: telemetry && typeof telemetry === "object" ? telemetry : null,
     ranAt: new Date().toISOString(),
   };

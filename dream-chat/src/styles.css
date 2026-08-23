@@ -997,6 +997,25 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-plan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; margin-top: 11px; padding-top: 10px; border-top: 1px solid rgba(133, 101, 33, .18); background: linear-gradient(180deg, rgba(255, 253, 245, .78), #fffdf5 35%); }
 .chat-plan-actions .primary-action { min-height: 36px; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; border-radius: 6px; }
 .chat-plan-actions .quiet-action { min-height: 36px; padding: 0 10px; border: 1px solid #d4c796; border-radius: 6px; color: #6e5c2c; }
+/* T7-S3: grantable budgets — compact stepper row + live usage line. */
+.budget-stepper { display: inline-flex; align-items: center; gap: 5px; margin-right: auto; color: #80662d; font-family: "DM Mono", monospace; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+.budget-stepper button { min-width: 20px; height: 20px; padding: 0 4px; border: 1px solid #d5ddd1; border-radius: 5px; background: #fffdf6; color: #55705d; font: 500 10px "DM Mono", monospace; cursor: pointer; }
+.budget-stepper button:disabled { opacity: .45; cursor: default; }
+.budget-usage { margin-top: 8px; padding-top: 7px; border-top: 1px solid rgba(133, 101, 33, .18); color: #80662d; font: 600 9px "DM Mono", monospace; letter-spacing: .08em; }
+/* T7-S1: answer-in-place question card — Maple asks, you answer above the plan dock. */
+.chat-question-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid #d6b767; border-radius: 10px; background: linear-gradient(135deg, #fff8df, #fffdf5); box-shadow: 0 7px 20px rgba(133, 101, 33, .1); }
+.chat-question-card .card-kicker { display: flex; align-items: center; justify-content: space-between; }
+.chat-question-prompt { font-size: 14px; line-height: 1.35; color: #3c3220; }
+.chat-question-card textarea { min-height: 62px; resize: vertical; }
+.chat-question-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chat-question-actions .primary-action { min-height: 36px; padding: 0 12px; border-radius: 6px; }
+/* Higher specificity than the wide-grid block (~1273) so the row shift wins
+   the cascade regardless of source order — question card above plan dock. */
+.chat-surface > .chat-question-card { grid-column: 2; grid-row: 6; align-self: start; width: auto; max-height: min(40vh, 360px); margin: 8px 14px 0; z-index: 1; }
+.chat-surface.is-asking > .chat-question-card { grid-row: 6; }
+.chat-surface.is-asking > .chat-plan-card { grid-column: 2; grid-row: 7 !important; margin-top: 0; }
+.chat-surface.is-asking > .interaction-mode-bar { grid-column: 2; grid-row: 8 !important; }
+.chat-surface.is-asking > .chat-compose { grid-column: 2; grid-row: 9 !important; }
 .chat-host-rail { display: grid; gap: 6px; min-width: 0; max-height: min(15vh, 150px); margin: 0 14px 7px; overflow: auto; scrollbar-gutter: stable; }
 .chat-host-details { min-width: 0; border: 1px solid #c7d6c1; border-radius: 9px; background: #f4f8ef; box-shadow: 0 4px 12px rgba(47, 75, 54, .05); }
 .chat-host-details[open] { display: flex; flex-direction: column; min-height: 0; max-height: min(15vh, 150px); overflow: hidden; }
@@ -1105,6 +1124,11 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-compare-column small { font-family: "DM Mono", monospace; font-size: 9px; color: #6c7d70; }
 .chat-compare-column pre { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.55 "DM Sans", -apple-system, sans-serif; color: var(--ink); }
 @media (max-width: 800px) { .chat-compare-grid { grid-template-columns: 1fr; } }
+/* T7-S4 FIX 1: pinned-prompt header on the lane compare card. */
+.chat-compare-prompt { display: flex; align-items: baseline; gap: 7px; margin-bottom: 9px; min-width: 0; }
+.chat-compare-prompt small { font-family: "DM Mono", monospace; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: #4f5c49; flex-shrink: 0; }
+.chat-compare-prompt code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10px/1.5 "DM Mono", monospace; color: #3d4a38; }
+.chat-compare-prompt .chat-compare-stale { color: #a05a2c; }
 .compare-picker { position: fixed; left: 50%; top: 18%; transform: translateX(-50%); z-index: 70; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 32px)); padding: 14px; border: 1px solid rgba(79, 92, 73, .3); border-radius: 10px; background: var(--paper); box-shadow: 0 18px 44px rgba(27, 48, 41, .24); }
 .compare-picker strong { font-family: "Newsreader", Georgia, serif; font-size: 15px; }
 .compare-picker p { margin: 0; font-size: 10px; line-height: 1.5; color: #58705d; }

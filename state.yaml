@@ -892,3 +892,28 @@ tranche6_grounded_harness_2026_08_22:
     - "task.comparison persists across turns without pinning the compared prompt text, so 'same prompt' can drift from the current column"
   claim_boundary: "All verification is deterministic host-side (unit suites, builds, syntax checks). Live cross-lane comparison runs, real recall injection against a populated Garden, and a live relaunch smoke were not exercised in this pass."
 
+tranche7_seamless_loop_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_210000-tranche7-seamless-loop.md
+  headline: "The ask_user loop closes in place: Maple asks, you answer in Chat, the resumed loop streams visibly."
+  changes:
+    answer_in_place:
+      what: "task_answer.cjs (assertAnswerable gate) + allowlisted task.answer command: validates waiting_for_user state, appends the answer to thread history via the same persistence as sendMessage, pins/clears task.question durably on the projection, then resumeTask continues the bounded loop. Renderer: MAPLE ASKS question card with inline answer box above the plan dock; StatusLamp reads ASKS YOU."
+      streaming: "Live Model Stream panel now covers agent_action streams too (was model_text only) — resumed structured-action inference after an answer streams visibly instead of running silently (user requirement)."
+    grantable_budgets:
+      what: "clampBudgetOverrides (pure, steps 1-24, commands 1-40); plan.approve clamps + merges overrides into task.budget before approval so proposeNextAction enforcement honors grants; renderer stepper on the awaiting-approval card (defaults 8/12, overrides only when non-default) + live steps/commands usage line while running."
+    debt_cleanup:
+      what: "Comparison records pin promptText with a renderer PROMPT PINNED header + prompt-since-superseded hint; context symmetry achieved by wrapping ONLY the bare CLI lane with injectGroundedContext (maple injects internally; no double-injection, verified by call graph) with honest contextApplied flag; stale-recall guard: injectGroundedContext accepts refreshQuery used only at the inference.respond call site."
+    live_eval_lane:
+      what: "electron/tool_use_live.cjs (dual module/CLI): runs the 11-fixture tool-use benchmark against live Maple with shared wall-clock budget and skip-remaining-on-timeout; scores response quality only (respondedRate, validEnvelopeRate against fixture-derived allowlists); receipts to Application Support e2e/tool-use-live/; npm script eval:tool-use-live; explicit claimBoundary that task completion is never claimed. Injectable inferenceFn keeps tests offline."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 190 passed (172 post-T6 + task_answer, clampBudgetOverrides, comparison prompt-pin, tool_use_live)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed"
+    reviews: "Batched review: S3 APPROVED, S4 APPROVED, S1 PASS pending one CSS fix (question-card row-shift lost the cascade to the later grid block — fixed with .is-asking scoped overrides) plus one S2 test-string mismatch (fixed). Reviewer also verified no maple double-injection and correct guard scoping."
+  known_minor_debt:
+    - "Inline ask_user model actions pin action.shortRationale as the question prompt (approximation, matches prior fallback)"
+    - "Budget overrides apply before plan-status validation, so an explicit approve on a running task could mutate budget mid-run (allowlisted explicit, low risk)"
+    - "Live eval lane not yet run against a live Maple server (receipt path verified by unit tests only)"
+  claim_boundary: "All verification is deterministic host-side. The ask_user loop, budget grants, and comparison fixes are unit-verified; a live end-to-end ask-answer-resume session and a live tool-use eval run against Maple were not exercised in this pass."
+

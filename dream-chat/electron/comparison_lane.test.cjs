@@ -64,3 +64,20 @@ test("buildComparisonRecord pins the comparison schema and fields", () => {
   // Telemetry is optional and must never be fabricated.
   assert.equal(buildComparisonRecord({ targetProvider: "codex" }).telemetry, null);
 });
+
+test("buildComparisonRecord pins the exact promptText (T7-S4 FIX 1)", () => {
+  const record = buildComparisonRecord({
+    targetProvider: "codex",
+    promptText: "the exact prompt that was re-run",
+    answer: "lane answer",
+    contextApplied: true,
+  });
+  assert.equal(record.promptText, "the exact prompt that was re-run");
+  assert.equal(record.contextApplied, true);
+  // Absent inputs stay honestly empty/false — never fabricated.
+  const bare = buildComparisonRecord({ targetProvider: "codex" });
+  assert.equal(bare.promptText, "");
+  assert.equal(bare.contextApplied, false);
+  // Non-boolean contextApplied coerces instead of passing through arbitrary values.
+  assert.equal(buildComparisonRecord({ targetProvider: "codex", contextApplied: "yes" }).contextApplied, true);
+});

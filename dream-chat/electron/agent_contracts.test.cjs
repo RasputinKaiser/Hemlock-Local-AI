@@ -1,6 +1,21 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { ACTION_SCHEMA, DEFAULT_BUDGET, coerceActionPayload, createObservation, extractActionEnvelope, extractJsonObject, mergeBudget, normalizeExpectedEvidence, validateAction, classifyFailure } = require("./agent_contracts.cjs");
+const { ACTION_SCHEMA, DEFAULT_BUDGET, clampBudgetOverrides, coerceActionPayload, createObservation, extractActionEnvelope, extractJsonObject, mergeBudget, normalizeExpectedEvidence, validateAction, classifyFailure } = require("./agent_contracts.cjs");
+
+test("clamps grantable budget overrides into the allowed step and command range", () => {
+  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 16, maxCommands: 24 }), { maxAgentSteps: 16, maxCommands: 24 });
+  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 0, maxCommands: 999 }), { maxAgentSteps: 1, maxCommands: 40 });
+  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: "12", maxRetriesPerOperation: 9 }), { maxAgentSteps: 12 });
+});
+
+test("budget override clamping drops garbage and never invents grants", () => {
+  assert.deepEqual(clampBudgetOverrides(null), {});
+  assert.deepEqual(clampBudgetOverrides("more"), {});
+  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: "lots" }), {});
+  const merged = mergeBudget(clampBudgetOverrides({ maxAgentSteps: 20 }));
+  assert.equal(merged.maxAgentSteps, 20);
+  assert.equal(merged.maxCommands, DEFAULT_BUDGET.maxCommands);
+});
 
 test("contract helpers create bounded observations and merge the execution budget", () => {
   const budget = mergeBudget({ maxCommands: 3 });

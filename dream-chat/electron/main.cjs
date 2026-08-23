@@ -8,11 +8,12 @@ const { ContextBroker } = require("./context_broker.cjs");
 const { AgentKernel } = require("./agent_kernel.cjs");
 const { AgentOrchestrator } = require("./agent_orchestrator.cjs");
 const { AgentIntentQueue, isActiveTask } = require("./agent_queue.cjs");
-const { DEFAULT_BUDGET, mergeBudget, compactObservation } = require("./agent_contracts.cjs");
+const { DEFAULT_BUDGET, mergeBudget, clampBudgetOverrides, compactObservation } = require("./agent_contracts.cjs");
 const { ThreadManager, DEFAULT_PROVIDER_CAPS, workspaceFingerprint } = require("./thread_manager.cjs");
 const { CodingWorkspace } = require("./coding_workspace.cjs");
 const { CodingAutopilot } = require("./coding_autopilot.cjs");
 const { chooseVerificationProfile, verificationSummary, skippedVerification } = require("./verification_profile.cjs");
+const { assertAnswerable } = require("./task_answer.cjs");
 const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
@@ -929,6 +930,14 @@ const codingWorkspace = new CodingWorkspace({
 });
 
 function updateAgentTask(patch, { emit = true } = {}) {
+  // T7-S1: pin the pending question durably on the projection while the task
+  // waits on the user (Chat reads task.question), and clear it the moment the
+  // phase moves on so a stale question never lingers.
+  if (patch.phase === "waiting_for_user" && patch.question === undefined) {
+    patch = { ...patch, question: { prompt: String(patch.foregroundStep || agentTask.foregroundStep || "").trim(), askedAt: new Date().toISOString() } };
+  } else if (patch.phase && patch.phase !== "waiting_for_user" && patch.question === undefined) {
+    patch = { ...patch, question: null };
+  }
   agentTask = { ...agentTask, ...patch, updatedAt: new Date().toISOString() };
   writeAgentState();
   agentKernel?.syncTask(agentTask);
@@ -1594,6 +1603,12 @@ async function runComparisonLane(payload = {}) {
   const promptText = lastUserMessage(threadManager.readConversation(String(agentTask.threadId || "")));
   if (!promptText) throw new Error("No user message is available in this thread to compare.");
   const messages = [{ role: "user", content: promptText }];
+  // T7-S4 FIX 2 (context symmetry): maple's runInference already assembles
+  // injectGroundedContext internally — wrapping here too would double-inject —
+  // so only the bare CLI lane wraps here. Both lanes read the same
+  // agentTask.recall snapshot, so the assembled system block is identical.
+  const cliMessages = await injectGroundedContext(messages);
+  const contextApplied = cliMessages.length > messages.length && cliMessages[0]?.role === "system";
   // Maple's conversation bookkeeping stamps completion state onto the live
   // task; a comparison must stay read-only, so restore what it touches.
   const taskRestore = { phase: agentTask.phase, status: agentTask.status, foregroundStep: agentTask.foregroundStep, blockedReason: agentTask.blockedReason };
@@ -1607,9 +1622,9 @@ async function runComparisonLane(payload = {}) {
     } else {
       // mode "comparison" skips conversation-mode task mutation; the CLI lane
       // runs exactly like normal inference otherwise (lease, stream, receipt).
-      result = await runCliInference({ messages, taskId: agentTask.id, threadId: agentTask.threadId || undefined }, normalizeSelection({ provider: guard.targetProvider }), { mode: "comparison" });
+      result = await runCliInference({ messages: cliMessages, taskId: agentTask.id, threadId: agentTask.threadId || undefined }, normalizeSelection({ provider: guard.targetProvider }), { mode: "comparison" });
     }
-    const comparison = buildComparisonRecord({ targetProvider: guard.targetProvider, answer: result.answer, telemetry: result.telemetry || null });
+    const comparison = buildComparisonRecord({ targetProvider: guard.targetProvider, promptText, answer: result.answer, contextApplied, telemetry: result.telemetry || null });
     updateAgentTask({ comparison });
     appendAgentEvent("comparison.completed", "passed", { comparison }, { evidenceRefs: result.rawOutputRef ? [result.rawOutputRef] : [], reversible: true });
     return { schema: COMPARISON_SCHEMA, status: "completed", comparison, task: agentTask };
@@ -1628,8 +1643,22 @@ async function runComparisonLane(payload = {}) {
 // Receipt-bearing memory injection (T6-G1): prepend the labeled promoted-memory
 // block as its own system-role message — host additions stay labeled, never
 // blended into model output. One receipt per inference when injection happened.
-function injectGroundedContext(messages = []) {
-  const grounded = buildGroundedContext({ recall: agentTask.recall });
+// T7-S4 FIX 3: optional refreshQuery re-runs SIPS recall first so call sites
+// that bypass the intent path (inference.respond) don't reuse whatever
+// agentTask.recall last held. Only inference.respond passes it.
+async function injectGroundedContext(messages = [], refreshQuery = "") {
+  let recall = agentTask.recall;
+  const query = String(refreshQuery || "").trim();
+  if (query) {
+    try {
+      recall = await runSipsRuntime({ action: "recall", query, limit: 6 });
+      updateAgentTask({ recall });
+      appendAgentEvent("memory.recalled", "passed", { query, count: recall.records?.length || 0, records: recall.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
+    } catch (error) {
+      appendAgentEvent("memory.recall.failed", "degraded", { query, error: error.message }, { reversible: true });
+    }
+  }
+  const grounded = buildGroundedContext({ recall });
   if (!grounded.systemBlock) return messages;
   appendAgentEvent("context.injected", "passed", { count: grounded.citations.length, citationIds: grounded.citations.map((citation) => citation.id) }, { reversible: true });
   return [{ role: "system", content: grounded.systemBlock }, ...messages];
@@ -1655,11 +1684,11 @@ async function runInference(payload = {}) {
   }
   // Compaction (and its digest receipt) runs once, inside the lease.
   const initialMessages = compactWithDigest(payload);
-  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: injectGroundedContext(initialMessages) }, selection, { mode: "conversation" });
+  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: await injectGroundedContext(initialMessages, payload.refreshQuery) }, selection, { mode: "conversation" });
   const requestedAdapter = String(payload.adapterPath || "");
   const endpoint = String(payload.apiBase || serverUrl).replace(/\/$/, "");
   const startedAt = Date.now();
-  let messages = injectGroundedContext(initialMessages);
+  let messages = await injectGroundedContext(initialMessages, payload.refreshQuery);
   let recovered = false;
   let stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
   let responsePayload = {};
@@ -2217,6 +2246,7 @@ const agentCommands = {
   "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "task.resume": { label: "Resume approved task", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "task.answer": { label: "Answer Maple's question", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "action.accept": { label: "Accept proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "action.reject": { label: "Reject proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "task.ask": { label: "Ask the user for a decision", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
@@ -2372,7 +2402,12 @@ async function runAgentCommand(action, payload = {}) {
       const suggestion = threadManager.transitionSuggestion(String(payload.suggestionId || ""), status);
       result = { schema: "hemlock.agent.suggestion.result.v1", status, suggestion };
     }
-    else if (command === "inference.respond") result = await runInference(payload);
+    else if (command === "inference.respond") {
+      // T7-S4 FIX 3: this path bypasses intent, so refresh recall from the
+      // live prompt before injectGroundedContext builds context.
+      const recallQuery = String(payload.refreshQuery || payload.query || lastUserMessage(threadManager.readConversation(String(agentTask.threadId || ""))) || "");
+      result = await runInference({ ...payload, refreshQuery: recallQuery });
+    }
     else if (command === "training.prepare") result = prepareTrainingDataset(payload);
     else if (command === "training.start") result = await runDream(payload);
     else if (command === "maple.launch") result = await launchMapleRuntime();
@@ -2497,9 +2532,26 @@ async function runAgentCommand(action, payload = {}) {
       appendAgentEvent(`memory.${command.split(".")[1]}`, "recorded", { targetId: payload.targetId, record: result.record }, { evidenceRefs: [result.memoryPath], reversible: true });
     }
     else if (command === "plan.propose") result = agentOrchestrator.proposePlan(agentTask, payload);
-    else if (command === "plan.approve") result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
+    else if (command === "plan.approve") {
+      // T7-S3: clamp user-granted budget overrides and pin them on the task (mergeBudget semantics) before approval resumes it.
+      const overrides = clampBudgetOverrides(payload.budgetOverrides);
+      if (Object.keys(overrides).length) agentOrchestrator.updateTask({ budget: mergeBudget({ ...agentOrchestrator.task().budget, ...overrides }) });
+      result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
+    }
     else if (command === "plan.reject") result = agentOrchestrator.rejectPlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""), String(payload.reason || "Rejected by user"));
     else if (command === "task.resume") result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
+    else if (command === "task.answer") {
+      // T7-S1: answer-in-place. The user's reply is persisted exactly like any
+      // other user message so thread history stays consistent, the pending
+      // question is cleared from the projection, and the task resumes through
+      // the normal resumeTask path.
+      const gate = assertAnswerable(agentTask, payload.answer);
+      if (!gate.ok) throw new Error(gate.reason);
+      threadManager.appendConversation(agentTask.threadId, { role: "user", content: gate.text });
+      updateAgentTask({ question: null, foregroundStep: `Answer received; resuming with your reply` });
+      appendAgentEvent("task.answered", "passed", { taskId: agentTask.id, chars: gate.text.length }, { reversible: true });
+      result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
+    }
     else if (command === "action.accept") result = await agentOrchestrator.acceptAction(String(payload.taskId || agentTask.id), String(payload.actionId || agentTask.activeActionId || ""));
     else if (command === "action.reject") result = agentOrchestrator.rejectAction(String(payload.taskId || agentTask.id), String(payload.actionId || agentTask.activeActionId || ""), String(payload.reason || "Rejected by user"));
     else if (command === "task.ask") result = agentOrchestrator.askUser(String(payload.taskId || agentTask.id), String(payload.question || payload.prompt || ""), payload.context || {});
