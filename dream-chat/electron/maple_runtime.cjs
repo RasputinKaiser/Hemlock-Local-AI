@@ -65,7 +65,12 @@ function isMapleTransportError(error) {
   const code = String(error?.code || error?.cause?.code || "");
   const message = String(error?.message || error?.cause?.message || error || "");
   return ["ECONNREFUSED", "UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(code)
-    || /fetch failed|socket|connection refused|other side closed|network/i.test(message);
+    || /fetch failed|socket|connection refused|other side closed|network/i.test(message)
+    // undici throws bare "TypeError: terminated" when the server dies
+    // mid-stream (e.g. MLX Metal GPU-timeout abort) and the SSE connection
+    // severs before the response completes. That is a transport death, and
+    // the bounded restart+retry below is exactly the right recovery.
+    || /^terminated$|terminated\b.*undici|premature close/i.test(message);
 }
 
 function createMapleLaunchResult({ server = {}, startedAt = null, error = null } = {}) {
