@@ -42,7 +42,11 @@ function compactInferenceMessages(messages, {
   // If the latest user request itself is larger than the budget, preserve its
   // complete text. Build/artifact requests are user intent, not disposable
   // history; the separate authoring contract owns source-size validation.
-  let remaining = Math.max(0, maxChars - (firstSystem?.content.length || 0) - latestUser.content.length);
+  // Messages AFTER the latest user (a trailing assistant reply) belong to that
+  // exchange and are kept with it — dropping them would orphan the answer to
+  // the question the prompt still contains.
+  const trailingAfterLatestUser = selected.slice(latestUserIndex + 1);
+  let remaining = Math.max(0, maxChars - (firstSystem?.content.length || 0) - latestUser.content.length - trailingAfterLatestUser.reduce((sum, message) => sum + message.content.length, 0));
   const history = [];
   for (const message of selected.slice(0, latestUserIndex).reverse()) {
     if (message.role === "system") continue;
@@ -54,7 +58,7 @@ function compactInferenceMessages(messages, {
       remaining = 0;
     }
   }
-  return [...(firstSystem ? [firstSystem] : []), ...history, latestUser];
+  return [...(firstSystem ? [firstSystem] : []), ...history, latestUser, ...trailingAfterLatestUser];
 }
 
 function isMapleTransportError(error) {
@@ -86,6 +90,7 @@ module.exports = {
   DEFAULT_CONVERSATION_MESSAGE_LIMIT,
   DEFAULT_CONVERSATION_CHAR_LIMIT,
   compactInferenceMessages,
+  normalizeInferenceMessage,
   isMapleTransportError,
   createMapleLaunchResult,
 };

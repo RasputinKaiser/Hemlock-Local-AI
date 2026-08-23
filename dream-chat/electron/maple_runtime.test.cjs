@@ -44,3 +44,19 @@ test("Maple launch receipt records startup failure without claiming readiness", 
   assert.equal(result.errorCode, "ENOENT");
   assert.equal(result.errorSignal, "SIGTERM");
 });
+
+test("Compaction keeps a trailing assistant reply after the latest user message", () => {
+  // Regression (T6-G2): a thread ending in an assistant reply used to lose that
+  // reply even with a huge char budget — the history walk stopped at the
+  // latest user message. The answer to the question in the prompt must stay.
+  const thread = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello there, this is the reply" },
+  ];
+  const compacted = compactInferenceMessages(thread);
+  assert.deepEqual(compacted, thread);
+  // Same guarantee under a tight-but-sufficient budget.
+  const tight = compactInferenceMessages(thread, { maxMessages: 4, maxChars: 500 });
+  assert.deepEqual(tight, thread);
+});

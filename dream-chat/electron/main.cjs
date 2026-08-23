@@ -12,6 +12,7 @@ const { DEFAULT_BUDGET, mergeBudget, compactObservation } = require("./agent_con
 const { ThreadManager, DEFAULT_PROVIDER_CAPS, workspaceFingerprint } = require("./thread_manager.cjs");
 const { CodingWorkspace } = require("./coding_workspace.cjs");
 const { CodingAutopilot } = require("./coding_autopilot.cjs");
+const { chooseVerificationProfile, verificationSummary, skippedVerification } = require("./verification_profile.cjs");
 const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
@@ -29,8 +30,12 @@ const {
   isMapleTransportError,
 } = require("./maple_runtime.cjs");
 const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
+const { shouldAutoDemote } = require("./memory_fitness.cjs");
+const { buildGroundedContext } = require("./prompt_context.cjs");
+const { applyDigestCompaction, insertDigestBlock } = require("./thread_digest.cjs");
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
 const { createWorkNotifier, trackChatResponseJob } = require("./work_notifications.cjs");
+const { COMPARISON_SCHEMA, canRunComparison, lastUserMessage, buildComparisonRecord } = require("./comparison_lane.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -1159,6 +1164,7 @@ async function processAgentIntent(payload = {}) {
     status: intent === "conversation" ? "running" : "planning",
     foregroundStep: intent === "conversation" ? `${selection.label} is answering from the selected Hemlock lane` : "Choose the next bounded action from context and evidence",
     evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(context?.evidenceRefs || []), ...(recall?.evidenceRefs || [])])],
+    recall: { ...recall },
   });
 
   // Casual conversation is a first-class local interaction, not a coding plan.
@@ -1544,6 +1550,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
     reasoning: selection.reasoning,
     elapsedMs: Date.now() - startedAt,
     finishReason: "provider_cli_completed",
+    contextChars: (Array.isArray(payload.messages) ? payload.messages : []).reduce((sum, message) => sum + String(message?.content || "").length, 0),
     promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null,
     completionTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null,
     tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
@@ -1572,8 +1579,73 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   };
 }
 
+// T6-P1: comparison lane. Re-runs ONLY the last user message on ONE alternate
+// provider lane. Read-only inference — no tools run, so no plan/approval gate.
+// One comparison at a time (module flag); each provider's own lease still
+// serializes against normal inference on that lane via withProvider.
+let comparisonInFlight = false;
+async function runComparisonLane(payload = {}) {
+  const currentSelection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  const guard = canRunComparison({ inFlight: comparisonInFlight, targetProvider: payload.targetProvider, currentProvider: currentSelection.provider });
+  if (!guard.ok) {
+    appendAgentEvent("comparison.blocked", "blocked", { reason: guard.reason, requested: String(payload.targetProvider || "") }, { reversible: true });
+    throw new Error(guard.reason);
+  }
+  const promptText = lastUserMessage(threadManager.readConversation(String(agentTask.threadId || "")));
+  if (!promptText) throw new Error("No user message is available in this thread to compare.");
+  const messages = [{ role: "user", content: promptText }];
+  // Maple's conversation bookkeeping stamps completion state onto the live
+  // task; a comparison must stay read-only, so restore what it touches.
+  const taskRestore = { phase: agentTask.phase, status: agentTask.status, foregroundStep: agentTask.foregroundStep, blockedReason: agentTask.blockedReason };
+  comparisonInFlight = true;
+  appendAgentEvent("comparison.started", "running", { targetProvider: guard.targetProvider, threadId: agentTask.threadId || null }, { reversible: true });
+  try {
+    let result;
+    if (guard.targetProvider === "maple") {
+      result = await runInference({ provider: "maple", messages, threadId: agentTask.threadId || undefined, taskId: agentTask.id });
+      updateAgentTask(taskRestore, { emit: false });
+    } else {
+      // mode "comparison" skips conversation-mode task mutation; the CLI lane
+      // runs exactly like normal inference otherwise (lease, stream, receipt).
+      result = await runCliInference({ messages, taskId: agentTask.id, threadId: agentTask.threadId || undefined }, normalizeSelection({ provider: guard.targetProvider }), { mode: "comparison" });
+    }
+    const comparison = buildComparisonRecord({ targetProvider: guard.targetProvider, answer: result.answer, telemetry: result.telemetry || null });
+    updateAgentTask({ comparison });
+    appendAgentEvent("comparison.completed", "passed", { comparison }, { evidenceRefs: result.rawOutputRef ? [result.rawOutputRef] : [], reversible: true });
+    return { schema: COMPARISON_SCHEMA, status: "completed", comparison, task: agentTask };
+  } catch (error) {
+    // A failed maple comparison still stamps the task "blocked" from inside
+    // runInference's catch; restore the pre-comparison state either way so the
+    // read-only contract holds on failure paths too.
+    updateAgentTask(taskRestore, { emit: false });
+    appendAgentEvent("comparison.failed", "failed", { error: error.message, targetProvider: guard.targetProvider }, { reversible: true });
+    throw error;
+  } finally {
+    comparisonInFlight = false;
+  }
+}
+
+// Receipt-bearing memory injection (T6-G1): prepend the labeled promoted-memory
+// block as its own system-role message — host additions stay labeled, never
+// blended into model output. One receipt per inference when injection happened.
+function injectGroundedContext(messages = []) {
+  const grounded = buildGroundedContext({ recall: agentTask.recall });
+  if (!grounded.systemBlock) return messages;
+  appendAgentEvent("context.injected", "passed", { count: grounded.citations.length, citationIds: grounded.citations.map((citation) => citation.id) }, { reversible: true });
+  return [{ role: "system", content: grounded.systemBlock }, ...messages];
+}
+
+// Rolling thread digest (T6-G2): compaction that admits what it drops. The
+// digest block re-enters the prompt as its own system message, ahead of the
+// retained tail; the receipt fires once per inference.
+function compactWithDigest(payload = {}) {
+  const { messages: compacted, digest } = applyDigestCompaction(payload.messages);
+  if (!digest) return compacted;
+  appendAgentEvent("thread.digest.created", "passed", { lines: digest.summaryLines.length, droppedCount: digest.droppedCount, chars: digest.chars, threadId: payload.threadId || agentTask.threadId || null }, { reversible: true });
+  return insertDigestBlock(compacted, digest);
+}
+
 async function runInference(payload = {}) {
-  const initialMessages = compactInferenceMessages(payload.messages);
   const selection = normalizeSelection({ provider: payload.provider || payload.modelProvider || agentTask.provider, model: payload.model || agentTask.model, reasoning: payload.reasoning || agentTask.reasoning });
   if (!payload.__providerLease) {
     return threadManager.withProvider(selection.provider, payload.threadId || payload.taskId || agentTask.threadId || agentTask.id, (lease) => runInference({ ...payload, __providerLease: true }, { __providerLease: true }).then((result) => {
@@ -1581,11 +1653,13 @@ async function runInference(payload = {}) {
       return result;
     }));
   }
-  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: initialMessages }, selection, { mode: "conversation" });
+  // Compaction (and its digest receipt) runs once, inside the lease.
+  const initialMessages = compactWithDigest(payload);
+  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: injectGroundedContext(initialMessages) }, selection, { mode: "conversation" });
   const requestedAdapter = String(payload.adapterPath || "");
   const endpoint = String(payload.apiBase || serverUrl).replace(/\/$/, "");
   const startedAt = Date.now();
-  let messages = initialMessages;
+  let messages = injectGroundedContext(initialMessages);
   let recovered = false;
   let stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
   let responsePayload = {};
@@ -1754,6 +1828,7 @@ async function runInference(payload = {}) {
         reasoning: "native",
         elapsedMs: Date.now() - startedAt,
         finishReason,
+        contextChars: messages.reduce((sum, message) => sum + message.content.length, 0),
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
         completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null,
         tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
@@ -2137,6 +2212,7 @@ const agentCommands = {
   "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "suggestion.snooze": { label: "Snooze Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "inference.respond": { label: "Run selected provider inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
+  "comparison.run": { label: "Compare last reply across lanes", capability: "read", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
   "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -2171,6 +2247,7 @@ const agentCommands = {
   "memory.promote": { label: "Promote memory candidate", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
   "memory.demote": { label: "Demote project lesson", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
   "memory.rollback": { label: "Rollback memory promotion", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
+  "memory.feedback": { label: "Record recall usefulness feedback", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
   "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
@@ -2253,6 +2330,7 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
     else if (command === "conversation.history") result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId: String(payload.threadId || agentTask.threadId || ""), conversation: threadManager.readConversation(String(payload.threadId || agentTask.threadId || "")) };
+    else if (command === "comparison.run") result = await runComparisonLane(payload);
     else if (command === "thread.pause") {
       const threadId = String(payload.threadId || agentTask.threadId);
       const checkpoint = threadManager.checkpoint(threadId, { taskId: agentTask.id, phase: "paused", status: "paused", reason: payload.reason || "paused-by-user", evidenceRefs: agentTask.evidenceRefs, artifactRepair: agentTask.artifactRepair, verificationIssues: agentTask.artifactRepair?.issues || [] });
@@ -2318,6 +2396,11 @@ async function runAgentCommand(action, payload = {}) {
       if (payload.__fromAgentAction && !approvedPlanAction) throw new Error("Applying a coding edit requires an approved Hemlock plan action.");
       result = codingWorkspace.apply({ threadId: payload.threadId || agentTask.threadId, source: payload.source, patches: payload.patches, baseDigests: payload.baseDigests, reason: payload.reason || agentTask.objective });
       updateAgentTask({ evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(result.evidenceRefs || [])])], foregroundStep: "Scoped coding edit applied; verification is next" });
+      // Conversational Build flow: surface post-apply verification in Chat.
+      // The coding repair autopilot runs its own verify loop, so stay out of
+      // its way. Fire-and-forget: apply's result must not block on a long
+      // verification run.
+      if (!String(payload.__agentActionId || "").startsWith("code-repair")) void runPostApplyVerification(result);
     }
     else if (command === "code.rollback") result = codingWorkspace.rollback({ threadId: payload.threadId || agentTask.threadId, changeSetId: payload.changeSetId });
     else if (command === "git.status") result = await gitStatusTool(payload);
@@ -2394,6 +2477,21 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "dream") result = await runDream(payload);
     else if (command === "selfloop" || command.startsWith("selfloop.")) result = await runSipsRuntime({ action: "selfloop", selfloopAction: command.startsWith("selfloop.") ? command.split(".")[1] : payload.selfloopAction, focus: payload.focus, outcome: payload.outcome, receiptPath: payload.receiptPath });
     else if (command === "remember") result = await recordAgentMemory(payload);
+    else if (command === "memory.feedback") {
+      // T6-M1b: recall usefulness feedback. The ledger append is additive in
+      // sips_runtime.py (sidecar feedback.jsonl); the demote policy reuses
+      // memory_fitness.shouldAutoDemote and the EXISTING demote transition
+      // (with its rollback receipt) — no new demote path is invented here.
+      result = await runSipsRuntime({ action: "memory-feedback", recordId: payload.recordId, kind: payload.kind, query: payload.query });
+      const counts = { useful: Math.max(0, Math.floor(Number(result?.counts?.useful))) || 0, irrelevant: Math.max(0, Math.floor(Number(result?.counts?.irrelevant))) || 0 };
+      const autoDemote = String(result?.recordStatus || "") === "active" && shouldAutoDemote(counts);
+      if (autoDemote) {
+        const demoted = await runSipsRuntime({ action: "memory-transition", transition: "demote", targetId: payload.recordId, note: payload.note || `Auto-demoted after ${counts.irrelevant} not-relevant recall votes vs ${counts.useful} useful votes.`, evidencePath: sessionEventsPath, provenance: "Hemlock recall usefulness auto-demote" });
+        appendAgentEvent("memory.demote", "recorded", { targetId: payload.recordId, reason: "recall-feedback-auto-demote", record: demoted.record }, { evidenceRefs: [demoted.memoryPath], reversible: true });
+      }
+      result = { ...result, autoDemoted: autoDemote };
+      appendAgentEvent("memory.feedback", "recorded", { recordId: payload.recordId, kind: payload.kind, query: payload.query || "", counts, autoDemoted: autoDemote }, { evidenceRefs: [result.feedbackPath], reversible: true });
+    }
     else if (command.startsWith("memory.")) {
       result = await runSipsRuntime({ action: "memory-transition", transition: command.split(".")[1], targetId: payload.targetId, note: payload.note, evidencePath: sessionEventsPath, provenance: `Hemlock memory command ${command}` });
       appendAgentEvent(`memory.${command.split(".")[1]}`, "recorded", { targetId: payload.targetId, record: result.record }, { evidenceRefs: [result.memoryPath], reversible: true });
@@ -2789,6 +2887,33 @@ async function runVerification(profileId, emit = null, options = {}) {
   } catch (error) {
     appendAgentEvent("verification.completed", "failed", { profile: profileId, label: profile.label, error: error.message });
     throw error;
+  }
+}
+
+// Conversational Build flow (T6-V1): after an approved code.apply lands a
+// change set, run the matched allowlisted verification profile ONCE and pin
+// the result on the task so Chat can render a VERIFICATION card. Only
+// allowlisted profiles can run; with no match we record an honest skip.
+async function runPostApplyVerification(changeSet) {
+  const changeSetId = String(changeSet?.id || "");
+  if (changeSetId && agentTask.verification?.status !== "skipped" && agentTask.verification?.schema === "hemlock.agent.verification.v1" && agentTask.verification?.changeSetId === changeSetId) return;
+  const appliedPaths = (Array.isArray(changeSet?.files) ? changeSet.files : []).map((file) => file?.path).filter(Boolean);
+  const profiles = Object.fromEntries(Object.entries(verificationProfiles).map(([id, profile]) => [id, { label: profile.label, command: profile.command, timeoutMs: profile.timeoutMs }]));
+  const choice = chooseVerificationProfile(profiles, appliedPaths);
+  if (!choice) {
+    updateAgentTask({ verification: skippedVerification("no matching profile") });
+    appendAgentEvent("verification.ran", "skipped", { reason: "no matching profile", changeSetId }, { reversible: true });
+    return;
+  }
+  const startedAt = Date.now();
+  try {
+    const receipt = await runVerification(choice.id, null, { workspaceRoot: agentTask.workspaceRoot });
+    const summary = verificationSummary({ choice, receipt, durationMs: Date.now() - startedAt, changeSetId });
+    updateAgentTask({ verification: summary, evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(receipt.evidenceRefs || [])])] });
+    appendAgentEvent("verification.ran", summary.status, { verification: summary }, { reversible: true, evidenceRefs: receipt.evidenceRefs || [] });
+  } catch (error) {
+    updateAgentTask({ verification: { schema: "hemlock.agent.verification.v1", status: "failed", reason: error.message, ranAt: new Date().toISOString() } });
+    appendAgentEvent("verification.ran", "failed", { error: error.message, changeSetId }, { reversible: true });
   }
 }
 

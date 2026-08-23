@@ -860,3 +860,35 @@ tranche5_improvements_2026_08_22:
   incident_note: "One fix subagent timed out after reverting uncommitted main.cjs hooks (git restore); hooks were re-applied directly by the orchestrator with the leak guard included. No other work was lost."
   claim_boundary: "All verification is host-side and deterministic (unit suites, builds, CDP DOM probes). Live Maple notification delivery, real macOS notification rendering, and a live desktop relaunch were not exercised in this pass."
 
+tranche6_grounded_harness_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_190000-tranche6-grounded-harness.md
+  headline: "The Memory Garden now feeds the model: promoted lessons reach inference prompts with receipts and an off-switch."
+  changes:
+    grounded_memory_injection:
+      what: "buildGroundedContext (electron/prompt_context.cjs) renders active-status SIPS records as a labeled system block [Hemlock memory · N records · verify-before-use], capped 1200 chars; injected into BOTH maple and CLI conversation inference via injectGroundedContext; context.injected event once per inference; structured-action path never injected; grounding chip in Chat status bar shows count and opens the popover/Memory Garden."
+    thread_digest:
+      what: "applyDigestCompaction/buildDigest/insertDigestBlock (electron/thread_digest.cjs): dropped middle history is summarized as metadata-derived digest lines (≤12, first sentences) re-entering the prompt inside the SAME char budget; thread.digest.created event once per inference (inside the provider lease)."
+      compaction_bug_fix: "Pre-existing bug fixed in compactInferenceMessages: a trailing assistant reply after the latest user message was silently dropped even with huge budget; now kept with its chars budgeted. Regression test added to maple_runtime.test.cjs."
+    context_meter:
+      what: "telemetry.contextChars on both inference paths; composer model line gains .context-meter (used/budget % of 24k, gold at ≥80%), pure contextMeter helper."
+    post_apply_verification_card:
+      what: "Conversational code.apply success auto-runs the matched allowlisted verification profile once (runPostApplyVerification), pins hemlock.agent.verification.v1 on the task with honest skipped status when no profile matches; Chat renders a VERIFICATION card (passed sage / failed gold / skipped); code-repair autopilot actions excluded."
+    completion_footnote:
+      what: "Renderer-only host-labeled note pushed on completion after apply: 'Host receipt · change set applied · verification passed/failed'; dedupe keyed task+changeSet+ranAt."
+    memory_fitness_loop:
+      what: "memory_fitness.cjs (scoreRecord/rankForRecall/shouldAutoDemote/applyFeedback, 15 tests); sips_runtime.py additive sidecar feedback.jsonl + read_feedback/aggregate_feedback_counts/memory-feedback action; allowlisted memory.feedback command appends votes and auto-demotes via the EXISTING demote transition when irrelevant≥3∧>useful; grounding chip popover offers useful/not-relevant per injected record."
+    comparison_lane:
+      what: "comparison.run host command re-sends the thread's last user prompt verbatim to one alternate lane (read-only conversation inference, provider lease respected, one-in-flight guard reset in finally, pre-comparison task state restored on success AND failure); renderer lane picker popover + two-column verbatim compare view stacking under 800px."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 172 passed (153 post-T5 baseline + prompt_context, thread_digest, verification_card, memory_feedback, comparison_lane, maple_runtime regression)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed; py_compile sips_runtime.py passed"
+    package_json: "verification_card.test.cjs added to test:agent script so CI cannot skip it"
+    reviews: "Every task passed independent spec+quality review. Reviewers caught and parent fixed: missing thread_digest wiring, M1b dead wiring (memory.feedback never called runSipsRuntime — one-line fix), P1 blocked-state leak on failed maple comparisons (restore moved to catch)."
+  known_minor_debt:
+    - "inference.respond bypasses the intent path so it injects whatever agentTask.recall last held (stale-recall asymmetry, pre-existing pattern)"
+    - "Maple vs CLI comparison lanes differ: maple gets grounded-context injection + digests, CLI does not — not apples-to-apples"
+    - "task.comparison persists across turns without pinning the compared prompt text, so 'same prompt' can drift from the current column"
+  claim_boundary: "All verification is deterministic host-side (unit suites, builds, syntax checks). Live cross-lane comparison runs, real recall injection against a populated Garden, and a live relaunch smoke were not exercised in this pass."
+
