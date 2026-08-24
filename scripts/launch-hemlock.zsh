@@ -210,7 +210,7 @@ fi
 # Block until the local Maple server answers /health so callers (and humans)
 # see one clean "ready" line instead of guessing. Skipped when the Electron
 # app exits immediately or when explicitly disabled.
-if (( exit_code == 0 )) && [[ "$HEMLOCK_LAUNCH_DRY_RUN" != "1" ]] && [[ "$HEMLOCK_SKIP_READINESS_WAIT" != "1" ]]; then
+if (( exit_code == 0 )) && [[ "${HEMLOCK_LAUNCH_DRY_RUN:-0}" != "1" ]] && [[ "${HEMLOCK_SKIP_READINESS_WAIT:-0}" != "1" ]]; then
   ready_after=""
   for i in {1..120}; do
     if command -v curl >/dev/null 2>&1 && curl -s -m 2 http://127.0.0.1:8080/health 2>/dev/null | grep -q '"status"'; then
