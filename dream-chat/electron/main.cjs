@@ -21,7 +21,7 @@ const { PreviewSessionManager } = require("./preview_policy.cjs");
 const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
 const { nextReadinessDelay, classifyHealthFailure, missingCheckpointItem } = require("./readiness_probe.cjs"); // T9-H1
 const { cacheStats } = require("./prompt_cache_stats.cjs");
-const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
+const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, shouldCheckpointStream, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
 const { firstTokenWatchdog } = require("./stream_watchdog.cjs");
 const {
@@ -422,6 +422,8 @@ const providerStatusCache = new Map();
 const activeStreams = new Map();
 const streamRing = new Map();
 const STREAM_RING_LIMIT = 240;
+// T11-A: bound on the appendAgentEvent dedup set (recent-window dedup only).
+const AGENT_EVENT_ID_WINDOW = 4096;
 let activeArtifactId = null;
 
 const providerCommandCandidates = {
@@ -781,6 +783,16 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
   };
   if (agentEventIds.has(event.id)) return event;
   agentEventIds.add(event.id);
+  // T11-A: the dedup set grew one entry per event for the process lifetime
+  // (agentEvents itself is capped at 160, but this Set never was). Bound it to
+  // a recent window — insertion order makes oldest ids drop first, so retry-
+  // window dedup semantics are preserved while memory stays flat.
+  if (agentEventIds.size > AGENT_EVENT_ID_WINDOW) {
+    for (const staleId of agentEventIds) {
+      agentEventIds.delete(staleId);
+      if (agentEventIds.size <= AGENT_EVENT_ID_WINDOW / 2) break;
+    }
+  }
   agentEvents.push(event);
   if (agentEvents.length > 160) agentEvents.shift();
   fs.appendFileSync(sessionEventsPath, `${JSON.stringify(event)}\n`, "utf-8");
@@ -841,6 +853,10 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
   if (!stream.channels[normalizedChannel]) stream.channels[normalizedChannel] = "";
   stream.channels[normalizedChannel] += normalizedDelta;
   if (normalizedChannel === "content") stream.text += normalizedDelta;
+  // T11-A: account raw delta bytes incrementally so the checkpoint throttle
+  // never needs to serialize the full accumulated channels just to measure
+  // growth (the old code JSON.stringify'd every channel on every call).
+  stream.channelBytes = (stream.channelBytes || 0) + Buffer.byteLength(normalizedDelta, "utf8");
   const frame = { channel: normalizedChannel, delta: normalizedDelta, terminal, status, usage, stopReason, time: new Date().toISOString() };
   if (terminal) {
     stream.frameCoalescer?.flush();
@@ -856,23 +872,29 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
 function checkpointStream(stream, { force = false } = {}) {
   if (!stream || !Object.values(stream.channels || {}).some(Boolean)) return;
   const now = Date.now();
-  const bytes = Buffer.byteLength(JSON.stringify(stream.channels), "utf8");
-  if (!force && now - stream.lastCheckpointAt < 750 && bytes - stream.lastCheckpointBytes < 2048) return;
+  // T11-A: throttle decision now uses incrementally-accounted delta bytes
+  // (shouldCheckpointStream) instead of serializing the entire channel map on
+  // every call — the old code paid O(total-output) JSON.stringify per SSE
+  // chunk even when the checkpoint was going to be skipped.
+  if (!shouldCheckpointStream(stream, { force, now })) return;
+  const serialized = JSON.stringify(stream.channels);
+  const bytes = Buffer.byteLength(serialized, "utf8");
   stream.lastCheckpointAt = now;
   stream.lastCheckpointBytes = bytes;
+  stream.lastMarkBytes = stream.channelBytes || 0;
   appendAgentEvent(stream.kind === "model_text" ? "inference.stream.checkpoint" : "operation.output.checkpoint", "checkpoint", {
     streamId: stream.streamId,
     operationId: stream.operationId,
     kind: stream.kind,
     sequence: stream.sequence - 1,
-    digest: streamDigest(JSON.stringify(stream.channels)),
+    digest: streamDigest(serialized),
     bytes,
     channels: streamChannelRecords(stream).map(({ name, digest, text }) => ({ name, digest, tail: text.slice(-2400) })),
   }, { reversible: true });
 }
 
 function startStream({ taskId = agentTask.id, operationId = null, kind = "model_text", provider = "maple" } = {}) {
-  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, provider, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, controller: null, abortReason: null, frameCoalescer: null };
+  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, provider, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, channelBytes: 0, lastMarkBytes: 0, controller: null, abortReason: null, frameCoalescer: null };
   stream.frameCoalescer = createStreamFrameCoalescer({ emit: (frame) => emitStreamFrame(stream, frame) });
   activeStreams.set(stream.streamId, stream);
   appendAgentEvent(kind === "model_text" ? "inference.stream.started" : "operation.output.started", "running", { streamId: stream.streamId, taskId, operationId, kind, provider });
@@ -900,6 +922,10 @@ function finishStream(stream, { status = "completed", stopReason = null, usage =
     channels: streamChannelRecords(stream),
   }, { reversible: true });
   activeStreams.delete(stream.streamId);
+  // T11-A: the per-stream frame ring was write-only replay memory that no code
+  // path ever read back; without this delete every finished stream leaked up
+  // to STREAM_RING_LIMIT retained frames in streamRing for the process lifetime.
+  streamRing.delete(stream.streamId);
 }
 
 function abortStreamsForTask(taskId, reason = "cancelled") {

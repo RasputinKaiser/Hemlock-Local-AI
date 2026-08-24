@@ -35,9 +35,51 @@ test("classifyInferenceError recognizes GPU server errors (HTTP 500 naming Metal
   assert.equal(result.retryable, true);
 });
 
-test("classifyInferenceError does not treat non-GPU HTTP 500 as gpu-server-error", () => {
+test("classifyInferenceError treats non-GPU HTTP 5xx as server-error, not gpu-server-error", () => {
   const error = Object.assign(new Error("internal error"), { status: 502 });
-  assert.equal(classifyInferenceError(error).kind, "unknown");
+  const result = classifyInferenceError(error);
+  assert.equal(result.kind, "server-error");
+  assert.notEqual(result.kind, "gpu-server-error");
+  assert.equal(result.retryable, true);
+});
+
+test("classifyInferenceError recognizes unreachable-host transport codes (T11-B)", () => {
+  for (const code of ["EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"]) {
+    const error = Object.assign(new Error("request failed"), { code });
+    const result = classifyInferenceError(error);
+    assert.equal(result.kind, "transport-death", `expected transport-death for ${code}`);
+    assert.equal(result.retryable, true);
+    assert.ok(result.userMessage.length > 0);
+  }
+});
+
+test("classifyInferenceError recognizes unreachable-host message wording without a code", () => {
+  for (const message of ["getaddrinfo ENOTFOUND maple.local", "connect EHOSTUNREACH 127.0.0.1:8080"]) {
+    const result = classifyInferenceError(new Error(message));
+    assert.equal(result.kind, "transport-death");
+    assert.equal(result.retryable, true);
+  }
+});
+
+test("classifyInferenceError recognizes HTTP 404 as endpoint-not-found", () => {
+  const byStatus = Object.assign(new Error("Maple-Preview returned HTTP 404: Not Found"), { status: 404 });
+  const byMessage = new Error("Maple-Preview returned HTTP 404: model route missing");
+  for (const error of [byStatus, byMessage]) {
+    const result = classifyInferenceError(error);
+    assert.deepEqual({ kind: result.kind, retryable: result.retryable }, { kind: "endpoint-not-found", retryable: false });
+    assert.equal(result.userMessage, "The local model server does not expose that endpoint.");
+  }
+});
+
+test("classifyInferenceError recognizes malformed structured-action envelopes", () => {
+  const byCode = Object.assign(new Error("Maple produced two invalid action envelopes: unexpected token"), { code: "INVALID_ACTION_OUTPUT" });
+  const empty = Object.assign(new Error("Maple returned no structured action content."), { code: "EMPTY_ACTION_OUTPUT" });
+  const byMessage = new Error("Maple produced two invalid action envelopes: Unexpected token '<' at position 0");
+  for (const error of [byCode, empty, byMessage]) {
+    const result = classifyInferenceError(error);
+    assert.deepEqual({ kind: result.kind, retryable: result.retryable }, { kind: "action-envelope-invalid", retryable: false });
+    assert.equal(result.userMessage, "The model returned a malformed action payload.");
+  }
 });
 
 test("classifyInferenceError recognizes user cancellation", () => {

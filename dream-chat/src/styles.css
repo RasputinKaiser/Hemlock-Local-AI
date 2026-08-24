@@ -226,7 +226,8 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-error .error-dismiss { margin-left: auto; border: 0; background: transparent; color: inherit; font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: 6px; opacity: 0.7; }
 .chat-error .error-dismiss:hover, .chat-error .error-dismiss:focus-visible { opacity: 1; background: rgba(148, 75, 47, 0.12); }
 .maple-channel-reasoning { background: rgba(203, 184, 122, 0.08); border-radius: 6px; }
-.maple-channel-reasoning pre { color: #7d7460; font-size: 10.5px; }
+.maple-channel-reasoning pre { color: #6b6350; font-size: 10.5px; }
+.maple-channel-reasoning[open] summary::before { content: ""; display: inline-block; width: 5px; height: 5px; margin-right: 6px; border-radius: 50%; background: var(--gold); vertical-align: 1px; }
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: #cf9e42; animation: lampPulse 1.2s infinite; }
 .chat-compose { display: flex; align-items: flex-end; gap: 10px; margin: 0 23px 19px; padding: 8px 8px 8px 14px; border: 1px solid #c0ccba; border-radius: 11px; background: #fffdf5; }
 .chat-compose textarea { min-height: 46px; }
@@ -1002,7 +1003,9 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .budget-stepper { display: inline-flex; align-items: center; gap: 5px; margin-right: auto; color: #80662d; font-family: "DM Mono", monospace; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
 .budget-stepper button { min-width: 20px; height: 20px; padding: 0 4px; border: 1px solid #d5ddd1; border-radius: 5px; background: #fffdf6; color: #55705d; font: 500 10px "DM Mono", monospace; cursor: pointer; }
 .budget-stepper button:disabled { opacity: .45; cursor: default; }
-.budget-usage { margin-top: 8px; padding-top: 7px; border-top: 1px solid rgba(133, 101, 33, .18); color: #80662d; font: 600 9px "DM Mono", monospace; letter-spacing: .08em; }
+.budget-stepper strong { min-width: 18px; color: #5d4a1e; font-size: 11px; letter-spacing: 0; text-align: center; font-variant-numeric: tabular-nums; }
+.budget-stepper small { color: #80662d; }
+.budget-usage { margin-top: 8px; padding-top: 7px; border-top: 1px solid rgba(133, 101, 33, .18); color: #80662d; font: 600 10px "DM Mono", monospace; letter-spacing: .05em; font-variant-numeric: tabular-nums; }
 /* T7-S1: answer-in-place question card — Maple asks, you answer above the plan dock. */
 .chat-question-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid #d6b767; border-radius: 10px; background: linear-gradient(135deg, #fff8df, #fffdf5); box-shadow: 0 7px 20px rgba(133, 101, 33, .1); }
 .chat-question-card .card-kicker { display: flex; align-items: center; justify-content: space-between; }
@@ -1047,8 +1050,9 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .interaction-mode-bar button { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 9px; border: 1px solid #cddbc9; border-radius: 6px; background: #f7faf2; color: #54705a; font: inherit; cursor: pointer; }
 .interaction-mode-bar button.is-selected { border-color: #8cad91; background: #e4f0df; color: #234b31; box-shadow: inset 0 0 0 1px #bdd3b9; }
 .interaction-mode-bar small { flex: 1 1 240px; color: #718274; font-size: 9px; }
-.stream-caret { display: inline-block; margin-left: 3px; color: #7d6529; animation: caretBlink 800ms step-end infinite; }
-@keyframes caretBlink { 50% { opacity: 0; } }
+.stream-caret { display: inline-block; margin-left: 3px; color: #7d6529; animation: caretPulse 900ms ease-in-out infinite; }
+@keyframes caretPulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+@media (prefers-reduced-motion: reduce) { .stream-caret { animation: none; opacity: .55; } }
 .sips-surface, .memory-surface, .dream-surface, .activity-surface, .receipts-surface, .map-surface, .settings-surface { overscroll-behavior: contain; }
 
 /* Model-output fidelity: Maple's channels are the primary reading surface;
@@ -1064,7 +1068,9 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .maple-channel { margin-top: 12px; }
 .maple-channel + .maple-channel { padding-top: 12px; border-top: 1px solid #e0e6dc; }
 .model-channel-label { display: block; overflow: hidden; margin-bottom: 6px; color: #43634d; font-family: "DM Mono", monospace; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-overflow: ellipsis; white-space: nowrap; }
-.maple-channel-content .message-content { padding: 0; border: 0; background: transparent; color: #22392b; font-size: 15px; line-height: 1.65; }
+.maple-channel-content .message-content { max-width: 72ch; padding: 0; border: 0; background: transparent; color: #22392b; font-size: 15px; line-height: 1.65; text-wrap: pretty; }
+.maple-channel-waiting p { margin: 0; color: #5f7161; font-size: 12px; line-height: 1.5; }
+.work-message.is-streaming .message-meta > span:first-child { color: #7d6529; }
 .maple-channel-content { min-height: 0; }
 .work-message.assistant .maple-output-card { line-height: 1.3; }
 .maple-channel-secondary { color: #334c3a; }
@@ -1104,7 +1110,8 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-verification-card.is-failed { border-color: #d6ae59; box-shadow: inset 3px 0 0 var(--gold); }
 .chat-verification-card.is-failed .card-kicker > span,
 .chat-verification-card.is-failed strong { color: #956d23; }
-.chat-verification-card.is-skipped { opacity: .82; }
+.chat-verification-card.is-skipped .card-kicker > span { color: #5f7161; }
+.chat-verification-card.is-skipped strong { color: #556958; }
 
 /* Verification-aware completion footnote (T6-V2): renderer-composed host
    receipt in the transcript, styled like the system notes plus a status
