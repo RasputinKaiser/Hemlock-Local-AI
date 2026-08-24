@@ -960,3 +960,16 @@ tranche8_stability_speed_2026_08_23:
     gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
   claim_boundary: "Deterministic host-side verification only. The stall watchdog was not exercised against a live SIGSTOP'd server; cache-hit rendering not yet seen live in Chat (needs app relaunch)."
 
+fix_partial_output_and_fresh_context_2026_08_24:
+  status: implemented_verified
+  trigger: "User incident: a short-story request streamed 17,632 chars over ~90s (verified in model-output receipt model_text-1787545277637) but the stream was cut before finish_reason; Hemlock's cancel path discarded everything — no assistant message persisted. Separately, five explicit-story refusals stayed in thread history and Maple's reasoning channel re-litigated them every turn ('the user is testing boundaries again'), poisoning all later prompts."
+  changes:
+    keep_partial_output:
+      what: "Cancelled/interrupted inference now persists streamed content as an assistant message with partial:true + stopReason in the thread (thread_manager.appendConversation carries the fields); renderer shows 'Interrupted — reply kept up to the cut' with gold border and preserves partial/stopReason across history loads."
+    fresh_context:
+      what: "NEW conversation.reset host command + threadManager.resetConversation (archives conversation to <file>.<ts>-archive.jsonl, clears it, keeps thread identity/checkpoints/receipts). Allowlisted as explicit-approval; palette action 'Fresh context'; renderer clears messages and shows an archived-count host footnote."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok, thread_manager suite 5/5"
+    live_evidence: "Incident diagnosed from durable receipts: raw SSE payload had 4217 chunks / zero finish_reason; thread jsonl confirmed poisoned-history reasoning verbatim."
+  claim_boundary: "Partial-output persistence and reset verified deterministically (suites/build); neither exercised live end-to-end in a running app yet."
+

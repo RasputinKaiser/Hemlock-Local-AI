@@ -423,10 +423,31 @@ class ThreadManager {
     if (!thread) throw new Error(`Hemlock thread was not found: ${threadId}`);
     const conversationPath = thread.conversationRef || path.join(this.conversationRoot, `${threadId}.jsonl`);
     fs.mkdirSync(path.dirname(conversationPath), { recursive: true });
-    const entry = { id: String(message.id || id("message")), threadId, role: ["user", "assistant", "system"].includes(message.role) ? message.role : "assistant", content: String(message.content || "").slice(0, 12000), channels: Array.isArray(message.channels) ? message.channels.slice(0, 12) : [], provider: message.provider || thread.provider, model: message.model ?? thread.model, reasoning: message.reasoning ?? thread.reasoning, createdAt: message.createdAt || nowIso(), rawOutputRef: message.rawOutputRef || null };
+    const entry = { id: String(message.id || id("message")), threadId, role: ["user", "assistant", "system"].includes(message.role) ? message.role : "assistant", content: String(message.content || "").slice(0, 12000), channels: Array.isArray(message.channels) ? message.channels.slice(0, 12) : [], provider: message.provider || thread.provider, model: message.model ?? thread.model, reasoning: message.reasoning ?? thread.reasoning, createdAt: message.createdAt || nowIso(), rawOutputRef: message.rawOutputRef || null, ...(message.partial ? { partial: true, stopReason: String(message.stopReason || "cancelled") } : {}) };
     fs.appendFileSync(conversationPath, `${JSON.stringify(entry)}\n`, "utf8");
     if (thread.conversationRef !== conversationPath) this.updateThread(threadId, { conversationRef: conversationPath });
     return entry;
+  }
+
+  // T8-F2: fresh context. Archives the existing conversation file next to the
+  // original (timestamped) and clears it, keeping the thread identity so
+  // checkpoints, artifacts, and receipts stay linked. The model's next prompt
+  // starts from zero history — no more relitigating old refusals.
+  resetConversation(threadId) {
+    const thread = this.thread(threadId);
+    if (!thread) throw new Error(`Hemlock thread was not found: ${threadId}`);
+    const conversationPath = thread.conversationRef || path.join(this.conversationRoot, `${threadId}.jsonl`);
+    let archivedMessages = 0;
+    let archivePath = null;
+    if (fs.existsSync(conversationPath)) {
+      const original = fs.readFileSync(conversationPath, "utf8");
+      archivedMessages = original.split("\n").filter((line) => line.trim()).length;
+      archivePath = `${conversationPath}.${Date.now()}-archive.jsonl`;
+      fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+      fs.writeFileSync(archivePath, original, "utf8");
+      fs.writeFileSync(conversationPath, "", "utf8");
+    }
+    return { threadId, archivedMessages, archivePath };
   }
 
   readConversation(threadId, { limit = 80 } = {}) {

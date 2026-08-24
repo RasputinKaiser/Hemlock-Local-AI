@@ -1937,6 +1937,25 @@ async function runInference(payload = {}) {
       if (reason === "cancelled" || reason === "interrupted") {
         mapleNotify.cancel();
         finishStream(stream, { status: "cancelled", stopReason: reason, rawOutputRef: interruptedRawOutputRef });
+        // T8-F1: a cancel must not vaporize minutes of streamed output. If the
+        // model produced real content before the cut, keep it in the thread as
+        // an honest partial reply instead of discarding it (17K-char story
+        // incident, 2026-08-24: full output existed only in raw receipts).
+        const partialText = stream.text.trim();
+        if (partialText) {
+          threadManager.appendConversation(String(payload.threadId || agentTask.threadId || ""), {
+            role: "assistant",
+            content: partialText,
+            channels: modelChannelRecords(stream.channels),
+            provider: "maple",
+            model: "default_model",
+            reasoning: "native",
+            rawOutputRef: interruptedRawOutputRef,
+            partial: true,
+            stopReason: reason,
+          });
+          appendAgentEvent("conversation.partial", "degraded", { taskId: agentTask.id, streamId: stream.streamId, chars: partialText.length, reason }, { reversible: true });
+        }
         const cancellation = new Error("Inference was cancelled before completion.");
         cancellation.code = "CANCELLED";
         throw cancellation;
@@ -2234,6 +2253,7 @@ const agentCommands = {
   "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "conversation.reset": { label: "Reset thread to fresh context", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false },
   "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -2372,6 +2392,15 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "switched", thread, task: agentTask, context: compileThreadContext(thread.id), conversation: threadManager.readConversation(thread.id) };
     }
     else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
+    else if (command === "conversation.reset") {
+      // T8-F2: fresh context. A poisoned history (refusal loops, dead-end
+      // tangents) follows the model every turn; this archives the old
+      // conversation file and starts clean, keeping the thread identity.
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const reset = threadManager.resetConversation(threadId);
+      appendAgentEvent("conversation.reset", "accepted", { threadId, archivedMessages: reset.archivedMessages, archivePath: reset.archivePath }, { reversible: false });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "reset", threadId, ...reset };
+    }
     else if (command === "conversation.history") result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId: String(payload.threadId || agentTask.threadId || ""), conversation: threadManager.readConversation(String(payload.threadId || agentTask.threadId || "")) };
     else if (command === "comparison.run") result = await runComparisonLane(payload);
     else if (command === "thread.pause") {
