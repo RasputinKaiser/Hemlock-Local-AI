@@ -9,6 +9,7 @@ const {
   createObservation,
   createPlan,
   boundedActionInput,
+  clampBudgetOverrides,
   coerceActionPayload,
   extractActionEnvelope,
   mergeBudget,
@@ -197,12 +198,30 @@ class AgentOrchestrator {
     return plan;
   }
 
-  async approvePlan(taskId, planId) {
+  async approvePlan(taskId, planId, budgetOverrides = null) {
     const task = this.task();
     if (task?.id !== taskId) throw new Error("The plan does not belong to the current task.");
     const plan = this.requirePlan(taskId, planId);
     if (plan.status === "approved") return { schema: "hemlock.agent.plan.result.v1", status: this.task().status, plan, task: this.task(), claimBoundary: "The plan was already approved; the durable task state is authoritative." };
+    // T10-LaneA guard: an approval only means something while the task is
+    // actually parked in waiting_for_approval. Reject honestly (no crash, no
+    // state mutation) when the task has moved on to running/blocked/terminal.
+    if (task.status !== "waiting_for_approval") {
+      return {
+        schema: "hemlock.agent.plan.result.v1",
+        status: "blocked",
+        reason: `Task is not awaiting plan approval; current status is ${task.status}.`,
+        plan,
+        task: this.task(),
+        claimBoundary: "No approval was applied and no task state changed.",
+      };
+    }
     if (plan.status !== "proposed") throw new Error(`Plan is not awaiting approval; current status is ${plan.status}.`);
+    // T10-LaneA: clamp user-granted budget overrides here (same pure helper the
+    // host uses at plan.approve dispatch) so the orchestrator is safe even when
+    // it is driven directly. Out-of-range or garbage keys drop out.
+    const clampedOverrides = clampBudgetOverrides(budgetOverrides);
+    if (Object.keys(clampedOverrides).length) this.updateTask({ budget: mergeBudget({ ...this.task().budget, ...clampedOverrides }) });
     this.kernel.transitionPlan(planId, "approve");
     this.updateTask({ phase: "work", status: "running", foregroundStep: "Maple is selecting the first bounded action", blockedReason: null, activePlanId: planId });
     this.emit("plan.approved", "passed", { planId, taskId, plan: this.kernel.getProjection().plans.find((item) => item.id === planId) }, { reversible: true });

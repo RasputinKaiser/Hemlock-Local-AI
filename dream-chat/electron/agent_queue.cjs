@@ -75,6 +75,25 @@ class AgentIntentQueue {
   }
 
   enqueue(payload = {}) {
+    // T10-LaneA: reject an identical objective that is already queued rather
+    // than stacking it behind itself. Only pending entries count — an active
+    // task can still be steered toward the same objective. FIFO order and
+    // durable state are untouched on a duplicate.
+    const incoming = String(payload.objective || payload.text || "").trim().toLowerCase();
+    if (incoming) {
+      const duplicateIndex = this.pending.findIndex((entry) => String(entry.payload.objective || entry.payload.text || "").trim().toLowerCase() === incoming);
+      if (duplicateIndex >= 0) {
+        const duplicate = this.pending[duplicateIndex];
+        return Promise.resolve({
+          schema: "hemlock.agent.queue.result.v1",
+          status: "duplicate",
+          requestId: duplicate.requestId,
+          queueEntry: { ...duplicate, payload: safePayload(duplicate.payload), position: duplicateIndex + 1 },
+          queue: this.snapshot(),
+          claimBoundary: "An identical objective is already queued; the new request was rejected without starting work or reordering the queue.",
+        });
+      }
+    }
     const entry = {
       schema: "hemlock.agent.queue.entry.v1",
       id: id("intent"),

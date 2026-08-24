@@ -487,3 +487,55 @@ test("a retryable failure retries once, while a cancellation cannot be rewritten
   assert.equal(cancelled.kernel.getProjection().actions[0].status, "cancelled");
   fs.rmSync(cancelled.root, { recursive: true, force: true });
 });
+
+test("blocks a plan approval when the task is not waiting_for_approval and leaves state intact", async () => {
+  const harness = makeHarness();
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    // Simulate the task moving on (e.g. running) after the plan was proposed.
+    harness.orchestrator.updateTask({ status: "running", phase: "work" });
+    const before = harness.kernel.getProjection();
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "blocked");
+    assert.match(result.reason, /not awaiting plan approval; current status is running/i);
+    assert.equal(result.claimBoundary, "No approval was applied and no task state changed.");
+    const after = harness.kernel.getProjection();
+    assert.deepEqual(after.plans[0].status, before.plans[0].status);
+    assert.equal(after.plans[0].status, "proposed");
+    assert.equal(harness.task.status, "running");
+    assert.equal(after.actions.length, before.actions.length);
+    assert.equal(after.observations.length, before.observations.length);
+    assert.equal(harness.events.some((event) => event.type === "plan.approved"), false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("clamps out-of-range budget overrides at approval time into task.budget", async () => {
+  const harness = makeHarness();
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ kind: "answer", label: "Answer from scoped local context" }] }).plan;
+    await harness.orchestrator.approvePlan(harness.task.id, plan.id, { maxAgentSteps: 999, maxCommands: -4, garbageKey: 7 });
+    assert.equal(harness.task.budget.maxAgentSteps, 24);
+    assert.equal(harness.task.budget.maxCommands, 1);
+    assert.equal(harness.task.budget.garbageKey, undefined);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("merges valid budget overrides into task.budget during approval", async () => {
+  const harness = makeHarness();
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ kind: "answer", label: "Answer from scoped local context" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id, { maxAgentSteps: "5", maxCommands: 3 });
+    assert.equal(result.status, "completed");
+    assert.equal(harness.task.budget.maxAgentSteps, 5);
+    assert.equal(harness.task.budget.maxCommands, 3);
+    // Untouched fields keep their prior values rather than resetting.
+    assert.equal(harness.task.budget.maxRetriesPerOperation, 1);
+    assert.equal(harness.task.budget.maxMutationSets, 1);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});

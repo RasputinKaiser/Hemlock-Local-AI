@@ -16,7 +16,7 @@ import {
   setWindowState,
   toggleMaximize,
 } from "./windowManager.js";
-import { createEphemeralStreamStore, hasLiveStream } from "./streamStore.js";
+import { createEphemeralStreamStore, createFrameCoalescer, hasLiveStream } from "./streamStore.js";
 import { groupEvidence } from "./evidenceLedger.js";
 import { withProvenance } from "./copyProvenance.js";
 import "./styles.css";
@@ -946,26 +946,36 @@ function App() {
       if (event.type === "artifact.preview.ready" && event.payload?.session) setPreviewSession(event.payload.session);
       if (event.type === "artifact.inspection.completed") setPreviewInspection(event.payload?.inspection || null);
     });
+    // Coalesce high-frequency stream deltas before they touch React state:
+    // buffered frames replay in push order through the same reducer below on
+    // one flush (rAF or a 50ms cap, whichever first); a terminal frame drains
+    // synchronously so completion never lags. Per-frame dedupe is preserved.
+    const flushStreamedMessages = (frames) => {
+      for (const frame of frames) {
+        const previous = liveStreamState.current.get(frame.streamId) || { sequence: -1, text: "", channels: {} };
+        if (Number.isFinite(frame.sequence) && frame.sequence <= previous.sequence) continue;
+        const channel = frame.channel || "content";
+        const channels = { ...(previous.channels || {}) };
+        channels[channel] = `${channels[channel] || ""}${frame.delta || ""}`;
+        liveStreamState.current.set(frame.streamId, { sequence: frame.sequence, text: channels.content || "", channels, terminal: frame.terminal, status: frame.status });
+        // Internal structured-action reasoning is streamed into Activity and
+        // receipts, but it is not a conversational assistant message. Only the
+        // model_text lane should materialize in the Chat transcript.
+        if (frame.kind !== "model_text") continue;
+        setMessages((current) => {
+          const index = current.findIndex((message) => message.streamId === frame.streamId);
+          if (index < 0 && (frame.delta || frame.terminal)) return [...current, { id: crypto.randomUUID(), role: "assistant", content: channels.content || "", channels: Object.entries(channels).map(([name, text]) => ({ name, text, visible: true, source: frame.provider || "maple" })), provider: frame.provider || "maple", streamId: frame.streamId, streaming: !frame.terminal, telemetry: null, streamStopReason: frame.stopReason || null, displayMode: "model-verbatim", time: formatTime() }];
+          if (index < 0) return current;
+          return current.map((message, messageIndex) => messageIndex === index ? { ...message, content: channels.content || "", channels: Object.entries(channels).map(([name, text]) => ({ name, text, visible: true, source: frame.provider || message.provider || "maple" })), provider: frame.provider || message.provider || "maple", streaming: !frame.terminal, streamStatus: frame.status, streamStopReason: frame.stopReason || message.streamStopReason || null } : message);
+        });
+      }
+    };
+    const streamedMessageCoalescer = createFrameCoalescer({ onFlush: flushStreamedMessages });
     const stopStream = agent.subscribeStream?.((frame) => {
       streamStoreRef.current?.apply(frame);
-      const previous = liveStreamState.current.get(frame.streamId) || { sequence: -1, text: "", channels: {} };
-      if (Number.isFinite(frame.sequence) && frame.sequence <= previous.sequence) return;
-      const channel = frame.channel || "content";
-      const channels = { ...(previous.channels || {}) };
-      channels[channel] = `${channels[channel] || ""}${frame.delta || ""}`;
-      liveStreamState.current.set(frame.streamId, { sequence: frame.sequence, text: channels.content || "", channels, terminal: frame.terminal, status: frame.status });
-      // Internal structured-action reasoning is streamed into Activity and
-      // receipts, but it is not a conversational assistant message. Only the
-      // model_text lane should materialize in the Chat transcript.
-      if (frame.kind !== "model_text") return;
-      setMessages((current) => {
-        const index = current.findIndex((message) => message.streamId === frame.streamId);
-        if (index < 0 && (frame.delta || frame.terminal)) return [...current, { id: crypto.randomUUID(), role: "assistant", content: channels.content || "", channels: Object.entries(channels).map(([name, text]) => ({ name, text, visible: true, source: frame.provider || "maple" })), provider: frame.provider || "maple", streamId: frame.streamId, streaming: !frame.terminal, telemetry: null, streamStopReason: frame.stopReason || null, displayMode: "model-verbatim", time: formatTime() }];
-        if (index < 0) return current;
-        return current.map((message, messageIndex) => messageIndex === index ? { ...message, content: channels.content || "", channels: Object.entries(channels).map(([name, text]) => ({ name, text, visible: true, source: frame.provider || message.provider || "maple" })), provider: frame.provider || message.provider || "maple", streaming: !frame.terminal, streamStatus: frame.status, streamStopReason: frame.stopReason || message.streamStopReason || null } : message);
-      });
+      streamedMessageCoalescer.push(frame);
     });
-    return () => { disposed = true; stop?.(); stopStream?.(); };
+    return () => { disposed = true; stop?.(); stopStream?.(); streamedMessageCoalescer.dispose(); };
   }, [isDesktop]);
 
   useEffect(() => {
@@ -1752,7 +1762,15 @@ function App() {
     setDreamReceipt(null);
     setError("");
     setRecoveryNotice("");
-    await updateTask({ objective: "Run local Dream", intent: "improve", phase: "training", status: "running", foregroundStep: "Preparing a local adapter" });
+    try {
+      await updateTask({ objective: "Run local Dream", intent: "improve", phase: "training", status: "running", foregroundStep: "Preparing a local adapter" });
+    } catch (dreamSetupError) {
+      // Composer untrap guard: a failed pre-flight task update must never
+      // strand isDreaming=true (which disables both composer inputs).
+      setError(`${dreamSetupError.message}. Dream did not start; the composer stays available.`);
+      setIsDreaming(false);
+      return;
+    }
     if (isDesktop) {
       const stop = window.mapleDesktop.onDreamProgress((update) => {
         if (typeof update.progress === "number") setDreamProgress(Math.max(0, Math.min(update.progress, 100)));
@@ -1985,10 +2003,20 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
       return;
     }
 
-    await updateTask({ objective: content.slice(0, 1000), intent: interaction.interactionMode === "build" ? "coding" : detectIntent(content, interaction.interactionMode), interactionMode: interaction.interactionMode, phase: "work", status: "running", foregroundStep: `Thinking with ${MODEL_LANES[modelSelection.provider].label}`, provider: modelSelection.provider, model: modelSelection.model || null, reasoning: modelSelection.reasoning, blockedReason: null });
-    await emitAgentEvent("prompt.submitted", "received", { content: content.slice(0, 500), intent: detectIntent(content) });
-    if (isDesktop) await runCommand("context.refresh", { reason: "prompt" });
-    await emitAgentEvent("inference.started", "running", { provider: modelSelection.provider, model: modelSelection.model || null, reasoning: modelSelection.reasoning, adapterPath: activeAdapterPath || null });
+    try {
+      await updateTask({ objective: content.slice(0, 1000), intent: interaction.interactionMode === "build" ? "coding" : detectIntent(content, interaction.interactionMode), interactionMode: interaction.interactionMode, phase: "work", status: "running", foregroundStep: `Thinking with ${MODEL_LANES[modelSelection.provider].label}`, provider: modelSelection.provider, model: modelSelection.model || null, reasoning: modelSelection.reasoning, blockedReason: null });
+      await emitAgentEvent("prompt.submitted", "received", { content: content.slice(0, 500), intent: detectIntent(content) });
+      if (isDesktop) await runCommand("context.refresh", { reason: "prompt" });
+      await emitAgentEvent("inference.started", "running", { provider: modelSelection.provider, model: modelSelection.model || null, reasoning: modelSelection.reasoning, adapterPath: activeAdapterPath || null });
+    } catch (sendSetupError) {
+      // Composer untrap guard: a failed pre-flight step must never strand
+      // isThinking=true (Send stays disabled while thinking outside desktop).
+      setError(`${sendSetupError.message}. The task was not started; the composer stays available.`);
+      setIsThinking(false);
+      setThinkingStartedAt(null);
+      await emitAgentEvent("prompt.failed", "blocked", { error: sendSetupError.message }).catch(() => {});
+      return;
+    }
     const baseBody = { messages: [memoryMessage, ...chatMessages, { role: "user", content }].filter(Boolean), temperature: 0.7, top_p: 0.95, top_k: 20, max_tokens: DEFAULT_MAPLE_MAX_TOKENS, stream: false, chat_template_kwargs: { enable_thinking: true } };
     const requestedAdapter = activeAdapterPath;
     try {
