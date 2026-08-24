@@ -108,7 +108,8 @@ function formatTokensPerSecond(usage, elapsedMs) {
   const durationSeconds = Number(elapsedMs) / 1000;
   if (!Number.isFinite(completionTokens) || completionTokens <= 0 || !Number.isFinite(durationSeconds) || durationSeconds <= 0) return "tok/s —";
   const rate = Math.round((completionTokens / durationSeconds) * 10) / 10;
-  return `tok/s ${rate}`;
+  // T8-F3: "~" marks char-estimated counts (server sent no usage chunk).
+  return `tok/s ${usage?.completionTokensApproximate ? "~" : ""}${rate}`;
 }
 
 function redactUserPaths(value) {

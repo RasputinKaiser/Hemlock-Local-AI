@@ -973,3 +973,17 @@ fix_partial_output_and_fresh_context_2026_08_24:
     live_evidence: "Incident diagnosed from durable receipts: raw SSE payload had 4217 chunks / zero finish_reason; thread jsonl confirmed poisoned-history reasoning verbatim."
   claim_boundary: "Partial-output persistence and reset verified deterministically (suites/build); neither exercised live end-to-end in a running app yet."
 
+fix_toks_artifactid_layout_2026_08_24:
+  status: implemented_verified
+  trigger: "User reports: (1) tok/s renders '—' in Host telemetry; (2) artifact build blocked with 'Stop reason: deterministic-input: Invalid artifact artifact ID.'; (3) plan card crowds/overlaps the composer in Build mode."
+  changes:
+    toks_per_second:
+      what: "Root cause: mlx_lm only emits a usage chunk when stream_options.include_usage is set — receipts showed 660 chunks, zero carrying usage, so completionTokens was always null. Added stream_options:{include_usage:true} to both Maple SSE requests; added honest fallback estimating completionTokens from streamed content+reasoning chars (÷4) flagged completionTokensApproximate; renderer prefixes '~' when approximate."
+    artifact_id_sanitization:
+      what: "Root cause: the model parrots plan-step refs ('artifact://manifest') as input.artifactId; orchestrator only filled the id when falsy, so garbage ids reached safeSegment and threw. executeCommandInput now deletes any artifactId failing ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ so the existing prior-artifact fallback fills the task's real id."
+    work_rail_layout:
+      what: "Plan card in the work rail had flex 0 0 auto + 42vh max-height inside an overflow:hidden rail — tall plans squeezed/overlapped the composer. Rail now scrolls vertically (overflow-y auto); plan card is flex 0 1 auto capped at 34vh/340px so it shrinks instead of pushing the composer out."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
+  claim_boundary: "Deterministic verification only; tok/s and layout fixes need a live chat session to confirm visually."
+

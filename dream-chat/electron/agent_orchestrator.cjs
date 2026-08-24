@@ -865,6 +865,12 @@ class AgentOrchestrator {
     const startedAt = Date.now();
     try {
       const commandInput = { ...(action.input || {}) };
+      // T8-F4: the model parrots plan-step refs ("artifact://manifest", "scratch
+      // artifact") as artifactId, which fails safeSegment and blocks authoring.
+      // A valid id matches ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ — anything else is
+      // treated as absent so the host fills in the task's real artifact below.
+      const ARTIFACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+      if (!ARTIFACT_ID_RE.test(String(commandInput.artifactId || ""))) delete commandInput.artifactId;
       if (action.commandId === "artifact.create") {
         const allowedArtifactKinds = new Set(["html", "svg", "text", "markdown", "json"]);
         commandInput.kind = allowedArtifactKinds.has(String(commandInput.kind || "").toLowerCase()) ? String(commandInput.kind).toLowerCase() : "html";

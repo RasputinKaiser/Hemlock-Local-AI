@@ -1721,6 +1721,9 @@ async function runInference(payload = {}) {
         top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
         max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
         stream: true,
+        // T8-F3: mlx_lm only emits a usage chunk when include_usage is set —
+        // without it telemetry has no completionTokens and tok/s renders "—".
+        stream_options: { include_usage: true },
         // Reasoning toggle: "off" explicitly disables the thinking channel
         // (LFM2.5 honors enable_thinking:false and skips CoT entirely — much
         // faster for casual chat). "on" leaves the flag unset: Maple emits its
@@ -1866,7 +1869,11 @@ async function runInference(payload = {}) {
         finishReason,
         contextChars: messages.reduce((sum, message) => sum + message.content.length, 0),
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
-        completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null,
+        // T8-F3: honest fallback — if the server never sent a usage chunk,
+        // estimate tokens from streamed output (≈4 chars/token) rather than
+        // rendering "tok/s —". Marked approximate.
+        completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? (Math.round((String(stream.channels.content || "").length + String(stream.channels.reasoning || stream.channels.reasoning_content || "").length) / 4) || null),
+        completionTokensApproximate: (usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null) == null,
         cachedTokens,
         cacheHitRatio: cacheStats({ promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null, cachedTokens }).hitRatio,
         tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
@@ -2683,6 +2690,7 @@ async function inferStructuredAction(prompt) {
       // done; mapleMaxTokens is only the transport/server ceiling.
       max_tokens: mapleMaxTokens,
       stream: true,
+      stream_options: { include_usage: true },
       response_format: { type: "json_object" },
       chat_template_kwargs: { enable_thinking: true },
     }),
