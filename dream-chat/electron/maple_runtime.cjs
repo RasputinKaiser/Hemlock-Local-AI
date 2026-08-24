@@ -70,7 +70,12 @@ function isMapleTransportError(error) {
     // mid-stream (e.g. MLX Metal GPU-timeout abort) and the SSE connection
     // severs before the response completes. That is a transport death, and
     // the bounded restart+retry below is exactly the right recovery.
-    || /^terminated$|terminated\b.*undici|premature close/i.test(message);
+    || /^terminated$|terminated\b.*undici|premature close/i.test(message)
+    || error?.code === "MAPLE_FIRST_TOKEN_STALL" // T8-S3: wedged-but-alive server (no first SSE byte) is a transport death
+    // T8-S4: with mlx 0.32.1 a Metal CommandBuffer error no longer aborts the
+    // server — it surfaces as an HTTP 500 whose body names the GPU error.
+    // Same transient class as a stream death: retry once via the same path.
+    || (error?.status >= 500 && /metal|commandbuffer|gpu/i.test(message))
 }
 
 function createMapleLaunchResult({ server = {}, startedAt = null, error = null } = {}) {

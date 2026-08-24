@@ -19,8 +19,10 @@ const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
 const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
+const { cacheStats } = require("./prompt_cache_stats.cjs");
 const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
+const { firstTokenWatchdog } = require("./stream_watchdog.cjs");
 const {
   PROVIDER_DEFINITIONS,
   normalizeSelection,
@@ -263,9 +265,9 @@ const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
   ? Math.max(4096, requestedMapleMaxTokens)
   : 16384;
 const maplePromptCacheSize = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE))
-  ? Math.max(1, Math.min(10, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
-  : 8;
-const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "512M");
+  ? Math.max(1, Math.min(16, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
+  : 12;
+const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "768M");
 const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY)))
   : 1;
@@ -275,23 +277,20 @@ const mapleDecodeConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE
 
 // ── Maple-Preview performance optimizations ──────────────────────────────
 //
-// 1. n-gram speculative decoding (--ngram-draft): zero-cost prompt-lookup
-//    draft on CPU. No extra model loaded, so peak memory stays at ~6-7 GB.
-//    Adaptive depth auto-chooses the best speed. Up to 2-3x decode speedup
-//    on code/repetitive output. Disable with HEMLOCK_NGRAM_DRAFT=0.
-//
-// 2. KV cache quantization (--kv-bits): 4-bit reduces KV cache memory by
+// 1. KV cache quantization (--kv-bits): 4-bit reduces KV cache memory by
 //    ~75%, letting the prompt cache hold more entries and context extend
 //    farther on the same hardware. Disable with HEMLOCK_KV_BITS=0.
 //
-// 3. Prefill step size (--prefill-step-size): smaller chunks improve
-//    responsiveness on long prompts; the n-gram draft also benefits from
-//    a slightly smaller prefill chunk. Tune with HEMLOCK_PREFILL_STEP_SIZE.
+// 2. Prefill step size (--prefill-step-size): smaller chunks improve
+//    responsiveness on long prompts. Tune with HEMLOCK_PREFILL_STEP_SIZE.
 // Persistent cross-restart prompt caching (--prompt-cache-file) is NOT available:
 // mlx_lm's HTTP server exposes only in-memory --prompt-cache-size/--prompt-cache-bytes
 // (both already tuned below); the on-disk cache flag exists only in generate.py CLI.
 // Verified 2026-08-22 — do not re-attempt against this server without an upstream change.
-const mapleNgramDraft = String(process.env.HEMLOCK_NGRAM_DRAFT || "1") !== "0";
+// n-gram speculative drafting is architecturally incompatible with Maple
+// (SWA-512 RotatingKVCache defeats the verifier's cache rewind —
+// mlx_lm/speculative.py:476 fallback). FlashHead (checkpoint flash_head) is
+// the decode-speed lever; enabled below.
 // KV cache quantization is DISABLED by default (HEMLOCK_KV_BITS=0). The
 // maple-2bit-mlx model uses a RotatingKVCache, and MLX raises
 // `NotImplementedError: RotatingKVCache Quantization NYI` then aborts the GPU
@@ -306,13 +305,6 @@ const mapleKvBits = Number.isFinite(Number(process.env.HEMLOCK_KV_BITS))
 const maplePrefillStepSize = Number.isInteger(Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
   ? Math.max(256, Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
   : 1024;
-// Maximum speculative depth for n-gram drafting. Larger depth = more chance
-// to catch long repeated n-grams (code, templates) but a rejected deep draft
-// costs more target forwards. 12 is a good balance for Maple's 512-token
-// sliding window. Tune with HEMLOCK_NGRAM_DEPTH.
-const mapleNgramDepth = Number.isInteger(Number(process.env.HEMLOCK_NGRAM_DEPTH))
-  ? Math.max(2, Math.min(32, Number(process.env.HEMLOCK_NGRAM_DEPTH)))
-  : 12;
 
 const serverArgs = [
   "mlx_lm",
@@ -344,9 +336,6 @@ const serverArgs = [
   "--log-level",
   "INFO",
   // ── Performance optimizations ──────────────────────────────
-  // n-gram prompt-lookup speculative decoding (adaptive depth, zero-cost CPU draft)
-  ...(mapleNgramDraft ? ["--ngram-draft"] : []),
-  ...(mapleNgramDraft ? ["--ngram-depth", String(mapleNgramDepth)] : []),
   // KV cache quantization: 4-bit saves ~75% KV cache memory
   ...(mapleKvBits > 0 ? ["--kv-bits", String(mapleKvBits)] : []),
   // Prefill in smaller chunks for better responsiveness
@@ -1555,6 +1544,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   finishStream(stream, { status: "completed", stopReason: "provider_cli_completed", usage, rawOutputRef });
   const answer = stream.text.trim();
   const channels = modelChannelRecords(stream.channels, selection.provider);
+  const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? null;
   const telemetry = {
     provider: selection.provider,
     model: selection.model || "provider-default",
@@ -1564,6 +1554,8 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
     contextChars: (Array.isArray(payload.messages) ? payload.messages : []).reduce((sum, message) => sum + String(message?.content || "").length, 0),
     promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null,
     completionTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null,
+    cachedTokens,
+    cacheHitRatio: cacheStats({ promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null, cachedTokens }).hitRatio,
     tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
     outputDigest: streamDigest(JSON.stringify(stream.channels)),
     contentDigest: digestText(answer),
@@ -1709,6 +1701,17 @@ async function runInference(payload = {}) {
     const controller = new AbortController();
     stream.controller = controller;
     const timeoutHandle = setTimeout(() => controller.abort("timeout"), inferenceTimeoutMs);
+    // T8-S3: first-token stall watchdog — Maple can accept the request and then
+    // wedge without emitting a single SSE byte; abort in 45s (not the full
+    // inferenceTimeoutMs) so the bounded transport recovery below takes over.
+    const stallStartedAt = Date.now();
+    let firstByteAt = null;
+    const stallHandle = setTimeout(() => {
+      if (!firstTokenWatchdog({ now: Date.now(), startedAt: stallStartedAt, firstByteAt }).stalled) return;
+      const stallError = new Error("first-token stall (no SSE bytes in 45s)");
+      stallError.code = "MAPLE_FIRST_TOKEN_STALL";
+      controller.abort(stallError);
+    }, 45000);
     try {
       const base = {
         model: selection.provider === "maple" ? resolveLocalModelPath(selection.model) : "default_model",
@@ -1764,6 +1767,7 @@ async function runInference(payload = {}) {
         let done = false;
         while (!done) {
           const result = await reader.read();
+          if (firstByteAt === null && result.value?.length) { firstByteAt = Date.now(); clearTimeout(stallHandle); } // T8-S3: first byte disarms the stall watchdog
           const parsedEvents = parser.push(result.value || new Uint8Array(), { final: result.done === true });
           for (const event of parsedEvents) {
             const parsed = parseSsePayload(event);
@@ -1853,6 +1857,7 @@ async function runInference(payload = {}) {
         appendAgentEvent("model-output.persist.failed", "failed", { streamId: stream.streamId, error: receiptError.message }, { reversible: true });
       }
       finishStream(stream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
+      const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? null;
       const telemetry = {
         provider: "maple",
         model: "default_model",
@@ -1862,6 +1867,8 @@ async function runInference(payload = {}) {
         contextChars: messages.reduce((sum, message) => sum + message.content.length, 0),
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
         completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null,
+        cachedTokens,
+        cacheHitRatio: cacheStats({ promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null, cachedTokens }).hitRatio,
         tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
         outputDigest: streamDigest(JSON.stringify(stream.channels)),
         contentDigest: streamDigest(answerText),
@@ -1942,6 +1949,7 @@ async function runInference(payload = {}) {
       throw error;
     } finally {
       clearTimeout(timeoutHandle);
+      clearTimeout(stallHandle); // T8-S3: disarm the stall watchdog on every exit
     }
   }
 }
@@ -2742,6 +2750,8 @@ async function inferStructuredAction(prompt) {
       finishReason: payload.choices?.[0]?.finish_reason || null,
       promptTokens: payload.usage?.prompt_tokens ?? null,
       completionTokens: payload.usage?.completion_tokens ?? null,
+      cachedTokens: payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? null,
+      cacheHitRatio: cacheStats({ promptTokens: payload.usage?.prompt_tokens ?? null, cachedTokens: payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? null }).hitRatio,
       tokensPerSecond: tokensPerSecond(payload.usage, Date.now() - startedAt),
       outputDigest: digestText(content),
       modelChannels: channels.map((channel) => ({ name: channel.name, digest: digestText(channel.text) })),

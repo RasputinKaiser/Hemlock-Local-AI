@@ -943,3 +943,20 @@ tranche7_5_chat_reliability_2026_08_23:
     - "recoverBaseServer (dream-run failure recovery) and ensureBaseInference (SIPS baseline) call stopServer+startServer directly, bypassing the shouldRespawn gate — INTENTIONAL: both are user-initiated training flows, not auto-retry loops; thrash risk accepted and documented."
   claim_boundary: "All verification is deterministic host-side (unit suites, builds, log analysis). The crash-loop gate, visible recovery note, and re-run button were not exercised against a live mid-generation server kill in this pass; the GPU-timeout itself is upstream mlx/Metal."
 
+tranche8_stability_speed_2026_08_23:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-23_tranche8-stability-speed.md
+  changes:
+    cache_telemetry_sizing:
+      what: "NEW prompt_cache_stats.cjs (pure hitRatio helper, 6 tests); all three inference telemetry blocks emit cachedTokens + cacheHitRatio from usage.prompt_tokens_details.cached_tokens; Host telemetry shows 'cache N%'; prompt cache defaults raised to size 12 / 768MB after live verification (768M accepted; repeat request measured 94% hit). Env clamp ceiling fixed 10→16 so operators aren't clamped below the default."
+    dead_flag_cleanup:
+      what: "Removed --ngram-draft/--ngram-depth and their env consts — architecturally incompatible with Maple (SWA-512 RotatingKVCache defeats the ngram verifier's cache rewind; mlx_lm/speculative.py fallback). FlashHead remains the decode lever. Launcher audit read-only."
+    first_token_stall_watchdog:
+      what: "NEW stream_watchdog.cjs (pure, 4 tests); Maple SSE path arms a 45s no-first-byte timer per attempt — abort with MAPLE_FIRST_TOKEN_STALL routes into the bounded transport retry instead of hanging the full 10-minute inference timeout. Timer disarms on first byte and in finally."
+    metal_error_surface:
+      what: "With mlx 0.32.1 Metal errors arrive as HTTP 500 (server survives). isMapleTransportError now classifies 500s whose body names Metal/CommandBuffer/GPU as transient → bounded retry. Renderer empty-reply tiers rewired to reachable data (streamStatus + streamStopReason captured from terminal stream frames — reviewer found the previous streamDied/errorCode flags were never populated, dead since T7.5); three honest copies: GPU error / connection dropped / token-limit."
+  review:
+    verdict: "S1 APPROVED (clamp gap fixed), S2 APPROVED, S3 APPROVED, S4 gaps fixed by parent after review (streamStopReason wiring + clamp ceiling)."
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
+  claim_boundary: "Deterministic host-side verification only. The stall watchdog was not exercised against a live SIGSTOP'd server; cache-hit rendering not yet seen live in Chat (needs app relaunch)."
+
