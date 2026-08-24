@@ -1003,18 +1003,9 @@ class AgentOrchestrator {
   blockTask(taskId, reason, payload = {}) {
     this.updateTask({ phase: "blocked", status: "blocked", foregroundStep: "Inspect the blocked action and choose the next decision", blockedReason: reason });
     this.emit("task.blocked", "blocked", { taskId, reason, ...payload }, { reversible: true });
-    if (this.task()?.provider === "maple" && typeof this.createSuggestion === "function") {
-      this.createSuggestion({
-        threadId: this.task()?.threadId || null,
-        projectId: this.task()?.projectId || null,
-        kind: "provider-escalation",
-        title: "Maple-Preview is blocked",
-        summary: "Retry this bounded task with an authenticated Codex or Claude subscription lane.",
-        reason,
-        evidenceRefs: this.task()?.evidenceRefs || [],
-        recommendedAction: { command: "task.escalate-provider", providers: ["codex", "claude"] },
-      });
-    }
+    // T8-F6: provider escalation removed — Hemlock runs ONLY the selected
+    // lane. A Maple failure surfaces as a blocked task with its reason; no
+    // Codex/Claude escape hatch is offered.
     return { schema: "hemlock.agent.task.result.v1", status: "blocked", task: this.task(), reason, ...payload };
   }
 

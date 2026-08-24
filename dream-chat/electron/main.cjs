@@ -1348,22 +1348,9 @@ function recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, 
     rawOutputRef,
     channels: modelChannelRecords(channels, selection.provider),
   });
-  if (selection.provider === "maple" && taskId === agentTask.id && agentTask.threadId) {
-    const existing = threadManager.listSuggestions({ threadId: agentTask.threadId, status: "unread" }).find((item) => item.kind === "provider-escalation");
-    if (!existing) {
-      const suggestion = threadManager.createSuggestion({
-        threadId: agentTask.threadId,
-        projectId: agentTask.projectId,
-        kind: "provider-escalation",
-        title: "Maple-Preview needs a provider decision",
-        summary: "The selected local Maple lane did not produce a usable response.",
-        reason: detail,
-        evidenceRefs: rawOutputRef ? [rawOutputRef] : [],
-        recommendedAction: { command: "task.escalate-provider", providers: ["codex", "claude"], requiresUserAction: true },
-      });
-      appendAgentEvent("suggestion.created", "candidate", { suggestion }, { evidenceRefs: suggestion.evidenceRefs, reversible: true });
-    }
-  }
+  // T8-F6: provider escalation removed — Hemlock runs ONLY the selected lane.
+  // A failed Maple inference surfaces through the normal failure receipts; no
+  // Codex/Claude escape-hatch suggestion is created.
 }
 
 function providerCommand(provider, selection, prompt, structured = false, cwd = repoRoot) {
@@ -2275,7 +2262,7 @@ const agentCommands = {
   "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "context.compile": { label: "Compile compact thread context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "task.checkpoint": { label: "Record task checkpoint", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "task.escalate-provider": { label: "Escalate task provider", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  // T8-F6: task.escalate-provider removed — single-lane policy, no provider switching.
   "suggestion.list": { label: "List Hemlock suggestions", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "suggestion.accept": { label: "Accept Hemlock suggestion", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
@@ -2437,14 +2424,6 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "context.compile") result = compileThreadContext(String(payload.threadId || agentTask.threadId));
     else if (command === "task.checkpoint") result = threadManager.checkpoint(String(payload.threadId || agentTask.threadId), { ...payload, taskId: payload.taskId || agentTask.id, phase: payload.phase || agentTask.phase, status: payload.status || agentTask.status, evidenceRefs: payload.evidenceRefs || agentTask.evidenceRefs, artifactRepair: payload.artifactRepair || agentTask.artifactRepair, autonomyPolicy: payload.autonomy || agentTask.autonomy });
-    else if (command === "task.escalate-provider") {
-      const provider = String(payload.provider || "");
-      if (!["maple", "codex", "claude"].includes(provider)) throw new Error(`Unsupported provider escalation target: ${provider}`);
-      const threadId = String(payload.threadId || agentTask.threadId);
-      const thread = threadManager.updateThread(threadId, { provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", blockedReason: null });
-      updateAgentTask({ provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", foregroundStep: `Provider changed to ${provider}; resume explicitly to continue` });
-      result = { schema: "hemlock.agent.provider.escalation.v1", status: "escalated", provider, thread };
-    }
     else if (command === "suggestion.list") result = { schema: "hemlock.agent.suggestion.result.v1", status: "ready", suggestions: threadManager.listSuggestions({ threadId: payload.threadId || agentTask.threadId, status: payload.status }) };
     else if (["suggestion.accept", "suggestion.dismiss", "suggestion.snooze"].includes(command)) {
       const status = command.split(".")[1] === "accept" ? "accepted" : command.split(".")[1] === "dismiss" ? "dismissed" : "snoozed";

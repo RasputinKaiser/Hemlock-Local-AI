@@ -1480,13 +1480,8 @@ function App() {
   async function transitionSuggestion(suggestion, status = "accepted") {
     const action = status === "accepted" ? "suggestion.accept" : status === "dismissed" ? "suggestion.dismiss" : "suggestion.snooze";
     const result = await runCommand(action, { suggestionId: suggestion.suggestionId });
-    if (result?.suggestion && status === "accepted" && suggestion.recommendedAction?.command) {
-      const recommended = suggestion.recommendedAction;
-      if (recommended.command === "task.escalate-provider") {
-        const provider = recommended.providers?.find((item) => providerStatuses.some((statusItem) => statusItem.provider === item && statusItem.authenticated)) || recommended.providers?.[0];
-        if (provider) await runCommand("task.escalate-provider", { threadId: suggestion.threadId || task.threadId, provider });
-      }
-    }
+    // T8-F6: provider escalation removed — accepted suggestions no longer
+    // switch lanes; Hemlock runs only the selected model.
   }
 
   async function refreshSips() {

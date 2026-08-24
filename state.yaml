@@ -987,3 +987,13 @@ fix_toks_artifactid_layout_2026_08_24:
     gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
   claim_boundary: "Deterministic verification only; tok/s and layout fixes need a live chat session to confirm visually."
 
+fix_remove_escalation_2026_08_24:
+  status: implemented_verified
+  trigger: "User directive: Maple-Preview failed and Hemlock suggested escalating to Codex/Claude — remove the escalation mechanism entirely; HemlockOS runs only the selected model lane."
+  changes:
+    escalation_removed:
+      what: "Removed both provider-escalation suggestion sites (orchestrator blockTask + recordCliInferenceFailure), the renderer auto-switch on suggestion.accept, the task.escalate-provider command, and its allowlist entry. A Maple failure now surfaces solely as an honest blocked task with its reason."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok; zero 'escalate' references outside policy comments"
+  claim_boundary: "Deterministic verification only."
+
