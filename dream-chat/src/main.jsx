@@ -45,6 +45,7 @@ function readUnderstoryPreference() {
 // capacity, not a prompt-level reasoning limit.
 const DEFAULT_MAPLE_MAX_TOKENS = 16384;
 const DEFAULT_ARTIFACT_LAYOUT = { source: 0.68, diff: 0.88, preview: 1.48, evidence: 168 };
+const TERMINAL_STREAM_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "interrupted_by_steering", "restarting"]);
 
 const MODEL_LANES = {
   maple: { provider: "maple", label: "Local", shortLabel: "MAPLE", kind: "local", defaultModel: "default_model", defaultModelLabel: "Local MLX model", defaultReasoning: "on", reasoningLevels: ["on", "off"], modelOptions: [{ value: "default_model", label: "Maple-Preview" }, { value: "lfm25-8b", label: "LFM2.5-8B-A1B (LiquidAI)" }] },
@@ -484,6 +485,7 @@ function App() {
   const [comparePickerOpen, setComparePickerOpen] = useState(false);
   const [compareDismissedAt, setCompareDismissedAt] = useState(null);
   const [streamFrames, setStreamFrames] = useState([]);
+  const [cancelBusy, setCancelBusy] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 1240, height: 700 });
   const [candidates, setCandidates] = useState([]);
   const [sourcePolicies, setSourcePolicies] = useState([]);
@@ -722,6 +724,12 @@ function App() {
     const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
   }, [isThinking, thinkingStartedAt]);
+
+  useEffect(() => {
+    if (!error) return undefined;
+    const timer = setTimeout(() => setError(""), 12000);
+    return () => clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     const node = endRef.current;
@@ -1863,14 +1871,23 @@ function App() {
     setChatPinned(true);
   }
 
-  function stopGeneration() {
-    if (!isThinking) return;
+  async function stopGeneration() {
+    if (cancelBusy) return;
+    const hasModelTextStream = streamFrames.some((frame) => frame.kind === "model_text" && !frame.terminal && !TERMINAL_STREAM_STATUSES.has(frame.status));
+    if (!isThinking && !hasModelTextStream) return;
     const agent = desktopAgent();
-    if (agent?.cancelStream) {
-      agent.cancelStream({}).catch(() => {});
-    } else if (agent?.cancel) {
-      agent.cancel(task.id).catch(() => {});
-    }
+    if (!agent?.cancelStream && !agent?.cancel) return;
+    setCancelBusy(true);
+    try {
+      if (agent.cancelStream && (isThinking || hasModelTextStream)) {
+        // Stream-scoped stop: aborts in-flight model output without cancelling
+        // the task; the aborted stream flows into the normal partial-persist path.
+        await agent.cancelStream({});
+      } else {
+        await agent.cancel(task.id);
+      }
+    } catch { /* the host keeps partial output regardless; nothing to recover here */ }
+    setCancelBusy(false);
     setIsThinking(false);
     setThinkingStartedAt(null);
     // A stop is a host action, not model output — record it as a host note so the
@@ -2262,7 +2279,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     // Live panel covers BOTH stream kinds (T7-S1): conversational replies and
     // the resumed structured-action loop after you answer a question. Silent
     // host work is not acceptable — watch the model think either way.
-    const liveStreams = streamFrames.filter((stream) => (stream.kind === "model_text" || stream.kind === "agent_action") && !stream.terminal);
+    const liveStreams = streamFrames.filter((stream) => (stream.kind === "model_text" || stream.kind === "agent_action") && !stream.terminal && !TERMINAL_STREAM_STATUSES.has(stream.status));
     const plans = (agentProjection?.plans || []).filter((plan) => plan.taskId === task.id);
     const planFromEvents = taskEvents.slice().reverse().map((event) => event.payload?.plan).find(Boolean) || null;
     const activePlan = plans.find((plan) => plan.id === task.activePlanId) || planFromEvents || plans.at(-1) || null;
@@ -2326,7 +2343,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
       const streamDied = message.telemetry?.finishReason === "error" || message.streamStatus === "failed" || message.streamStatus === "restarting" || message.errorCode === "CANCELLED";
       const failureText = String(message.telemetry?.stopReason || message.streamStopReason || "");
       const gpuError = streamDied && /metal|commandbuffer|gpu/i.test(failureText);
-      if (!visibleChannels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName}</span>{gpuError ? <><p>The model hit a GPU error (transient). Hemlock retried automatically — try again if this persists.</p><div className="repair-actions"><button type="button" onClick={() => retryLastMessage()}>Re-run this prompt</button></div></> : streamDied ? <><p>The connection to the local model dropped mid-reply (the server likely restarted after a hiccup). The reply was not completed.</p><div className="repair-actions"><button type="button" onClick={() => retryLastMessage()}>Re-run this prompt</button></div></> : <p>The model finished without returning any text. This usually means it hit its token limit while reasoning. Try again, or raise the token ceiling in a longer task.</p>}</div>;
+      if (!visibleChannels.length) return <div className="maple-channel maple-channel-empty"><span className="model-channel-label">{providerName}</span>{gpuError ? <><p>The model hit a GPU error (transient). Hemlock retried automatically — try again if this persists.</p><div className="repair-actions"><button type="button" disabled={isThinking} onClick={() => retryLastMessage()}>Re-run this prompt</button></div></> : streamDied ? <><p>The connection to the local model dropped mid-reply (the server likely restarted after a hiccup). The reply was not completed.</p><div className="repair-actions"><button type="button" disabled={isThinking} onClick={() => retryLastMessage()}>Re-run this prompt</button></div></> : <p>The model finished without returning any text. This usually means it hit its token limit while reasoning. Try again, or raise the token ceiling in a longer task.</p>}</div>;
       return visibleChannels.map((channel, index) => {
         const label = `${channelProviderName(channel.source || message.provider)} · ${displayText(channel.name, "content")}`;
         if (channel.name === "content" || index === 0 && channels.length === 1) return <div className="maple-channel maple-channel-content" key={`${channel.name}-${index}`}><span className="model-channel-label">{label}</span><div className="message-content">{displayText(channel.text, "")}{message.streaming && <span className="stream-caret" aria-label={`${providerName} response still arriving`}>▍</span>}</div></div>;
@@ -2367,7 +2384,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
       {!chatPinned && (isThinking || liveStreams.length > 0) && <button type="button" className="chat-jump-latest" onClick={jumpToLatest}><Icon name="chevron" size={12} /> New activity</button>}
       {serverDownWhileWaiting ? <div className="live-note is-stalled"><span className="pulse" /> The local model server is not responding. Open Settings → Check local readiness, or restart Hemlock.</div> : isThinking && (() => { const liveFrame = liveStreams.at(-1) || null; const reasoningText = liveFrame?.channels?.reasoning || liveFrame?.channels?.reasoning_content || ""; const contentText = liveFrame?.channels?.content || ""; const reasoningTokens = reasoningText ? Math.round(reasoningText.length / 4) : 0; const phase = contentText ? "writing the answer" : reasoningTokens > 0 ? "thinking" : serverHealthProbe === null ? "loading model weights" : "warming up"; return <div className="live-note live-note-thinking"><span className="pulse" /> {selectedLane.label} is {phase}{serverHealthProbe === null && phase === "loading model weights" ? " — first load can take a moment" : ""}{thinkingElapsed != null ? <span className="thinking-timer">{thinkingElapsed < 60 ? `${thinkingElapsed}s` : `${Math.floor(thinkingElapsed / 60)}m ${thinkingElapsed % 60}s`}</span> : null}{reasoningTokens > 0 && !contentText ? <span className="thinking-reasoning-chars">{reasoningTokens} tokens reasoned</span> : null}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></div>; })()}
       <div ref={endRef} />
-      </div><aside className="chat-work-rail" aria-label="Hemlock work rail">{hostActivity}{verificationCard}{evidenceRail}<div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode"><span className="interaction-mode-label">WORK MODE</span><button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button><button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")}><Icon name="artifact" size={13} /> Build</button><small>{interactionMode === "build" ? "Build mode: one plan approval, then scratch-artifact autopilot." : "Explore mode: conversation stays conversational until you hand off to Build."}</small></div><div className="composer-model-line">{composerModelLine}{contextMeterState && <span className={`context-meter${contextMeterState.warn ? " is-warn" : ""}`} role="meter" aria-valuenow={contextMeterState.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Prompt context budget used" title="Share of the bounded prompt budget the last reply used"><i style={{ "--meter-fill": `${contextMeterState.percent}%` }} /><span>{contextMeterState.label}</span></span>}</div><form className="chat-compose" onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : "Continue the conversation or task…"} rows="2" aria-label="Continue Hemlock task" disabled={isDreaming} /><button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button></form></aside>{chatStatusBar}</div>;
+      </div><aside className="chat-work-rail" aria-label="Hemlock work rail">{hostActivity}{verificationCard}{evidenceRail}<div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode"><span className="interaction-mode-label">WORK MODE</span><button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button><button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")}><Icon name="artifact" size={13} /> Build</button><small>{interactionMode === "build" ? "Build mode: one plan approval, then scratch-artifact autopilot." : "Explore mode: conversation stays conversational until you hand off to Build."}</small></div><div className="composer-model-line">{composerModelLine}{contextMeterState && <span className={`context-meter${contextMeterState.warn ? " is-warn" : ""}`} role="meter" aria-valuenow={contextMeterState.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Prompt context budget used" title="Share of the bounded prompt budget the last reply used"><i style={{ "--meter-fill": `${contextMeterState.percent}%` }} /><span>{contextMeterState.label}</span></span>}</div><form className="chat-compose" onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : "Continue the conversation or task…"} rows="2" aria-label="Continue Hemlock task" disabled={isDreaming} />{(isThinking || liveStreams.length > 0) && <button type="button" className="stop-action" onClick={() => void stopGeneration()} disabled={cancelBusy}><Icon name="stop" size={14} /> {cancelBusy ? "Stopping…" : "Stop"}</button>}<button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button></form></aside>{chatStatusBar}</div>;
   }
 
   function renderSips() {

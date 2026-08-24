@@ -1,4 +1,5 @@
 const MAPLE_LAUNCH_SCHEMA = "hemlock.maple.launch.v1";
+const { classifyInferenceError } = require("./error_taxonomy.cjs");
 
 const DEFAULT_CONVERSATION_MESSAGE_LIMIT = 16;
 const DEFAULT_CONVERSATION_CHAR_LIMIT = 24000;
@@ -61,21 +62,14 @@ function compactInferenceMessages(messages, {
   return [...(firstSystem ? [firstSystem] : []), ...history, latestUser, ...trailingAfterLatestUser];
 }
 
+// T9-H2: delegates to the shared taxonomy. Same verdicts as the old inline
+// ladder — transport-death, stall, and gpu-server-error are the retryable
+// inference-failure classes; everything else (HTTP 400, cancellation,
+// invalid checkpoint) is not.
+const RETRYABLE_TRANSPORT_KINDS = new Set(["transport-death", "stall", "gpu-server-error"]);
+
 function isMapleTransportError(error) {
-  const code = String(error?.code || error?.cause?.code || "");
-  const message = String(error?.message || error?.cause?.message || error || "");
-  return ["ECONNREFUSED", "UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(code)
-    || /fetch failed|socket|connection refused|other side closed|network/i.test(message)
-    // undici throws bare "TypeError: terminated" when the server dies
-    // mid-stream (e.g. MLX Metal GPU-timeout abort) and the SSE connection
-    // severs before the response completes. That is a transport death, and
-    // the bounded restart+retry below is exactly the right recovery.
-    || /^terminated$|terminated\b.*undici|premature close/i.test(message)
-    || error?.code === "MAPLE_FIRST_TOKEN_STALL" // T8-S3: wedged-but-alive server (no first SSE byte) is a transport death
-    // T8-S4: with mlx 0.32.1 a Metal CommandBuffer error no longer aborts the
-    // server — it surfaces as an HTTP 500 whose body names the GPU error.
-    // Same transient class as a stream death: retry once via the same path.
-    || (error?.status >= 500 && /metal|commandbuffer|gpu/i.test(message))
+  return RETRYABLE_TRANSPORT_KINDS.has(classifyInferenceError(error).kind);
 }
 
 function createMapleLaunchResult({ server = {}, startedAt = null, error = null } = {}) {

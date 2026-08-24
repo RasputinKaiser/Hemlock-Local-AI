@@ -997,3 +997,23 @@ fix_remove_escalation_2026_08_24:
     gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok; zero 'escalate' references outside policy comments"
   claim_boundary: "Deterministic verification only."
 
+tranche9_hardening_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche9-hardening.md
+  changes:
+    readiness_hardening:
+      what: "NEW readiness_probe.cjs (backoff min(2000,250*2^attempt), deadline reason, classifyHealthFailure); readiness deadline errors now name the last failure classification; child-exit during readiness fails fast with signal; model path validated BEFORE spawn (config.json + safetensors required) — kills the LFM2.5 404 class."
+    error_taxonomy:
+      what: "NEW error_taxonomy.cjs classifyInferenceError → {kind, retryable, userMessage} across 7 kinds (transport-death/stall/gpu-server-error/cancelled-by-user/model-invalid/server-not-ready/unknown); isMapleTransportError delegates to it with identical verdicts (maple_runtime tests unmodified-green). agent:cancel handler returns a plain-data snapshot if structured-clone fails."
+    artifact_flow_tests:
+      what: "NEW artifact_flow.test.cjs (6 tests): garbage artifactId stripping ×5 incl. numeric 42, author-without-create host scaffold, bounded repair loop with blocked-then-passed inspect sequence, clamp unit. EXPOSED GAP found and fixed: numeric artifactIds passed the sanitizer via String() coercion — sanitizer now rejects non-strings."
+    renderer_hygiene:
+      what: "TERMINAL_STREAM_STATUSES includes 'restarting' so restarting streams don't leave stale LIVE panels; re-run buttons disabled while thinking; error banner auto-dismisses after 12s (manual dismiss clears timer); .partial-note/.chat-error flex fixes."
+    stop_button:
+      what: "Composer Stop button appears only while streaming (isThinking or live model_text stream); calls agent:stream-cancel (stream-scoped, preserves the task) with agent:cancel fallback; wired to pre-existing dead plumbing from b165526; cancelled stream flows into partial-persist; draft preserved; gold-styled, cancelBusy-guarded."
+  review:
+    note: "Batched reviewer timed out mid-review (17 calls, no findings written); parent performed direct verification of highest-risk items instead: stream-cancel handler (no duplicate registration, aborts non-terminal model_text, T8-F1 compatible), preload bridge both paths, H1 validation placement before spawn, H5 renderer guard logic. Skipped-test follow-up: numeric-ID gap found by H3's skipped test was fixed in product code and the test unskipped."
+  verification:
+    gates: "electron 236/236 (0 skipped), renderer 26/26, vite build ok, node --check main/orchestrator/maple_runtime ok, esbuild ok"
+  claim_boundary: "Deterministic verification only. Stop button and readiness diagnostics not yet exercised against a live wedged server."
+

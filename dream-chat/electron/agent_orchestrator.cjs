@@ -870,7 +870,9 @@ class AgentOrchestrator {
       // A valid id matches ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ — anything else is
       // treated as absent so the host fills in the task's real artifact below.
       const ARTIFACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
-      if (!ARTIFACT_ID_RE.test(String(commandInput.artifactId || ""))) delete commandInput.artifactId;
+      // T9-H3: non-string artifactIds (numbers from a confused model envelope)
+      // are invalid too — String(42)==="42" would otherwise pass the regex.
+      if (typeof commandInput.artifactId !== "string" || !ARTIFACT_ID_RE.test(commandInput.artifactId)) delete commandInput.artifactId;
       if (action.commandId === "artifact.create") {
         const allowedArtifactKinds = new Set(["html", "svg", "text", "markdown", "json"]);
         commandInput.kind = allowedArtifactKinds.has(String(commandInput.kind || "").toLowerCase()) ? String(commandInput.kind).toLowerCase() : "html";

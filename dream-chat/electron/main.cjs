@@ -19,6 +19,7 @@ const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
 const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
+const { nextReadinessDelay, classifyHealthFailure, missingCheckpointItem } = require("./readiness_probe.cjs"); // T9-H1
 const { cacheStats } = require("./prompt_cache_stats.cjs");
 const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
@@ -138,7 +139,19 @@ const modelCandidates = [
   path.join(os.homedir(), "Models", "Hemlock", "maple-2bit-mlx"),
   path.join(repoRoot, "maple-2bit-mlx"),
 ].filter(Boolean).map((candidate) => path.resolve(candidate));
-const modelPath = modelCandidates.find((candidate) => fs.existsSync(candidate)) || modelCandidates[0];
+// T9-H1: prefer candidates that look like real MLX checkpoints (a bogus dir
+// used to spawn blindly and 404 later); fall through so startServer explains.
+function mlxCheckpointProblem(dirPath) {
+  let names = [];
+  try {
+    if (!fs.statSync(dirPath).isDirectory()) return "a readable model directory";
+    names = fs.readdirSync(dirPath);
+  } catch {
+    return "a readable model directory";
+  }
+  return missingCheckpointItem(names);
+}
+const modelPath = modelCandidates.find((candidate) => !mlxCheckpointProblem(candidate)) || modelCandidates[0];
 
 // Local MLX model registry for the picker. "default_model" is the Maple
 // launch model; other entries are absolute model directories served by the
@@ -150,7 +163,9 @@ const LOCAL_MODEL_PATHS = {
 
 function resolveLocalModelPath(model) {
   const resolved = LOCAL_MODEL_PATHS[String(model || "")];
-  return resolved && fs.existsSync(resolved) ? resolved : "default_model";
+  // T9-H1: an existing-but-invalid dir would lazy-load to a 404 mid-chat;
+  // fall back to the validated default instead.
+  return resolved && !mlxCheckpointProblem(resolved) ? resolved : "default_model";
 }
 const minimumDreamFreeBytes = Number(process.env.HEMLOCK_MIN_FREE_BYTES || 10 * 1024 ** 3);
 
@@ -3051,8 +3066,11 @@ async function codingInference(prompt, adapterPath = "") {
 
 async function startServer(adapterPath = "") {
   if (serverProcess && !serverProcess.killed) return;
-  if (!fs.existsSync(modelPath)) {
-    throw new Error(`Maple-Preview model was not found at ${modelPath}. Set HEMLOCK_MODEL_PATH to a local MLX model directory.`);
+  // T9-H1: validate the checkpoint BEFORE spawning so a bad selection fails
+  // with a fixable message instead of a server-side 404 after boot.
+  const checkpointProblem = mlxCheckpointProblem(modelPath);
+  if (checkpointProblem) {
+    throw new Error(`Model at ${modelPath} is not a valid MLX checkpoint (missing ${checkpointProblem}). Open Settings → Model to fix.`);
   }
   // Adopt an already-running Maple server instead of colliding with it. A
   // leftover server from a prior launch, a crashed process, or an external
@@ -3152,7 +3170,14 @@ function stopServer() {
 async function waitForServer(timeoutMs = 180000, { preserveInference = false } = {}) {
   const startedAt = Date.now();
   let lastError = null;
-  while (Date.now() - startedAt < timeoutMs) {
+  let attempt = 0;
+  const loggedReasons = new Set();
+  // T9-H1(d): exit during readiness wakes the poll sleep and throws at once.
+  const exited = new Promise((resolve) => {
+    if (!serverProcess || serverProcess.killed) return resolve(serverProcessError || { code: null, signal: null });
+    serverProcess.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  while (true) {
     if (serverProcessError) {
       const error = new Error(`The local Maple-Preview server failed before becoming ready: ${serverProcessError.message}`);
       Object.assign(error, serverProcessError);
@@ -3170,12 +3195,26 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
         return { processReady: true, inferenceReady: serverState.inferenceReady };
       }
       lastError = new Error(`Maple-Preview health returned HTTP ${response.status}`);
+      lastError.status = response.status;
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(50, timeoutMs - (Date.now() - startedAt)))));
+    // T9-H1(b): log each distinct failure reason once, not per-poll spam.
+    const classification = classifyHealthFailure(lastError);
+    if (!loggedReasons.has(classification)) {
+      loggedReasons.add(classification);
+      console.log(`[hemlock] Maple health check waiting: ${classification} (${lastError?.message || "unknown"})`);
+    }
+    // T9-H1(a): capped exponential backoff via the pure helper.
+    const step = nextReadinessDelay({ attempt: attempt++, startedAt, timeoutMs });
+    if (step.done) break;
+    await Promise.race([
+      new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt))))),
+      exited,
+    ]);
   }
-  throw new Error(`The local Maple-Preview server process did not become ready: ${lastError?.message || "timeout"}.`);
+  // T9-H1(c): the deadline error names the last failure classification.
+  throw new Error(`The local Maple-Preview server process did not become ready (last: ${classifyHealthFailure(lastError)}): ${lastError?.message || "timeout"}.`);
 }
 
 async function launchMapleRuntime({ resetCrashLoop = false } = {}) {
@@ -3333,6 +3372,7 @@ async function probeInference(adapterPath = "") {
 async function waitForInference(adapterPath = "", timeoutMs = inferenceProbeTimeoutMs) {
   const startedAt = Date.now();
   let lastError = null;
+  let attempt = 0;
   while (Date.now() - startedAt < timeoutMs) {
     try {
       return await probeInference(adapterPath);
@@ -3342,9 +3382,11 @@ async function waitForInference(adapterPath = "", timeoutMs = inferenceProbeTime
       // repair the adapter and would only keep the UI looking busy.
       if (adapterPath && error.status >= 400) throw error;
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(50, timeoutMs - (Date.now() - startedAt)))));
+    const step = nextReadinessDelay({ attempt: attempt++, startedAt, timeoutMs }); // T9-H1(a)
+    if (step.done) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt)))));
   }
-  throw new Error(`Maple-Preview inference did not become ready: ${lastError?.message || "timeout"}.`);
+  throw new Error(`Maple-Preview inference did not become ready (last: ${classifyHealthFailure(lastError)}): ${lastError?.message || "timeout"}.`);
 }
 
 async function recoverBaseServer() {
@@ -3901,7 +3943,15 @@ ipcMain.handle("agent:cancel", (_event, taskId) => {
   appendAgentEvent("task.updated", "cancelled", { reason: "cancel requested by user" }, { reversible: true });
   updateAgentTask({ status: "cancelled", phase: "stopped", foregroundStep: "Stopped by user", blockedReason: null });
   appendAgentEvent("operation.cancelled", "cancelled", { taskId: agentTask.id, operationIds: cancelledOperations }, { reversible: true });
-  return getAgentState();
+  try {
+    // Electron structured-clones IPC returns; agent state can carry
+    // non-serializable values, which historically surfaced as
+    // "An object could not be cloned" on this channel (see Launch.log).
+    JSON.stringify(getAgentState());
+    return getAgentState();
+  } catch {
+    return { ok: true, taskId: String(taskId || agentTask.id), status: "cancelled", timestamp: new Date().toISOString() };
+  }
 });
 // Stream-only stop: abort in-flight model streams without cancelling the task,
 // killing dream/SIPS children, or tearing down operations. This is the
