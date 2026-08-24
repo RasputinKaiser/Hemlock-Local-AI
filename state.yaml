@@ -932,6 +932,8 @@ tranche7_5_chat_reliability_2026_08_23:
       what: "Dead replies (streamDied) render honest copy + a Re-run-this-prompt button reusing retryLastMessage (same helper as per-message retry); token-limit branch unchanged."
     ipc_clone_errors_cleared:
       what: "All 6 'object could not be cloned' errors in launch.log date to Aug 15 (before the stability-pass fix); zero occurrences since. Historical — no live bug."
+    mlx_upgrade_0321:
+      what: "Root cause of the GPU-timeout SIGABRTs identified upstream: mlx <0.32.0 threw Metal CommandBuffer errors from the completion handler (uncatchable → abort). PR #3523 (in 0.32.0) defers them to safe checkpoints so the server can catch and continue. Upgraded the Hemlock runtime mlx 0.31.2 → 0.32.1; 8 consecutive generations with zero aborts (previously crashing every few requests). setup.py documents the recommendation."
   verification:
     electron_suite: "node --test electron/*.test.cjs: 200 passed (190 + 10 crash_policy incl. source wiring guards)"
     renderer_suite: "node --test src/*.test.js: 26 passed"

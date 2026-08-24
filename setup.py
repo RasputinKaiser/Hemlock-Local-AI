@@ -11,6 +11,11 @@ sys.path.append(str(package_dir))
 from _version import __version__
 
 MIN_MLX_VERSION = "0.31.2"
+# 0.32.0+ recommended: PR #3523 ("Catch error in CommandBuffer and poison the
+# events") turns the uncatchable Metal completion-handler abort (SIGABRT on
+# kIOGPUCommandBufferCallbackErrorTimeout, seen 10x on macOS 26.6 / M1 Pro)
+# into a catchable exception raised at safe checkpoints. Verified 2026-08-23:
+# mlx 0.32.1 survived 8 consecutive generations with zero GPU-timeout aborts.
 
 setup(
     name="mlx-lm",
