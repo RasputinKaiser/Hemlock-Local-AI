@@ -1017,3 +1017,63 @@ tranche9_hardening_2026_08_24:
     gates: "electron 236/236 (0 skipped), renderer 26/26, vite build ok, node --check main/orchestrator/maple_runtime ok, esbuild ok"
   claim_boundary: "Deterministic verification only. Stop button and readiness diagnostics not yet exercised against a live wedged server."
 
+
+tranche10_chat_build_stability_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche10-chat-build-stability-ux.md
+  commit: e707da7
+  changes:
+    coalesced_stream_updates:
+      what: "createFrameCoalescer (streamStore.js) buffers stream frames, drains on rAF or 50ms cap (background-tab stall fix), terminal frames drain synchronously; main.jsx subscriber pushes frames through the identical reducer at flush — ordering/dedupe/verbatim semantics unchanged; shared createScheduler fixes prior rAF leak on dispose."
+    composer_untrap_guards:
+      what: "startDream pre-flight updateTask failure no longer strands isDreaming=true; browser-path sendMessage pre-flight failure clears isThinking + timer and emits prompt.failed. Both previously left the composer permanently disabled."
+    plan_approval_guards:
+      what: "approvePlan(taskId, planId, budgetOverrides) rejects non-waiting_for_approval task states with an honest blocked result (no mutation); clamps overrides via existing pure clampBudgetOverrides inside the orchestrator so direct callers are safe too."
+    queue_duplicate_rejection:
+      what: "agent_queue enqueue rejects an identical pending objective (status duplicate, points at existing entry); active-task steering unaffected; FIFO order untouched."
+  verification:
+    gates: "electron 241/241 (236 baseline + 5 new), renderer 30/30 (26 baseline + 4 new), vite build ok, node --check ok, esbuild ok"
+    integration: "Both lanes' diffs reviewed by parent before single tranche commit; renderer gates re-run independently after host changes."
+  claim_boundary: "Deterministic verification only. Coalescing latency improvement and untrap guards not yet exercised in a live streaming session; duplicate rejection semantics not yet exercised live. Deferred follow-ups: host stream/projection perf audit (per-frame stringify, unbounded arrays, listener leaks), error-taxonomy gap sweep for uncovered user-visible errors."
+
+tranche11_chat_build_polish_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche11-chat-build-polish-hardening.md
+  commit: 125d36b
+  base: e707da7 (first tranche under delegation.child_timeout_seconds=1800 — both lanes landed in one run, no re-dispatch)
+  changes:
+    host_stream_perf:
+      what: "checkpointStream JSON.stringify'd the full channel map on EVERY SSE chunk before the throttle check (O(total-output²) per stream); replaced with pure shouldCheckpointStream predicate + incremental stream.channelBytes accounting; serialization now happens once on actual checkpoints. streamRing leaked up to 240 retained frames per finished stream (write-only, never read) — deleted in finishStream. agentEventIds dedup Set grew forever while agentEvents capped at 160 — bounded to a 4096 insertion-order window."
+    error_taxonomy_gaps:
+      what: "New kinds: endpoint-not-found (HTTP 404, non-retryable), server-error (non-GPU 5xx, retryable), action-envelope-invalid (INVALID/EMPTY_ACTION_OUTPUT, non-retryable — repair loop already exhausted), transport-death extended to EHOSTUNREACH/ENETUNREACH/EAI_AGAIN/getaddrinfo. Retry behavior unchanged (maple_runtime keeps its narrow kind set)."
+    renderer_memoization:
+      what: "TranscriptMessageRow = memo() at module scope with primitive-only props + ref-backed stable onRetry; coalesced flushes re-render only the advancing row. channelProviderName hoisted; reasoning toggle became a prop."
+    streaming_prose:
+      what: "Fixed real bug: empty bubble mid-stream flashed terminal 'finished without text' copy — now shows 'Waiting for first output…' with caret. 72ch measure + text-wrap pretty on streamed content; caret softened to opacity pulse with prefers-reduced-motion fallback; gold LIVE dot on open reasoning channels."
+    contrast_fixes:
+      what: "Reasoning body #7d7460 was 4.32:1 over tinted bg → #6b6350 (5.56:1). Skipped verification card opacity:.82 dimmed kicker to 4.09:1 → explicit muted colors (#5f7161 5.13:1) with regression test banning opacity. Failed tone #956d23 passes at 4.60:1 (thin headroom, left as-is). Plan-card hierarchy reordered objective → steps → usage counters → stepper/actions; budget usage 10px DM Mono tabular."
+  investigated_no_change:
+    - "stream_dispatcher coalescer clean; SSE parser buffers correctly"
+    - "agent_kernel event spine already bounded everywhere (ops -80, plans -40, actions/observations/candidates -120, episodes -40)"
+    - "no listener leaks — all .on() attach to short-lived children or app-level once-handlers"
+    - "repo.inspect caching skipped: dispatch lives in main.cjs command layer, no small call-site change exists"
+  verification:
+    gates: "electron 249/249 (+8), renderer 33/33 (+3), vite build ok, node --check ok, esbuild ok; all re-run by parent after lane integration"
+  claim_boundary: "Deterministic/static verification only (contrast math, source tests, builds). Memo skip behavior and O(n²) fix not yet observed against a live Maple stream; live relaunch smoke still outstanding from T10."
+
+tranche12_build_loop_hotfix_2026_08_24:
+  status: implemented_verified
+  trigger: "User-reported live incident: Build mode looped re-proposing completed commands, plan card covered chat, streamed output rendered ABOVE sent messages, no artifact ever reached the viewer."
+  root_causes:
+    plan_mutation_loop: "adaptPlanForCommand INSERTED a new plan step on every adaptive selection of an already-completed command — the plan grew [repo-map, repo-map, ...] each round, pushing artifact.author permanently out of reach (projection.jsonl: repo-map x24, create/author x20 all-time, zero previewable artifacts)."
+    author_failures: "artifact.author failed on empty input / sha256-as-id because executeCommand never injected taskId (registry resolved under wrong task) and missing-artifact threw before any fallback."
+    ui_ordering: "chat-live-stream panel rendered BEFORE messages.map in chat-surface; plan card shared grid cell with chat-work-rail (layered on top)."
+  changes:
+    anti_repeat_guard: "completedTaskCommands + resolveProgressCommand pure helpers; proposeNextAction redirects a repeat proposal to the plan's next incomplete step deterministically, emits action.redirected host note; adaptPlanForCommand refuses to insert duplicates of completed commands while open planned work remains."
+    author_bulletproofing: "ensure-create-if-missing before authoring; registry throws retry once through host scaffold fallback; taskId injected at executeCommand call site; next-action prompt now states 'Completed already (do NOT repeat): …' and 'Plan progress: step N of M'."
+    renderer_ordering: "live-stream panel moved below transcript with border-top separator; plan card moved to its own grid row in column 1 under the transcript (row 5), work rail untouched in column 2; message-order invariant verified (append-only, streamId-keyed)."
+    test_contract_fixes: "mock executeCommands mirror production artifactCommandReceipt shape (artifactId field); assertions updated to assert executed behavior rather than raw preserved proposal inputs."
+  verification:
+    gates: "electron 257/257 (+8 net), renderer 34/34 (+1), vite build ok, node --check ok, esbuild ok; debug probes stripped post-debug"
+    commit: e1fbefe
+  claim_boundary: "Deterministic verification only until live smoke completes; loop fix exercised via regression test replaying the incident pattern (repeat proposals redirected once, plan stable at 2 steps), not yet against live Maple."
