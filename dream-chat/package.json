@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "test:agent": "node --test electron/agent_kernel.test.cjs electron/agent_contracts.test.cjs electron/agent_orchestrator.test.cjs electron/agent_queue.test.cjs electron/context_sources.test.cjs electron/tool_use_eval.test.cjs electron/stream_protocol.test.cjs electron/response_budget.test.cjs electron/artifact_registry.test.cjs electron/artifact_verifier.test.cjs electron/interaction_modes.test.cjs electron/preview_policy.test.cjs electron/provider_adapters.test.cjs electron/maple_runtime.test.cjs electron/preload_contract.test.cjs electron/stream_dispatcher.test.cjs electron/thread_manager.test.cjs electron/coding_workspace.test.cjs electron/coding_autopilot.test.cjs",
-    "test:ui": "node --test src/windowManager.test.js src/streamStore.test.js src/styles.test.js",
+    "test:agent": "node --test electron/agent_kernel.test.cjs electron/agent_contracts.test.cjs electron/agent_orchestrator.test.cjs electron/agent_queue.test.cjs electron/context_sources.test.cjs electron/tool_use_eval.test.cjs electron/stream_protocol.test.cjs electron/response_budget.test.cjs electron/artifact_registry.test.cjs electron/artifact_verifier.test.cjs electron/interaction_modes.test.cjs electron/preview_policy.test.cjs electron/provider_adapters.test.cjs electron/maple_runtime.test.cjs electron/preload_contract.test.cjs electron/stream_dispatcher.test.cjs electron/thread_manager.test.cjs electron/coding_workspace.test.cjs electron/coding_autopilot.test.cjs electron/verification_card.test.cjs",
+    "test:ui": "node --test src/windowManager.test.js src/streamStore.test.js src/styles.test.js src/evidenceLedger.test.js src/copyProvenance.test.js",
     "eval:agent": "node electron/tool_use_eval.cjs",
+  "eval:tool-use-live": "node electron/tool_use_live.cjs",
     "verify:agent": "npm run test:agent && npm run test:ui && npm run build",
     "test:e2e:artistic-fixture": "node electron/e2e_artistic_fixture.cjs",
     "test:e2e:artistic-maple": "node electron/e2e_artistic_maple.cjs",

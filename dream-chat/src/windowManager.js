@@ -1,7 +1,7 @@
 export const WINDOW_SCHEMA = "hemlock.window.state.v2";
 export const TITLEBAR_HEIGHT = 42;
 export const MIN_VISIBLE_BODY = 80;
-export const SNAP_THRESHOLD = 16;
+export const SNAP_THRESHOLD = 7;
 export const CASCADE_STEP = 24;
 
 export const WINDOW_DEFINITIONS = {
@@ -131,9 +131,14 @@ export function normalizeZOrder(windows, focusedId = null) {
   return next;
 }
 
-export function focusWindow(windows, windowId, now = new Date().toISOString()) {
+export function focusWindow(windows, windowId, now = new Date().toISOString(), canvas = null) {
   if (!windows?.[windowId]) return windows;
-  return normalizeZOrder({ ...windows, [windowId]: { ...windows[windowId], state: windows[windowId].state === "minimized" ? "normal" : windows[windowId].state, lastFocusedAt: now } }, windowId);
+  const item = windows[windowId];
+  // Re-clamp on focus: a window persisted against an older canvas size (or parked
+  // outside the visible surface) must come back on-screen when the user summons it.
+  // Without this, clicking the dock item only re-orders z and nothing visibly changes.
+  const bounds = canvas ? clampBounds(item.bounds, canvas, item.minimumSize) : item.bounds;
+  return normalizeZOrder({ ...windows, [windowId]: { ...item, state: item.state === "minimized" ? "normal" : item.state, bounds, lastFocusedAt: now } }, windowId);
 }
 
 function overlaps(a, b) {

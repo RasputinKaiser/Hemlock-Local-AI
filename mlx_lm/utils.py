@@ -52,7 +52,8 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
-    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "gemma4_unified": "gemma4",
+    "lfm2_dspark": "dspark",  # LFM2.5-DSpark speculative draft model (mlx_lm/models/dspark.py)
 }
 
 MAX_FILE_SIZE_GB = 5

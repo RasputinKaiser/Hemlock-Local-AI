@@ -191,6 +191,8 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    ngram_draft: bool = False
+    ngram_window: int = 1024
 
 
 @dataclass
@@ -311,11 +313,21 @@ class ModelProvider:
                 "Loading with adapters or draft models not supported in distributed mode"
             )
 
-        # Remove the old model if it exists.
+        # Remove the old model if it exists. Drop references FIRST, then clear
+        # the MLX memory + Metal cache: on 16 GB Macs two resident models (e.g.
+        # maple-2bit ~6 GB + LFM2.5-4bit ~5 GB) exceed the GPU wired limit and
+        # Metal aborts the whole server (GPU Timeout -> SIGABRT) on the next
+        # forward pass. Clearing here makes model switching actually free the
+        # previous model's memory before the new one is allocated.
         self.model_key = None
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        try:
+            mx.clear_cache()
+            mx.metal.clear_cache()
+        except Exception:
+            pass
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -623,6 +635,17 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
+        # n-gram speculative decoding and KV cache quantization are only
+        # implemented on the single-request path (`_serve_single` →
+        # `stream_generate` → `generate_step`). The continuous-batching
+        # `BatchGenerator` path ignores both flags, so force the single path
+        # whenever either optimization is active. With decode/prompt
+        # concurrency set to 1 (the Hemlock default) this has no throughput
+        # downside for a local single-user assistant.
+        if getattr(args, "ngram_draft", False):
+            return False
+        if self.cli_args.kv_bits is not None:
+            return False
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
@@ -923,6 +946,7 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
+            ngram_draft = getattr(args, "ngram_draft", False)
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -932,9 +956,20 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
-                num_draft_tokens=args.num_draft_tokens,
+                # n-gram drafting uses its own depth ceiling (default 12);
+                # --num-draft-tokens only governs model-based speculation.
+                num_draft_tokens=(
+                    self.cli_args.ngram_depth
+                    if ngram_draft and hasattr(self.cli_args, "ngram_depth")
+                    else args.num_draft_tokens
+                ),
+                ngram_draft=ngram_draft,
+                ngram_window=getattr(args, "ngram_window", 1024),
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
@@ -949,9 +984,11 @@ class ResponseGenerator:
                     Response(
                         gen.text,
                         gen.token,
-                        gen.logprobs[gen.token].item(),
+                        0.0 if gen.logprobs is None else gen.logprobs[gen.token].item(),
                         finish_reason,
-                        _format_top_logprobs(
+                        ()
+                        if gen.logprobs is None
+                        else _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
                         ),
                     )
@@ -1117,6 +1154,20 @@ class APIHandler(BaseHTTPRequestHandler):
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
+        )
+        self.ngram_draft = self.body.get(
+            "ngram_draft",
+            self.response_generator.cli_args.ngram_draft
+            if hasattr(self.response_generator.cli_args, "ngram_draft")
+            else False,
+        )
+        self.ngram_window = int(
+            self.body.get(
+                "ngram_window",
+                self.response_generator.cli_args.ngram_window
+                if hasattr(self.response_generator.cli_args, "ngram_window")
+                else 1024,
+            )
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
@@ -1356,6 +1407,8 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            ngram_draft=bool(self.ngram_draft),
+            ngram_window=int(self.ngram_window),
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -1761,6 +1814,27 @@ def main():
         default=3,
     )
     parser.add_argument(
+        "--ngram-draft",
+        action="store_true",
+        help=(
+            "Use zero-cost n-gram (prompt-lookup) speculative decoding. No second "
+            "model is loaded, so memory stays at the target's footprint. Best for "
+            "repetitive / code / templated output. Output is identical to greedy."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-window",
+        type=int,
+        help="Context window size for n-gram draft lookup.",
+        default=1024,
+    )
+    parser.add_argument(
+        "--ngram-depth",
+        type=int,
+        help="Maximum speculative depth for n-gram drafting (default: 12).",
+        default=12,
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
@@ -1818,7 +1892,7 @@ def main():
         "--chat-template-args",
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
-        default="{}",
+        default='{"enable_thinking": true}',
     )
     parser.add_argument(
         "--decode-concurrency",
@@ -1837,6 +1911,24 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization (default: no quantization). 4-bit saves ~75% KV memory.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=5000,
+        help="Step at which to start quantizing the KV cache (default: 5000)",
     )
     parser.add_argument(
         "--prompt-cache-size",

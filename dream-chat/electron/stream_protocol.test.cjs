@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { Utf8SseParser, parseSsePayload, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, digest } = require("./stream_protocol.cjs");
+const { Utf8SseParser, parseSsePayload, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, shouldCheckpointStream, digest } = require("./stream_protocol.cjs");
 
 test("parses split UTF-8 and SSE boundaries through DONE", () => {
   const parser = new Utf8SseParser();
@@ -79,3 +79,29 @@ test("digest is stable and names the algorithm", () => {
   assert.match(digest("Hemlock"), /^sha256:[0-9a-f]{64}$/);
   assert.equal(digest("Hemlock"), digest("Hemlock"));
 });
+
+// T11-A: the host's checkpointStream gate — throttle on incremental delta
+// bytes + interval instead of serializing full channels per SSE chunk.
+test("shouldCheckpointStream skips when interval and byte growth are both under budget", () => {
+  const state = { lastCheckpointAt: 1000, channelBytes: 1000, lastMarkBytes: 0 };
+  assert.equal(shouldCheckpointStream(state, { now: 1500 }), false); // 500ms < 750ms, 1000 < 2048
+});
+
+test("shouldCheckpointStream fires when either the interval elapsed or enough bytes accrued", () => {
+  assert.equal(shouldCheckpointStream({ lastCheckpointAt: 1000, channelBytes: 1000, lastMarkBytes: 0 }, { now: 1800 }), true);
+  assert.equal(shouldCheckpointStream({ lastCheckpointAt: 1000, channelBytes: 3100, lastMarkBytes: 1000 }, { now: 1100 }), true); // 2100 >= 2048
+});
+
+test("shouldCheckpointStream always fires when forced and rejects non-object state", () => {
+  assert.equal(shouldCheckpointStream({ lastCheckpointAt: Date.now(), channelBytes: 0, lastMarkBytes: 0 }, { force: true }), true);
+  for (const garbage of [null, undefined, 42, "stream"]) {
+    assert.equal(shouldCheckpointStream(garbage), false);
+  }
+});
+
+test("shouldCheckpointStream treats missing accounting fields as not-yet-due", () => {
+  // Empty state: lastCheckpointAt defaults to 0, so only `now` values at least
+  // one interval past epoch would fire — a bare object stays skipped.
+  assert.equal(shouldCheckpointStream({}, { now: 10 }), false);
+});
+

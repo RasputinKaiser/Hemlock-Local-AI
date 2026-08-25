@@ -9,10 +9,12 @@ const {
   createObservation,
   createPlan,
   boundedActionInput,
+  clampBudgetOverrides,
   coerceActionPayload,
   extractActionEnvelope,
   mergeBudget,
   normalizeExpectedEvidence,
+  TERMINAL_ACTION_STATUSES,
   validateAction,
 } = require("./agent_contracts.cjs");
 
@@ -89,6 +91,33 @@ function allowedNextCommands(commandRegistry = {}, plan = { steps: [] }, history
   }).slice(0, 32);
 }
 
+// T12 anti-repeat guard: a completed command's receipt is already durable.
+// Re-running it cannot create new progress — it only burns an agent step and,
+// in Build mode, starves the artifact steps until the wall clock expires (the
+// task-2026-08-24T21-02-29 loop: repo-map re-proposed for ~24 turns after
+// artifact.create had completed). When Maple re-proposes anything that already
+// completed AND approved plan work remains, the host deterministically advances
+// to the plan's next incomplete step instead and records why.
+function completedTaskCommands(history = {}) {
+  return new Set((history.actions || [])
+    .filter((action) => TERMINAL_ACTION_STATUSES.has(action.status) && action.kind !== "ask_user" && action.commandId)
+    .map((action) => action.commandId));
+}
+
+function resolveProgressCommand(proposal, completedIds, planSteps = []) {
+  const requested = String(proposal?.commandId || "").trim();
+  if (!requested || !completedIds?.has(requested)) return { commandId: requested || null, redirected: false };
+  const nextIndex = planSteps.findIndex((step) => step?.commandId && !completedIds.has(step.commandId));
+  const redirect = nextIndex >= 0 ? planSteps[nextIndex] : null;
+  return {
+    commandId: redirect?.commandId || null,
+    redirected: Boolean(redirect),
+    reason: `model re-proposed completed ${requested}; host advanced to plan step ${nextIndex + 1}`,
+    step: redirect || null,
+    requestedCommandId: requested,
+  };
+}
+
 function actionInputContract(commandId) {
   switch (String(commandId || "")) {
     case "artifact.create":
@@ -129,7 +158,7 @@ function defaultPlanSteps(intent, objective = "") {
       { commandId: "git.diff", label: "Record the final scoped diff", expectedEvidence: ["git://diff"] },
     ];
   }
-  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Inspect recent evidence before proposing improvement", expectedEvidence: ["receipt://recent"] }];
+  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Recall recent local evidence before proposing", expectedEvidence: ["receipt://recent"] }, { commandId: "improve.propose", label: "Propose a bounded local improvement from the evidence", expectedEvidence: ["receipt://proposed-improvement"] }, { kind: "answer", label: "Summarize the proposed improvement for approval" }];
   if (intent === "conversation") return [{ kind: "answer", label: "Answer from the scoped context and evidence" }];
   return [{ commandId: "repo-map", label: "Inspect the local project", expectedEvidence: ["repo://current-worktree"] }];
 }
@@ -197,12 +226,30 @@ class AgentOrchestrator {
     return plan;
   }
 
-  async approvePlan(taskId, planId) {
+  async approvePlan(taskId, planId, budgetOverrides = null) {
     const task = this.task();
     if (task?.id !== taskId) throw new Error("The plan does not belong to the current task.");
     const plan = this.requirePlan(taskId, planId);
     if (plan.status === "approved") return { schema: "hemlock.agent.plan.result.v1", status: this.task().status, plan, task: this.task(), claimBoundary: "The plan was already approved; the durable task state is authoritative." };
+    // T10-LaneA guard: an approval only means something while the task is
+    // actually parked in waiting_for_approval. Reject honestly (no crash, no
+    // state mutation) when the task has moved on to running/blocked/terminal.
+    if (task.status !== "waiting_for_approval") {
+      return {
+        schema: "hemlock.agent.plan.result.v1",
+        status: "blocked",
+        reason: `Task is not awaiting plan approval; current status is ${task.status}.`,
+        plan,
+        task: this.task(),
+        claimBoundary: "No approval was applied and no task state changed.",
+      };
+    }
     if (plan.status !== "proposed") throw new Error(`Plan is not awaiting approval; current status is ${plan.status}.`);
+    // T10-LaneA: clamp user-granted budget overrides here (same pure helper the
+    // host uses at plan.approve dispatch) so the orchestrator is safe even when
+    // it is driven directly. Out-of-range or garbage keys drop out.
+    const clampedOverrides = clampBudgetOverrides(budgetOverrides);
+    if (Object.keys(clampedOverrides).length) this.updateTask({ budget: mergeBudget({ ...this.task().budget, ...clampedOverrides }) });
     this.kernel.transitionPlan(planId, "approve");
     this.updateTask({ phase: "work", status: "running", foregroundStep: "Maple is selecting the first bounded action", blockedReason: null, activePlanId: planId });
     this.emit("plan.approved", "passed", { planId, taskId, plan: this.kernel.getProjection().plans.find((item) => item.id === planId) }, { reversible: true });
@@ -255,8 +302,18 @@ class AgentOrchestrator {
   adaptPlanForCommand(task, plan, history, decision) {
     if (!decision?.commandId || decision.mode !== "adaptive") return plan.steps[history.actions.length] || null;
     const currentIndex = history.actions.length;
-    const existingIndex = plan.steps.findIndex((step, index) => index >= currentIndex && step.commandId === decision.commandId);
+    let existingIndex = plan.steps.findIndex((step, index) => index >= currentIndex && step.commandId === decision.commandId);
     let step = existingIndex >= currentIndex ? plan.steps.splice(existingIndex, 1)[0] : null;
+    // T12 anti-repeat: never INSERT a new copy of a command that already
+    // completed in this task while incomplete approved work remains — that
+    // grew the plan forever and pushed the real step out of reach (the
+    // task-2026-08-24 Build-mode loop). Hand back the current slot instead;
+    // the proposeNextAction progress guard owns the explicit redirect note.
+    if (!step) {
+      const completedIds = completedTaskCommands(history);
+      const openPlannedWork = plan.steps.some((item, index) => index >= currentIndex && item?.commandId && !completedIds.has(item.commandId));
+      if (completedIds.has(decision.commandId) && openPlannedWork) return plan.steps[currentIndex] || null;
+    }
     const descriptor = this.commandRegistry[decision.commandId] || {};
     if (!step) {
       step = {
@@ -325,6 +382,14 @@ class AgentOrchestrator {
     };
     const nextPlannedStep = plan.steps[history.actions.length] || null;
     const allowedCommands = this.allowedNextCommands(task, plan, history);
+    // T12 next-action clarity: Maple's failed-session reasoning showed genuine
+    // confusion about what had already finished ("plan.approve is running but
+    // not yet completed... suggests the plan has been approved"). Make the
+    // completion state explicit and compact so stale commands stop looking live.
+    const completedIds = completedTaskCommands(history);
+    const completedList = [...completedIds].join(", ");
+    const totalSteps = plan.steps.filter((step) => step?.commandId).length;
+    const doneSteps = plan.steps.filter((step) => step?.commandId && completedIds.has(step.commandId)).length;
     const actionPrompt = {
       system: [
         "You are Maple-Preview operating inside Hemlock.",
@@ -336,6 +401,8 @@ class AgentOrchestrator {
         "If evidence is insufficient, return kind ask_user or blocked. Do not claim completion without a host observation or receipt.",
         '{"schema":"hemlock.agent.action.v1","id":"a","taskId":"t","step":1,"kind":"tool","commandId":"registered-command","input":{},"shortRationale":"Short reason","expectedEvidence":[],"approval":"none","status":"proposed"}',
         `The current planned command is ${nextPlannedStep?.commandId || "none"}. You may choose another entry from allowedNextCommands if it better serves the objective; the host will validate and record that adaptation.`,
+        completedList ? `Completed already (do NOT repeat; a re-proposal is redirected to the plan): ${completedList}` : `Completed already (do NOT repeat): none`,
+        `Plan status: approved. Plan progress: step ${Math.min(doneSteps + 1, Math.max(totalSteps, 1))} of ${Math.max(totalSteps, 1)}${totalSteps ? "" : " (no planned tool steps)"}.`,
         `allowedNextCommands: ${JSON.stringify(allowedCommands)}`,
         `Input contract for the current planned command: ${actionInputContract(nextPlannedStep?.commandId)} Use the reasoning channel as needed, then finish with the action envelope.`,
       ].join("\n"),
@@ -539,6 +606,30 @@ class AgentOrchestrator {
         : this.deterministicAction(task, plan, history);
       if (TERMINAL_TASK_STATUSES.has(this.task()?.status)) return { schema: "hemlock.agent.task.result.v1", status: this.task().status, task: this.task() };
       action = { ...action, taskId, step: history.actions.length + 1 };
+      // T12 anti-repeat guard: Maple re-proposing a command whose receipt is
+      // already durable cannot create progress — and in Build mode it starves
+      // the artifact steps until budgets expire (the task-2026-08-24 loop:
+      // repo-map re-proposed ~24 times after artifact.create completed). While
+      // approved plan work remains incomplete, a repeat proposal is replaced
+      // by the plan's next unfinished step and a host note explains why.
+      if (action.kind === "tool" && action.commandId) {
+        const completedIds = completedTaskCommands(history);
+        const hasIncompletePlanStep = plan.steps.some((step) => step?.commandId && !completedIds.has(step.commandId));
+        if (hasIncompletePlanStep) {
+          const redirect = resolveProgressCommand(action, completedIds, plan.steps);
+          if (redirect.redirected) {
+            this.emit("action.redirected", "degraded", {
+              taskId,
+              requestedCommandId: redirect.requestedCommandId,
+              selectedCommandId: redirect.commandId,
+              reason: redirect.reason,
+              mode: "anti-repeat-guard",
+              parseStatus: "redirected",
+            }, { evidenceRefs: expectedEvidenceForCommand(redirect.commandId), reversible: true });
+            action = { ...this.deterministicAction(task, plan, history), hostSelection: { requestedCommandId: redirect.requestedCommandId, selectedCommandId: redirect.commandId, mode: "redirected", reason: redirect.reason }, parseStatus: "redirected" };
+          }
+        }
+      }
       validateAction(action, this.commandRegistry);
     } catch (error) {
       const nextStep = plan.steps[history.actions.length];
@@ -863,8 +954,17 @@ class AgentOrchestrator {
     this.kernel.transitionAction(action.id, "start");
     this.emit("command.started", "running", { actionId: action.id, command: action.commandId }, { reversible: true });
     const startedAt = Date.now();
+    let error = null;
     try {
       const commandInput = { ...(action.input || {}) };
+      // T8-F4: the model parrots plan-step refs ("artifact://manifest", "scratch
+      // artifact") as artifactId, which fails safeSegment and blocks authoring.
+      // A valid id matches ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ — anything else is
+      // treated as absent so the host fills in the task's real artifact below.
+      const ARTIFACT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+      // T9-H3: non-string artifactIds (numbers from a confused model envelope)
+      // are invalid too — String(42)==="42" would otherwise pass the regex.
+      if (typeof commandInput.artifactId !== "string" || !ARTIFACT_ID_RE.test(commandInput.artifactId)) delete commandInput.artifactId;
       if (action.commandId === "artifact.create") {
         const allowedArtifactKinds = new Set(["html", "svg", "text", "markdown", "json"]);
         commandInput.kind = allowedArtifactKinds.has(String(commandInput.kind || "").toLowerCase()) ? String(commandInput.kind).toLowerCase() : "html";
@@ -873,9 +973,18 @@ class AgentOrchestrator {
         commandInput.mime ||= "text/html";
         commandInput.entrypoint = typeof commandInput.entrypoint === "string" && commandInput.entrypoint !== "create" && commandInput.entrypoint && !commandInput.entrypoint.startsWith("/") && !commandInput.entrypoint.split(/[\\/]/).some((part) => part === "." || part === ".." || !part) ? commandInput.entrypoint : "index.html";
       }
-      if (action.commandId === "artifact.author" && !commandInput.artifactId) {
-        const priorArtifact = this.kernel.getTaskHistory(task.id).observations.slice().reverse().map((item) => item.structuredOutput).find((output) => output?.schema === "hemlock.agent.artifact.v1" && output.id);
-        if (priorArtifact?.id) commandInput.artifactId = priorArtifact.id;
+      if (action.commandId === "artifact.author") {
+        // T12: an adaptive artifact.author can arrive before any
+        // artifact.create ran (real receipts: input {} and input.artifactId
+        // "sha256:bbd26…" both ended action.faild). Resolve a usable target id
+        // here; if none exists yet, mark it so the dispatch below creates one.
+        const ARTIFACT_TARGET_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/;
+        if (typeof commandInput.artifactId !== "string" || !ARTIFACT_TARGET_RE.test(commandInput.artifactId)) delete commandInput.artifactId;
+        if (!commandInput.artifactId) {
+          const priorArtifact = this.kernel.getTaskHistory(task.id).observations.slice().reverse().map((item) => item.structuredOutput).find((output) => output?.schema === "hemlock.agent.artifact.v1" && output.id);
+          commandInput.__ensureArtifact = !(priorArtifact?.id && typeof priorArtifact.id === "string" && ARTIFACT_TARGET_RE.test(priorArtifact.id));
+          if (!commandInput.__ensureArtifact) commandInput.artifactId = priorArtifact.id;
+        }
       }
       const priorOutputs = this.kernel.getTaskHistory(task.id).observations.slice().reverse().map((item) => item.structuredOutput);
       const latestArtifact = priorOutputs.find((output) => output?.schema === "hemlock.agent.artifact.v1" && output.id);
@@ -903,7 +1012,71 @@ class AgentOrchestrator {
         const latestPreview = priorOutputs.find((output) => output?.schema === "hemlock.agent.preview.open.v1" && output.session?.id);
         if (latestPreview?.session?.id) commandInput.sessionId = latestPreview.session.id;
       }
-      let result = await this.executeCommand(action.commandId, { ...commandInput, __fromAgentAction: true, __approvedPlan: true, __agentActionId: action.id });
+      if (action.commandId === "artifact.author" && commandInput.__ensureArtifact === true) {
+        // T12 author-fallback bulletproofing: the author action targeted an
+        // artifact that does not exist in this task (no artifact.create yet).
+        // Create-if-missing with host defaults, then continue into the normal
+        // author path — never fail the action for a missing scratch artifact.
+        delete commandInput.__ensureArtifact;
+        try {
+          const created = await this.executeCommand("artifact.create", {
+            taskId: task.id,
+            title: String(task.objective || "Hemlock animation").split(/[:.!?]/, 1)[0].slice(0, 120) || "Hemlock animation",
+            kind: "html",
+            mime: "text/html",
+            entrypoint: "index.html",
+            __fromAgentAction: true,
+            __approvedPlan: true,
+            __agentActionId: action.id,
+          });
+          if (created?.artifactId) commandInput.artifactId = created.artifactId;
+          else if (!commandInput.artifactId) throw new Error("Host could not create a scratch artifact for authoring.");
+          this.emit("artifact.author.ensure", "degraded", { taskId: task.id, artifactId: created.artifactId, reason: "artifact.author arrived before any artifact.create completed; host created the scratch artifact." }, { reversible: true });
+        } catch (ensureError) {
+          this.emit("artifact.author.ensure", "failed", { taskId: task.id, reason: ensureError.message }, { reversible: true });
+          throw ensureError;
+        }
+      }
+      let result = await this.executeCommand(action.commandId, { ...commandInput, taskId: commandInput.taskId || task.id, __fromAgentAction: true, __approvedPlan: true, __agentActionId: action.id });
+      if (action.commandId === "artifact.author") {
+        // T12: registry-side throws (missing manifest, invalid path segments in
+        // model-supplied source maps or filenames, kind/runtime validation)
+        // must degrade to the host scaffold outcome instead of failing a
+        // receipt-backed Build-mode action. Retry once through the same
+        // create-if-missing-then-author fallback used above.
+        const retryAuthor = async () => {
+          const ensured = await this.executeCommand("artifact.create", {
+            taskId: task.id,
+            title: String(task.objective || "Hemlock animation").split(/[:.!?]/, 1)[0].slice(0, 120) || "Hemlock animation",
+            kind: "html",
+            mime: "text/html",
+            entrypoint: "index.html",
+            __fromAgentAction: true,
+            __approvedPlan: true,
+            __agentActionId: action.id,
+          });
+          if (!ensured?.artifactId) throw new Error("Host could not create a scratch artifact for authoring.");
+          return this.executeCommand(action.commandId, {
+            ...commandInput,
+            artifactId: ensured.artifactId,
+            filename: "index.html",
+            runtimeTemplate: "html",
+            source: { "index.html": fallbackAnimationSource(task.objective) },
+            status: "previewable",
+            evidence: [{ type: "authoring.host_fallback", reason: `Registry rejected the authored revision (${error.message}); host scaffold retained.` }],
+            __fromAgentAction: true,
+            __approvedPlan: true,
+            __agentActionId: action.id,
+          });
+        };
+        try {
+          result = result && typeof result.then === "function" ? await result : result;
+        } catch (authorError) {
+          error = authorError;
+          result = await retryAuthor();
+          this.emit("artifact.author.recovered", "degraded", { taskId: task.id, artifactId: result?.id || null, reason: authorError.message }, { reversible: true });
+        }
+      }
       if (action.commandId === "artifact.preview.inspect" && result?.status === "blocked") {
         result = await this.repairArtifact(task, this.kernel.getProjection().plans.find((item) => item.id === task.activePlanId) || { steps: [] }, action, result);
       }
@@ -997,18 +1170,9 @@ class AgentOrchestrator {
   blockTask(taskId, reason, payload = {}) {
     this.updateTask({ phase: "blocked", status: "blocked", foregroundStep: "Inspect the blocked action and choose the next decision", blockedReason: reason });
     this.emit("task.blocked", "blocked", { taskId, reason, ...payload }, { reversible: true });
-    if (this.task()?.provider === "maple" && typeof this.createSuggestion === "function") {
-      this.createSuggestion({
-        threadId: this.task()?.threadId || null,
-        projectId: this.task()?.projectId || null,
-        kind: "provider-escalation",
-        title: "Maple-Preview is blocked",
-        summary: "Retry this bounded task with an authenticated Codex or Claude subscription lane.",
-        reason,
-        evidenceRefs: this.task()?.evidenceRefs || [],
-        recommendedAction: { command: "task.escalate-provider", providers: ["codex", "claude"] },
-      });
-    }
+    // T8-F6: provider escalation removed — Hemlock runs ONLY the selected
+    // lane. A Maple failure surfaces as a blocked task with its reason; no
+    // Codex/Claude escape hatch is offered.
     return { schema: "hemlock.agent.task.result.v1", status: "blocked", task: this.task(), reason, ...payload };
   }
 
@@ -1024,4 +1188,4 @@ class AgentOrchestrator {
   }
 }
 
-module.exports = { AgentOrchestrator, defaultPlanSteps };
+module.exports = { AgentOrchestrator, defaultPlanSteps, completedTaskCommands, resolveProgressCommand };

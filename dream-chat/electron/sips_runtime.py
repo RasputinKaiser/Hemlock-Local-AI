@@ -127,6 +127,81 @@ def record(payload: dict) -> dict:
     return {"schema": SCHEMA, "status": "recorded", "record": entry, "memoryPath": str(memory_path)}
 
 
+def read_feedback(feedback_path: Path) -> list[dict]:
+    if not feedback_path.is_file():
+        return []
+    entries = []
+    for line in feedback_path.read_text(encoding="utf-8").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            entries.append(value)
+    return entries
+
+
+def aggregate_feedback_counts(entries: list, record_id: str | None = None) -> dict:
+    """Pure: count useful/irrelevant votes per record id from ledger lines.
+
+    Unknown kinds and blank record ids are ignored, never counted as votes.
+    With record_id set, returns just that record's {useful, irrelevant}
+    counts (zeroed when unseen); otherwise returns every record's counts.
+    """
+    counts: dict[str, dict] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("recordId") or "")
+        kind = str(entry.get("kind") or "")
+        if not entry_id or kind not in {"useful", "irrelevant"}:
+            continue
+        bucket = counts.setdefault(entry_id, {"useful": 0, "irrelevant": 0})
+        bucket[kind] += 1
+    if record_id is not None:
+        return dict(counts.get(str(record_id), {"useful": 0, "irrelevant": 0}))
+    return counts
+
+
+def memory_feedback(payload: dict) -> dict:
+    """Append one recall-usefulness vote to the sidecar feedback ledger.
+
+    Additive only: existing memory.jsonl records are never rewritten; votes
+    land in sipsDir/feedback.jsonl so old ledgers stay byte-identical. The
+    demote decision itself stays with the host (memory_fitness.shouldAutoDemote
+    + the existing demote transition), which reads `counts` and `recordStatus`.
+    """
+    _root, sips_dir, memory_path = paths(payload)
+    record_id = str(payload.get("recordId") or "").strip()
+    kind = str(payload.get("kind") or "").strip().lower()
+    if not record_id:
+        raise ValueError("Memory feedback needs a non-empty recordId.")
+    if kind not in {"useful", "irrelevant"}:
+        raise ValueError(f"Unknown recall feedback kind: {kind or 'missing'}")
+    feedback_path = sips_dir / "feedback.jsonl"
+    feedback_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "schema": "hemlock.sips.feedback.v1",
+        "recordId": record_id,
+        "kind": kind,
+        "query": str(payload.get("query") or ""),
+        "at": now(),
+    }
+    with feedback_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    target = next((item for item in reversed(read_records(memory_path)) if item.get("id") == record_id), None)
+    return {
+        "schema": SCHEMA,
+        "status": "recorded",
+        "feedback": entry,
+        "recordId": record_id,
+        "counts": aggregate_feedback_counts(read_feedback(feedback_path), record_id),
+        "recordStatus": target.get("status") if target else None,
+        "feedbackPath": str(feedback_path),
+        "claimBoundary": "Feedback counts are advisory; auto-demotion stays a separate host decision using the existing demote transition.",
+    }
+
+
 def memory_transition(payload: dict) -> dict:
     _root, _sips_dir, memory_path = paths(payload)
     target_id = str(payload.get("targetId") or "").strip()
@@ -215,6 +290,8 @@ def main() -> None:
         result = record(payload)
     elif action == "memory-transition":
         result = memory_transition(payload)
+    elif action == "memory-feedback":
+        result = memory_feedback(payload)
     elif action == "recall":
         result = recall(payload)
     elif action == "selfloop":

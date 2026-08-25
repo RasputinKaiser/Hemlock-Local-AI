@@ -43,6 +43,20 @@ function mergeBudget(budget = {}) {
   return { ...DEFAULT_BUDGET, ...budget };
 }
 
+// T7-S3: pure clamp for user-granted plan budgets. Keeps only maxAgentSteps
+// and maxCommands as integers bounded to [1..24] / [1..40]; garbage drops out.
+const BUDGET_OVERRIDE_BOUNDS = Object.freeze({ maxAgentSteps: [1, 24], maxCommands: [1, 40] });
+
+function clampBudgetOverrides(overrides) {
+  const clamped = {};
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) return clamped;
+  for (const [key, [min, max]] of Object.entries(BUDGET_OVERRIDE_BOUNDS)) {
+    const parsed = Number.parseInt(overrides[key], 10);
+    if (Number.isFinite(parsed)) clamped[key] = Math.min(Math.max(parsed, min), max);
+  }
+  return clamped;
+}
+
 function normalizeExpectedEvidence(value, fallback = []) {
   if (Array.isArray(value)) return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -371,6 +385,7 @@ module.exports = {
   id,
   digest,
   mergeBudget,
+  clampBudgetOverrides,
   normalizeExpectedEvidence,
   validateAction,
   extractJsonObject,

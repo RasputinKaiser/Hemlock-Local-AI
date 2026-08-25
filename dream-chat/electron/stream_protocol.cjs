@@ -135,6 +135,22 @@ function createStreamId(prefix = "stream") {
   return `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
+// T11-A: checkpoint throttle decision as a pure predicate so the host can gate
+// full-channel serialization without stringifying the whole accumulated stream
+// just to decide whether to skip. Checkpoint proceeds when EITHER the minimum
+// interval has elapsed OR at least minDeltaBytes of raw delta have accumulated
+// since the last checkpoint (force always proceeds).
+const CHECKPOINT_MIN_INTERVAL_MS = 750;
+const CHECKPOINT_MIN_DELTA_BYTES = 2048;
+
+function shouldCheckpointStream(state, { force = false, now = Date.now(), minIntervalMs = CHECKPOINT_MIN_INTERVAL_MS, minDeltaBytes = CHECKPOINT_MIN_DELTA_BYTES } = {}) {
+  if (!state || typeof state !== "object") return false;
+  if (force) return true;
+  const intervalElapsed = Number(now) - Number(state.lastCheckpointAt || 0) >= minIntervalMs;
+  const deltaGrown = Number(state.channelBytes || 0) - Number(state.lastMarkBytes || 0) >= minDeltaBytes;
+  return intervalElapsed || deltaGrown;
+}
+
 module.exports = {
   Utf8SseParser,
   parseSsePayload,
@@ -144,5 +160,8 @@ module.exports = {
   selectStructuredActionText,
   streamStateSnapshot,
   createStreamId,
+  shouldCheckpointStream,
+  CHECKPOINT_MIN_INTERVAL_MS,
+  CHECKPOINT_MIN_DELTA_BYTES,
   digest,
 };

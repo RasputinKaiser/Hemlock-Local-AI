@@ -58,6 +58,34 @@ verification:
   strong_agent_tool_use_dream_receipt: "~/Library/Application Support/Hemlock/workspace-runtime/dream-runs/strong-agent-tool-use-smoke-20260814/training-receipt.json"
   strong_agent_tool_use_dream_metrics: "1 optimizer step; train loss 6.882; validation loss 6.502; 11.608M trainable parameters"
   strong_agent_tool_use_dream_base_digest_unchanged: true
+models:
+  launcher:
+    prod_flow: "double-click / --app now runs electron directly against dist/ with HEMLOCK_PROD_UI=1 — no Vite dev server, no concurrently (saves ~7GB RAM, no terminal window)"
+    dev_flow: "scripts/launch-hemlock.zsh --dev restores old Vite+HMR flow"
+    rebuild_ui: "cd dream-chat && npm run build (required once before prod flow; dist/ ships prebuilt)"
+  maple_2bit:
+    directory: /Users/ianzvirbulis/Models/Hemlock/maple-2bit-mlx
+    role: default local chat model ("default_model")
+  lfm25_8b_a1b:
+    repo: LiquidAI/LFM2.5-8B-A1B-MLX-4bit
+    directory: /Users/ianzvirbulis/Models/Hemlock/LFM2.5-8B-A1B-mlx-4bit
+    model_type: lfm2_moe (native mlx-lm support)
+    params: "8B total, ~1.5B active (24 layers, 32 experts, 4 active, 2 dense)"
+    dtype: 4-bit group-64 (official LiquidAI MLX quant, 4.5 GB)
+    size_gb: 4.5
+    role: selectable local model in Hemlock picker (maple lane, option "lfm25-8b")
+    picker_value: lfm25-8b
+    request_routing: main.cjs resolveLocalModelPath() maps picker value -> model dir; mlx_lm server lazy-loads per request
+    smoke_test: "server on :8099 healthy; chat completion returned reasoning channel + 'LFM2.5 is alive' (finish=stop, 139 tokens)"
+    bf16_note: "bf16 original (16.9GB) deleted - exceeded 16GB Mac GPU wired limit (GPU timeout) and filled disk"
+  lfm25_dspark_draft:
+    repo: LiquidAI/LFM2.5-8B-A1B-DSpark
+    directory: /Users/ianzvirbulis/Models/Hemlock/LFM2.5-8B-A1B-DSpark-mlx
+    model_type: dspark (custom mlx_lm/models/dspark.py wrapper; MODEL_REMAPPING lfm2_dspark->dspark)
+    params: 327.7M (matches LiquidAI blog spec exactly)
+    architecture: "DFlash-style 5-layer attention-only backbone fed by fc(10240->2048) on concat hidden states from target layers [2,6,10,14,18]; rank-256 factorized Markov head; confidence head on 2304->1"
+    verified: "loads via mlx_lm.load_model; forward + draft heads produce (B,L,128000) logits and (B,L) confidence"
+    limitation: "mlx-lm speculative_generate_step drives draft models with token ids; DSpark consumes target hidden states, so stock mlx-lm speculative decoding cannot use it. Day-one runtimes are llama.cpp + SGLang. On-device (M-series) speedup for the 8B MoE is ~18% per LiquidAI benchmarks."
   strong_agent_tool_use_dream_candidate_status: training_completed_candidate_pending
   strong_agent_candidate_inference_probe: blocked
   strong_agent_candidate_inference_reason: "The trained adapter server was healthy, but the structured-action probes did not yield a valid hemlock.agent.action.v1 envelope: the first spent its completion on reasoning/prose and hit the token limit; a no-thinking retry returned an invented list_directory action. No candidate quality or activation claim made."
@@ -782,3 +810,270 @@ chat_fullscreen_visual_polish_2026_08_16:
     diff_check: passed
     design_qa: "design-qa.md result passed"
   claim_boundary: "This is a renderer/layout polish pass validated against the supplied screenshot and a live Electron capture. It does not claim a new Maple inference or artifact-quality result."
+
+electron_host_ux_lane_b_2026_08_21:
+  status: implemented_verified
+  plan: docs/plans/2026-08-21-os-feel-ux-pass.md
+  channels:
+    dialog_confirm: "dialog.showMessageBox wrapper; tone-mapped danger/default buttons; returns boolean via mapConfirmChoice; empty message rejects honestly."
+    notification_show: "Main-process Notification with whitespace-collapsed, length-clamped title (80) / body (240); darwin subtitle stamps app name; structured {shown,error} on failure."
+    windows_list: "hemlock.window.list.v1 read-only pull of renderer-owned hemlock-os-windows-v2 localStorage snapshot; closed windows excluded, rows sorted by zOrder; honest unavailable payload when no renderer."
+    preload: "mapleDesktop/hemlockAgent expose confirmDialog, notify, and windowsList."
+  tests:
+    host_ux_ipc: "dream-chat/electron/host_ux_ipc.test.cjs: 11 passed"
+    electron_suite: "node --test dream-chat/electron/*.test.cjs: 95 passed"
+    renderer_tests: "windowManager + styles tests: 16 passed"
+    vite_build: "passed (dist rebuilt for HEMLOCK_PROD_UI flow)"
+  claim_boundary: "IPC handlers and preload surfaces are verified against mocked Electron. No live desktop relaunch or real macOS notification delivery was exercised in this pass; consumers of notify() remain future work per plan."
+
+tranche5_improvements_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_120000-hemlockos-tranche5-improvements.md
+  changes:
+    maple_response_notifications:
+      what: "Long Maple/provider chat completions (>30s, unfocused window) announce via workNotifier; structured-action never notifies; cancelled streams never announce or linger."
+      files: "electron/main.cjs (hooks at runInference + runCliInference boundaries), work_notifications.cjs (trackChatResponseJob adapter), maple_notify.test.cjs (8 tests)"
+      leak_guard: "Jobs settle (finish/cancel) BEFORE risky post-terminal work; Maple success-path receipt write is guarded with an event receipt on failure; cancel-after-finish is a no-op."
+    evidence_ledger_grouping:
+      what: "Chat evidence rail rows grouped by event-type prefix with counts + newest time (pure groupEvidence helper in src/evidenceLedger.js, 3 tests); stale thread.search comment corrected."
+    launcher_stale_reap:
+      what: "reap_stale_mlx_lm(port) kills non-child mlx_lm listeners on 8080 pre-Electron, warns on non-mlx_lm squatters, waits only after a kill; double-launch protected by PID-lock early return."
+    copy_provenance:
+      what: "Option-click copy on assistant messages includes [PROVIDER · time · thread] header + rawOutputRef via pure withProvenance helper (src/copyProvenance.js, 4 tests); plain click byte-identical."
+    primer_command_center:
+      what: "PrimerCard second mount at top of Command Center .workbench-main; shared dismissal state; no CSS/layout change."
+    reopen_tips:
+      what: "Settings 'Reopen getting-started tips' clears only the dismissed flag (clearPrimerDismissal), focuses Chat or falls back to Command Center."
+    glossary_tooltips:
+      what: "GlossaryHint component (7 usages, 5 terms): native title= hover kept; keyboard-focus and tap popovers with paper/sage/gold styling; Escape hides element-level without touching overlay ordering."
+      fixes_after_review: "Click-after-focus no longer toggle-closes the popover (openedByFocus ref consumed by click); .glossary-hint position:relative so the popover anchors to the hint instead of .os-window (was clipped invisible). Both fixes empirically verified via CDP trusted input in real Chromium."
+    narrator_consolidation:
+      what: "Command Center copy-only dedup: ribbon NOW cell shows phase only, loop OBSERVATION cell points to Evidence card, work-note idle copy shortened, filler detail removed. No layout change."
+    audit_viewport_convention:
+      what: "docs/plans/2026-08-22-audit-viewport-convention.md pins detector audits at 1240x820 for comparable counts."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 121 passed (113 baseline + 8 maple_notify)"
+    renderer_suite: "node --test src/*.test.js: 26 passed (16 baseline + 3 evidenceLedger + 4 copyProvenance + 3 windowManager/styles additions)"
+    vite_build: "passed"
+    syntax: "main.cjs node --check passed; launcher zsh -n passed; main.jsx esbuild passed"
+    reviews: "Every task passed independent spec+quality review except 3.1, which failed first review (2 empirically reproduced defects) and passed after direct fixes; 1.1 leak-path finding from quality review fixed with regression test."
+  incident_note: "One fix subagent timed out after reverting uncommitted main.cjs hooks (git restore); hooks were re-applied directly by the orchestrator with the leak guard included. No other work was lost."
+  claim_boundary: "All verification is host-side and deterministic (unit suites, builds, CDP DOM probes). Live Maple notification delivery, real macOS notification rendering, and a live desktop relaunch were not exercised in this pass."
+
+tranche6_grounded_harness_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_190000-tranche6-grounded-harness.md
+  headline: "The Memory Garden now feeds the model: promoted lessons reach inference prompts with receipts and an off-switch."
+  changes:
+    grounded_memory_injection:
+      what: "buildGroundedContext (electron/prompt_context.cjs) renders active-status SIPS records as a labeled system block [Hemlock memory · N records · verify-before-use], capped 1200 chars; injected into BOTH maple and CLI conversation inference via injectGroundedContext; context.injected event once per inference; structured-action path never injected; grounding chip in Chat status bar shows count and opens the popover/Memory Garden."
+    thread_digest:
+      what: "applyDigestCompaction/buildDigest/insertDigestBlock (electron/thread_digest.cjs): dropped middle history is summarized as metadata-derived digest lines (≤12, first sentences) re-entering the prompt inside the SAME char budget; thread.digest.created event once per inference (inside the provider lease)."
+      compaction_bug_fix: "Pre-existing bug fixed in compactInferenceMessages: a trailing assistant reply after the latest user message was silently dropped even with huge budget; now kept with its chars budgeted. Regression test added to maple_runtime.test.cjs."
+    context_meter:
+      what: "telemetry.contextChars on both inference paths; composer model line gains .context-meter (used/budget % of 24k, gold at ≥80%), pure contextMeter helper."
+    post_apply_verification_card:
+      what: "Conversational code.apply success auto-runs the matched allowlisted verification profile once (runPostApplyVerification), pins hemlock.agent.verification.v1 on the task with honest skipped status when no profile matches; Chat renders a VERIFICATION card (passed sage / failed gold / skipped); code-repair autopilot actions excluded."
+    completion_footnote:
+      what: "Renderer-only host-labeled note pushed on completion after apply: 'Host receipt · change set applied · verification passed/failed'; dedupe keyed task+changeSet+ranAt."
+    memory_fitness_loop:
+      what: "memory_fitness.cjs (scoreRecord/rankForRecall/shouldAutoDemote/applyFeedback, 15 tests); sips_runtime.py additive sidecar feedback.jsonl + read_feedback/aggregate_feedback_counts/memory-feedback action; allowlisted memory.feedback command appends votes and auto-demotes via the EXISTING demote transition when irrelevant≥3∧>useful; grounding chip popover offers useful/not-relevant per injected record."
+    comparison_lane:
+      what: "comparison.run host command re-sends the thread's last user prompt verbatim to one alternate lane (read-only conversation inference, provider lease respected, one-in-flight guard reset in finally, pre-comparison task state restored on success AND failure); renderer lane picker popover + two-column verbatim compare view stacking under 800px."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 172 passed (153 post-T5 baseline + prompt_context, thread_digest, verification_card, memory_feedback, comparison_lane, maple_runtime regression)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed; py_compile sips_runtime.py passed"
+    package_json: "verification_card.test.cjs added to test:agent script so CI cannot skip it"
+    reviews: "Every task passed independent spec+quality review. Reviewers caught and parent fixed: missing thread_digest wiring, M1b dead wiring (memory.feedback never called runSipsRuntime — one-line fix), P1 blocked-state leak on failed maple comparisons (restore moved to catch)."
+  known_minor_debt:
+    - "inference.respond bypasses the intent path so it injects whatever agentTask.recall last held (stale-recall asymmetry, pre-existing pattern)"
+    - "Maple vs CLI comparison lanes differ: maple gets grounded-context injection + digests, CLI does not — not apples-to-apples"
+    - "task.comparison persists across turns without pinning the compared prompt text, so 'same prompt' can drift from the current column"
+  claim_boundary: "All verification is deterministic host-side (unit suites, builds, syntax checks). Live cross-lane comparison runs, real recall injection against a populated Garden, and a live relaunch smoke were not exercised in this pass."
+
+tranche7_seamless_loop_2026_08_22:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-22_210000-tranche7-seamless-loop.md
+  headline: "The ask_user loop closes in place: Maple asks, you answer in Chat, the resumed loop streams visibly."
+  changes:
+    answer_in_place:
+      what: "task_answer.cjs (assertAnswerable gate) + allowlisted task.answer command: validates waiting_for_user state, appends the answer to thread history via the same persistence as sendMessage, pins/clears task.question durably on the projection, then resumeTask continues the bounded loop. Renderer: MAPLE ASKS question card with inline answer box above the plan dock; StatusLamp reads ASKS YOU."
+      streaming: "Live Model Stream panel now covers agent_action streams too (was model_text only) — resumed structured-action inference after an answer streams visibly instead of running silently (user requirement)."
+    grantable_budgets:
+      what: "clampBudgetOverrides (pure, steps 1-24, commands 1-40); plan.approve clamps + merges overrides into task.budget before approval so proposeNextAction enforcement honors grants; renderer stepper on the awaiting-approval card (defaults 8/12, overrides only when non-default) + live steps/commands usage line while running."
+    debt_cleanup:
+      what: "Comparison records pin promptText with a renderer PROMPT PINNED header + prompt-since-superseded hint; context symmetry achieved by wrapping ONLY the bare CLI lane with injectGroundedContext (maple injects internally; no double-injection, verified by call graph) with honest contextApplied flag; stale-recall guard: injectGroundedContext accepts refreshQuery used only at the inference.respond call site."
+    live_eval_lane:
+      what: "electron/tool_use_live.cjs (dual module/CLI): runs the 11-fixture tool-use benchmark against live Maple with shared wall-clock budget and skip-remaining-on-timeout; scores response quality only (respondedRate, validEnvelopeRate against fixture-derived allowlists); receipts to Application Support e2e/tool-use-live/; npm script eval:tool-use-live; explicit claimBoundary that task completion is never claimed. Injectable inferenceFn keeps tests offline."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 190 passed (172 post-T6 + task_answer, clampBudgetOverrides, comparison prompt-pin, tool_use_live)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed"
+    reviews: "Batched review: S3 APPROVED, S4 APPROVED, S1 PASS pending one CSS fix (question-card row-shift lost the cascade to the later grid block — fixed with .is-asking scoped overrides) plus one S2 test-string mismatch (fixed). Reviewer also verified no maple double-injection and correct guard scoping."
+  known_minor_debt:
+    - "Inline ask_user model actions pin action.shortRationale as the question prompt (approximation, matches prior fallback)"
+    - "Budget overrides apply before plan-status validation, so an explicit approve on a running task could mutate budget mid-run (allowlisted explicit, low risk)"
+    - "Live eval lane not yet run against a live Maple server (receipt path verified by unit tests only)"
+  claim_boundary: "All verification is deterministic host-side. The ask_user loop, budget grants, and comparison fixes are unit-verified; a live end-to-end ask-answer-resume session and a live tool-use eval run against Maple were not exercised in this pass."
+
+tranche7_5_chat_reliability_2026_08_23:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-23_tranche75-chat-reliability.md
+  trigger: "Real incident 2026-08-23: MLX Metal GPU-timeout (kIOGPUCommandBufferCallbackErrorTimeout) SIGABRT'd the maple server mid-stream 7 times; undici surfaced bare 'TypeError: terminated' which was not classified as a transport error, so the bounded auto-retry never fired."
+  changes:
+    transport_classification:
+      what: "isMapleTransportError recognizes 'terminated'/premature-close (undici's error when the SSE server dies mid-stream) — the bounded restart+retry now fires on server-death kills. Committed separately as 76756e7 with honest empty-reply renderer copy distinguishing dropped-connection from token-limit."
+    crash_loop_policy:
+      what: "crash_policy.cjs (pure): recordCrash appends+prunes a rolling window; shouldRespawn blocks at ≥3 crashes in 10min (fails open on garbage). main.cjs: stopServer stamps child.mapleStopRequested so our own stops are not crashes; unexpected deaths (SIGABRT/SIGKILL) record + consult the policy — over budget skips respawn, sets serverState crashLooped/crashLoopReason, emits maple.crashloop.detected. maple.launch resets the loop. Recovery is lazy (next inference), so the gate sits at restartMapleRuntime entry."
+    visible_recovery:
+      what: "Transport retry emits maple.recovery (degraded) receipt; conciseAgentNote renders 'Connection to {provider} dropped; the runtime restarted and your prompt is being re-run (attempt N)' in HOST ACTIVITY."
+    rerun_on_dead_reply:
+      what: "Dead replies (streamDied) render honest copy + a Re-run-this-prompt button reusing retryLastMessage (same helper as per-message retry); token-limit branch unchanged."
+    ipc_clone_errors_cleared:
+      what: "All 6 'object could not be cloned' errors in launch.log date to Aug 15 (before the stability-pass fix); zero occurrences since. Historical — no live bug."
+    mlx_upgrade_0321:
+      what: "Root cause of the GPU-timeout SIGABRTs identified upstream: mlx <0.32.0 threw Metal CommandBuffer errors from the completion handler (uncatchable → abort). PR #3523 (in 0.32.0) defers them to safe checkpoints so the server can catch and continue. Upgraded the Hemlock runtime mlx 0.31.2 → 0.32.1; 8 consecutive generations with zero aborts (previously crashing every few requests). setup.py documents the recommendation."
+  verification:
+    electron_suite: "node --test electron/*.test.cjs: 200 passed (190 + 10 crash_policy incl. source wiring guards)"
+    renderer_suite: "node --test src/*.test.js: 26 passed"
+    build_and_syntax: "vite build passed; node --check main.cjs passed; esbuild main.jsx passed"
+    reviews: "Batched review APPROVED. Reviewer verified: stopServer SIGKILL-fallback classifies as our-stop (no false crash), crashLooped reaches renderer via getAgentState server snapshot, maple.launch reset path correct, R2 fires once per retry, R3 reuses retryLastMessage with no duplicated send logic."
+  known_exemption:
+    - "recoverBaseServer (dream-run failure recovery) and ensureBaseInference (SIPS baseline) call stopServer+startServer directly, bypassing the shouldRespawn gate — INTENTIONAL: both are user-initiated training flows, not auto-retry loops; thrash risk accepted and documented."
+  claim_boundary: "All verification is deterministic host-side (unit suites, builds, log analysis). The crash-loop gate, visible recovery note, and re-run button were not exercised against a live mid-generation server kill in this pass; the GPU-timeout itself is upstream mlx/Metal."
+
+tranche8_stability_speed_2026_08_23:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-23_tranche8-stability-speed.md
+  changes:
+    cache_telemetry_sizing:
+      what: "NEW prompt_cache_stats.cjs (pure hitRatio helper, 6 tests); all three inference telemetry blocks emit cachedTokens + cacheHitRatio from usage.prompt_tokens_details.cached_tokens; Host telemetry shows 'cache N%'; prompt cache defaults raised to size 12 / 768MB after live verification (768M accepted; repeat request measured 94% hit). Env clamp ceiling fixed 10→16 so operators aren't clamped below the default."
+    dead_flag_cleanup:
+      what: "Removed --ngram-draft/--ngram-depth and their env consts — architecturally incompatible with Maple (SWA-512 RotatingKVCache defeats the ngram verifier's cache rewind; mlx_lm/speculative.py fallback). FlashHead remains the decode lever. Launcher audit read-only."
+    first_token_stall_watchdog:
+      what: "NEW stream_watchdog.cjs (pure, 4 tests); Maple SSE path arms a 45s no-first-byte timer per attempt — abort with MAPLE_FIRST_TOKEN_STALL routes into the bounded transport retry instead of hanging the full 10-minute inference timeout. Timer disarms on first byte and in finally."
+    metal_error_surface:
+      what: "With mlx 0.32.1 Metal errors arrive as HTTP 500 (server survives). isMapleTransportError now classifies 500s whose body names Metal/CommandBuffer/GPU as transient → bounded retry. Renderer empty-reply tiers rewired to reachable data (streamStatus + streamStopReason captured from terminal stream frames — reviewer found the previous streamDied/errorCode flags were never populated, dead since T7.5); three honest copies: GPU error / connection dropped / token-limit."
+  review:
+    verdict: "S1 APPROVED (clamp gap fixed), S2 APPROVED, S3 APPROVED, S4 gaps fixed by parent after review (streamStopReason wiring + clamp ceiling)."
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
+  claim_boundary: "Deterministic host-side verification only. The stall watchdog was not exercised against a live SIGSTOP'd server; cache-hit rendering not yet seen live in Chat (needs app relaunch)."
+
+fix_partial_output_and_fresh_context_2026_08_24:
+  status: implemented_verified
+  trigger: "User incident: a short-story request streamed 17,632 chars over ~90s (verified in model-output receipt model_text-1787545277637) but the stream was cut before finish_reason; Hemlock's cancel path discarded everything — no assistant message persisted. Separately, five explicit-story refusals stayed in thread history and Maple's reasoning channel re-litigated them every turn ('the user is testing boundaries again'), poisoning all later prompts."
+  changes:
+    keep_partial_output:
+      what: "Cancelled/interrupted inference now persists streamed content as an assistant message with partial:true + stopReason in the thread (thread_manager.appendConversation carries the fields); renderer shows 'Interrupted — reply kept up to the cut' with gold border and preserves partial/stopReason across history loads."
+    fresh_context:
+      what: "NEW conversation.reset host command + threadManager.resetConversation (archives conversation to <file>.<ts>-archive.jsonl, clears it, keeps thread identity/checkpoints/receipts). Allowlisted as explicit-approval; palette action 'Fresh context'; renderer clears messages and shows an archived-count host footnote."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok, thread_manager suite 5/5"
+    live_evidence: "Incident diagnosed from durable receipts: raw SSE payload had 4217 chunks / zero finish_reason; thread jsonl confirmed poisoned-history reasoning verbatim."
+  claim_boundary: "Partial-output persistence and reset verified deterministically (suites/build); neither exercised live end-to-end in a running app yet."
+
+fix_toks_artifactid_layout_2026_08_24:
+  status: implemented_verified
+  trigger: "User reports: (1) tok/s renders '—' in Host telemetry; (2) artifact build blocked with 'Stop reason: deterministic-input: Invalid artifact artifact ID.'; (3) plan card crowds/overlaps the composer in Build mode."
+  changes:
+    toks_per_second:
+      what: "Root cause: mlx_lm only emits a usage chunk when stream_options.include_usage is set — receipts showed 660 chunks, zero carrying usage, so completionTokens was always null. Added stream_options:{include_usage:true} to both Maple SSE requests; added honest fallback estimating completionTokens from streamed content+reasoning chars (÷4) flagged completionTokensApproximate; renderer prefixes '~' when approximate."
+    artifact_id_sanitization:
+      what: "Root cause: the model parrots plan-step refs ('artifact://manifest') as input.artifactId; orchestrator only filled the id when falsy, so garbage ids reached safeSegment and threw. executeCommandInput now deletes any artifactId failing ^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ so the existing prior-artifact fallback fills the task's real id."
+    work_rail_layout:
+      what: "Plan card in the work rail had flex 0 0 auto + 42vh max-height inside an overflow:hidden rail — tall plans squeezed/overlapped the composer. Rail now scrolls vertically (overflow-y auto); plan card is flex 0 1 auto capped at 34vh/340px so it shrinks instead of pushing the composer out."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok"
+  claim_boundary: "Deterministic verification only; tok/s and layout fixes need a live chat session to confirm visually."
+
+fix_remove_escalation_2026_08_24:
+  status: implemented_verified
+  trigger: "User directive: Maple-Preview failed and Hemlock suggested escalating to Codex/Claude — remove the escalation mechanism entirely; HemlockOS runs only the selected model lane."
+  changes:
+    escalation_removed:
+      what: "Removed both provider-escalation suggestion sites (orchestrator blockTask + recordCliInferenceFailure), the renderer auto-switch on suggestion.accept, the task.escalate-provider command, and its allowlist entry. A Maple failure now surfaces solely as an honest blocked task with its reason."
+  verification:
+    gates: "electron 210/210, renderer 26/26, vite build ok, node --check ok, esbuild ok; zero 'escalate' references outside policy comments"
+  claim_boundary: "Deterministic verification only."
+
+tranche9_hardening_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche9-hardening.md
+  changes:
+    readiness_hardening:
+      what: "NEW readiness_probe.cjs (backoff min(2000,250*2^attempt), deadline reason, classifyHealthFailure); readiness deadline errors now name the last failure classification; child-exit during readiness fails fast with signal; model path validated BEFORE spawn (config.json + safetensors required) — kills the LFM2.5 404 class."
+    error_taxonomy:
+      what: "NEW error_taxonomy.cjs classifyInferenceError → {kind, retryable, userMessage} across 7 kinds (transport-death/stall/gpu-server-error/cancelled-by-user/model-invalid/server-not-ready/unknown); isMapleTransportError delegates to it with identical verdicts (maple_runtime tests unmodified-green). agent:cancel handler returns a plain-data snapshot if structured-clone fails."
+    artifact_flow_tests:
+      what: "NEW artifact_flow.test.cjs (6 tests): garbage artifactId stripping ×5 incl. numeric 42, author-without-create host scaffold, bounded repair loop with blocked-then-passed inspect sequence, clamp unit. EXPOSED GAP found and fixed: numeric artifactIds passed the sanitizer via String() coercion — sanitizer now rejects non-strings."
+    renderer_hygiene:
+      what: "TERMINAL_STREAM_STATUSES includes 'restarting' so restarting streams don't leave stale LIVE panels; re-run buttons disabled while thinking; error banner auto-dismisses after 12s (manual dismiss clears timer); .partial-note/.chat-error flex fixes."
+    stop_button:
+      what: "Composer Stop button appears only while streaming (isThinking or live model_text stream); calls agent:stream-cancel (stream-scoped, preserves the task) with agent:cancel fallback; wired to pre-existing dead plumbing from b165526; cancelled stream flows into partial-persist; draft preserved; gold-styled, cancelBusy-guarded."
+  review:
+    note: "Batched reviewer timed out mid-review (17 calls, no findings written); parent performed direct verification of highest-risk items instead: stream-cancel handler (no duplicate registration, aborts non-terminal model_text, T8-F1 compatible), preload bridge both paths, H1 validation placement before spawn, H5 renderer guard logic. Skipped-test follow-up: numeric-ID gap found by H3's skipped test was fixed in product code and the test unskipped."
+  verification:
+    gates: "electron 236/236 (0 skipped), renderer 26/26, vite build ok, node --check main/orchestrator/maple_runtime ok, esbuild ok"
+  claim_boundary: "Deterministic verification only. Stop button and readiness diagnostics not yet exercised against a live wedged server."
+
+
+tranche10_chat_build_stability_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche10-chat-build-stability-ux.md
+  commit: e707da7
+  changes:
+    coalesced_stream_updates:
+      what: "createFrameCoalescer (streamStore.js) buffers stream frames, drains on rAF or 50ms cap (background-tab stall fix), terminal frames drain synchronously; main.jsx subscriber pushes frames through the identical reducer at flush — ordering/dedupe/verbatim semantics unchanged; shared createScheduler fixes prior rAF leak on dispose."
+    composer_untrap_guards:
+      what: "startDream pre-flight updateTask failure no longer strands isDreaming=true; browser-path sendMessage pre-flight failure clears isThinking + timer and emits prompt.failed. Both previously left the composer permanently disabled."
+    plan_approval_guards:
+      what: "approvePlan(taskId, planId, budgetOverrides) rejects non-waiting_for_approval task states with an honest blocked result (no mutation); clamps overrides via existing pure clampBudgetOverrides inside the orchestrator so direct callers are safe too."
+    queue_duplicate_rejection:
+      what: "agent_queue enqueue rejects an identical pending objective (status duplicate, points at existing entry); active-task steering unaffected; FIFO order untouched."
+  verification:
+    gates: "electron 241/241 (236 baseline + 5 new), renderer 30/30 (26 baseline + 4 new), vite build ok, node --check ok, esbuild ok"
+    integration: "Both lanes' diffs reviewed by parent before single tranche commit; renderer gates re-run independently after host changes."
+  claim_boundary: "Deterministic verification only. Coalescing latency improvement and untrap guards not yet exercised in a live streaming session; duplicate rejection semantics not yet exercised live. Deferred follow-ups: host stream/projection perf audit (per-frame stringify, unbounded arrays, listener leaks), error-taxonomy gap sweep for uncovered user-visible errors."
+
+tranche11_chat_build_polish_2026_08_24:
+  status: implemented_verified
+  plan: .hermes/plans/2026-08-24_tranche11-chat-build-polish-hardening.md
+  commit: 125d36b
+  base: e707da7 (first tranche under delegation.child_timeout_seconds=1800 — both lanes landed in one run, no re-dispatch)
+  changes:
+    host_stream_perf:
+      what: "checkpointStream JSON.stringify'd the full channel map on EVERY SSE chunk before the throttle check (O(total-output²) per stream); replaced with pure shouldCheckpointStream predicate + incremental stream.channelBytes accounting; serialization now happens once on actual checkpoints. streamRing leaked up to 240 retained frames per finished stream (write-only, never read) — deleted in finishStream. agentEventIds dedup Set grew forever while agentEvents capped at 160 — bounded to a 4096 insertion-order window."
+    error_taxonomy_gaps:
+      what: "New kinds: endpoint-not-found (HTTP 404, non-retryable), server-error (non-GPU 5xx, retryable), action-envelope-invalid (INVALID/EMPTY_ACTION_OUTPUT, non-retryable — repair loop already exhausted), transport-death extended to EHOSTUNREACH/ENETUNREACH/EAI_AGAIN/getaddrinfo. Retry behavior unchanged (maple_runtime keeps its narrow kind set)."
+    renderer_memoization:
+      what: "TranscriptMessageRow = memo() at module scope with primitive-only props + ref-backed stable onRetry; coalesced flushes re-render only the advancing row. channelProviderName hoisted; reasoning toggle became a prop."
+    streaming_prose:
+      what: "Fixed real bug: empty bubble mid-stream flashed terminal 'finished without text' copy — now shows 'Waiting for first output…' with caret. 72ch measure + text-wrap pretty on streamed content; caret softened to opacity pulse with prefers-reduced-motion fallback; gold LIVE dot on open reasoning channels."
+    contrast_fixes:
+      what: "Reasoning body #7d7460 was 4.32:1 over tinted bg → #6b6350 (5.56:1). Skipped verification card opacity:.82 dimmed kicker to 4.09:1 → explicit muted colors (#5f7161 5.13:1) with regression test banning opacity. Failed tone #956d23 passes at 4.60:1 (thin headroom, left as-is). Plan-card hierarchy reordered objective → steps → usage counters → stepper/actions; budget usage 10px DM Mono tabular."
+  investigated_no_change:
+    - "stream_dispatcher coalescer clean; SSE parser buffers correctly"
+    - "agent_kernel event spine already bounded everywhere (ops -80, plans -40, actions/observations/candidates -120, episodes -40)"
+    - "no listener leaks — all .on() attach to short-lived children or app-level once-handlers"
+    - "repo.inspect caching skipped: dispatch lives in main.cjs command layer, no small call-site change exists"
+  verification:
+    gates: "electron 249/249 (+8), renderer 33/33 (+3), vite build ok, node --check ok, esbuild ok; all re-run by parent after lane integration"
+  claim_boundary: "Deterministic/static verification only (contrast math, source tests, builds). Memo skip behavior and O(n²) fix not yet observed against a live Maple stream; live relaunch smoke still outstanding from T10."
+
+tranche12_build_loop_hotfix_2026_08_24:
+  status: implemented_verified
+  trigger: "User-reported live incident: Build mode looped re-proposing completed commands, plan card covered chat, streamed output rendered ABOVE sent messages, no artifact ever reached the viewer."
+  root_causes:
+    plan_mutation_loop: "adaptPlanForCommand INSERTED a new plan step on every adaptive selection of an already-completed command — the plan grew [repo-map, repo-map, ...] each round, pushing artifact.author permanently out of reach (projection.jsonl: repo-map x24, create/author x20 all-time, zero previewable artifacts)."
+    author_failures: "artifact.author failed on empty input / sha256-as-id because executeCommand never injected taskId (registry resolved under wrong task) and missing-artifact threw before any fallback."
+    ui_ordering: "chat-live-stream panel rendered BEFORE messages.map in chat-surface; plan card shared grid cell with chat-work-rail (layered on top)."
+  changes:
+    anti_repeat_guard: "completedTaskCommands + resolveProgressCommand pure helpers; proposeNextAction redirects a repeat proposal to the plan's next incomplete step deterministically, emits action.redirected host note; adaptPlanForCommand refuses to insert duplicates of completed commands while open planned work remains."
+    author_bulletproofing: "ensure-create-if-missing before authoring; registry throws retry once through host scaffold fallback; taskId injected at executeCommand call site; next-action prompt now states 'Completed already (do NOT repeat): …' and 'Plan progress: step N of M'."
+    renderer_ordering: "live-stream panel moved below transcript with border-top separator; plan card moved to its own grid row in column 1 under the transcript (row 5), work rail untouched in column 2; message-order invariant verified (append-only, streamId-keyed)."
+    test_contract_fixes: "mock executeCommands mirror production artifactCommandReceipt shape (artifactId field); assertions updated to assert executed behavior rather than raw preserved proposal inputs."
+  verification:
+    gates: "electron 257/257 (+8 net), renderer 34/34 (+1), vite build ok, node --check ok, esbuild ok; debug probes stripped post-debug"
+    commit: e1fbefe
+  claim_boundary: "Deterministic verification only until live smoke completes; loop fix exercised via regression test replaying the incident pattern (repeat proposals redirected once, plan stable at 2 steps), not yet against live Maple."

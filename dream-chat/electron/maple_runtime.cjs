@@ -1,4 +1,5 @@
 const MAPLE_LAUNCH_SCHEMA = "hemlock.maple.launch.v1";
+const { classifyInferenceError } = require("./error_taxonomy.cjs");
 
 const DEFAULT_CONVERSATION_MESSAGE_LIMIT = 16;
 const DEFAULT_CONVERSATION_CHAR_LIMIT = 24000;
@@ -42,7 +43,11 @@ function compactInferenceMessages(messages, {
   // If the latest user request itself is larger than the budget, preserve its
   // complete text. Build/artifact requests are user intent, not disposable
   // history; the separate authoring contract owns source-size validation.
-  let remaining = Math.max(0, maxChars - (firstSystem?.content.length || 0) - latestUser.content.length);
+  // Messages AFTER the latest user (a trailing assistant reply) belong to that
+  // exchange and are kept with it — dropping them would orphan the answer to
+  // the question the prompt still contains.
+  const trailingAfterLatestUser = selected.slice(latestUserIndex + 1);
+  let remaining = Math.max(0, maxChars - (firstSystem?.content.length || 0) - latestUser.content.length - trailingAfterLatestUser.reduce((sum, message) => sum + message.content.length, 0));
   const history = [];
   for (const message of selected.slice(0, latestUserIndex).reverse()) {
     if (message.role === "system") continue;
@@ -54,14 +59,17 @@ function compactInferenceMessages(messages, {
       remaining = 0;
     }
   }
-  return [...(firstSystem ? [firstSystem] : []), ...history, latestUser];
+  return [...(firstSystem ? [firstSystem] : []), ...history, latestUser, ...trailingAfterLatestUser];
 }
 
+// T9-H2: delegates to the shared taxonomy. Same verdicts as the old inline
+// ladder — transport-death, stall, and gpu-server-error are the retryable
+// inference-failure classes; everything else (HTTP 400, cancellation,
+// invalid checkpoint) is not.
+const RETRYABLE_TRANSPORT_KINDS = new Set(["transport-death", "stall", "gpu-server-error"]);
+
 function isMapleTransportError(error) {
-  const code = String(error?.code || error?.cause?.code || "");
-  const message = String(error?.message || error?.cause?.message || error || "");
-  return ["ECONNREFUSED", "UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(code)
-    || /fetch failed|socket|connection refused|other side closed|network/i.test(message);
+  return RETRYABLE_TRANSPORT_KINDS.has(classifyInferenceError(error).kind);
 }
 
 function createMapleLaunchResult({ server = {}, startedAt = null, error = null } = {}) {
@@ -86,6 +94,7 @@ module.exports = {
   DEFAULT_CONVERSATION_MESSAGE_LIMIT,
   DEFAULT_CONVERSATION_CHAR_LIMIT,
   compactInferenceMessages,
+  normalizeInferenceMessage,
   isMapleTransportError,
   createMapleLaunchResult,
 };

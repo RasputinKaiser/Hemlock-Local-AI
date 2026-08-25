@@ -87,10 +87,61 @@ test("Chat keeps live model output visible and does not call stale evidence pass
   assert.match(mainSource, /chatPinnedRef\.current/);
 });
 
+test("Hotfix: live stream renders below the transcript and the plan card owns its own grid slot", () => {
+  // Reading-order invariant: streamed output follows sent messages, never precedes them.
+  const streamAt = mainSource.indexOf('{liveStreams.length > 0 && <section className="chat-live-stream"');
+  const transcriptAt = mainSource.indexOf("{messages.map((message, messageIndex) =>");
+  const jumpAt = mainSource.indexOf('className="chat-jump-latest"');
+  assert.ok(streamAt > -1 && transcriptAt > -1 && jumpAt > -1);
+  assert.ok(streamAt > transcriptAt && streamAt < jumpAt, "live stream must sit between messages.map and the jump-to-latest/thinking block");
+  assert.match(mainSource, /aria-label="Live model stream" aria-live="polite"/);
+  // Plan card occupies grid row 5 in column 1 (below the transcript) — it must
+  // never share column 2 rows 3-8 with .chat-work-rail again.
+  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*5;/s);
+  assert.doesNotMatch(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*2;/s);
+  // flushStreamedMessages only appends new streams at the end of the transcript.
+  assert.match(mainSource, /return \[\.\.\.current, \{ id: crypto\.randomUUID\(\), role: "assistant"/);
+});
+
 test("Displayed workspace paths redact the macOS home-directory identity", () => {
   assert.match(mainSource, /function redactUserPaths\(value\)/);
   assert.match(mainSource, /replace\(\/.*Users/);
   assert.match(mainSource, /redactUserPaths\(value\)/);
   assert.match(mainSource, /displayText\(message\.rawOutputRef\)/);
-  assert.match(mainSource, /the path stays local and is not shown in Hemlock UI/);
+  // New-thread flow now uses the native directory picker; the privacy promise
+  // moved into the picker dialog title in electron/main.cjs.
+  assert.doesNotMatch(mainSource, /window\.prompt\(/);
+});
+
+test("T11-B transcript rows are memoized so stream flushes skip unchanged messages", () => {
+  assert.match(mainSource, /const TranscriptMessageRow = memo\(function TranscriptMessageRow\(/);
+  assert.match(mainSource, /<TranscriptMessageRow key=\{message\.id\}/);
+  assert.match(mainSource, /reasoningOff=\{modelSelection\.reasoning === "off"\}/);
+  // Stable retry identity keeps memo props shallow-equal across parent renders.
+  assert.match(mainSource, /const stableRetryLast = useCallback\(\(target\) => stableRetryRef\.current\(target\), \[\]\)/);
+});
+
+test("T11-B streaming prose reads like a living document with an honest waiting state", () => {
+  // Comfortable measure + pretty wrapping for streamed assistant prose.
+  assert.match(styles, /\.maple-channel-content \.message-content\s*\{[^}]*max-width:\s*72ch;[^}]*text-wrap:\s*pretty;/s);
+  // Growing-edge caret pulses (reduced-motion safe) and disappears on terminal frames.
+  assert.match(styles, /@keyframes caretPulse/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\)\s*\{ \.stream-caret \{ animation: none;/s);
+  // Empty streaming bubble shows a waiting note, never the terminal "no text" copy.
+  assert.match(mainSource, /maple-channel-waiting/);
+  assert.match(styles, /\.maple-channel-waiting p\s*\{/);
+  // Reasoning channel stays visually distinct while live.
+  assert.match(styles, /\.maple-channel-reasoning\[open\] summary::before/);
+  assert.match(styles, /\.maple-channel-reasoning pre\s*\{[^}]*color:\s*#6b6350;/s);
+});
+
+test("T11-B verification status colors and budget counters hold the contrast floor", () => {
+  // Skipped cards use explicit muted colors instead of an opacity dim that
+  // composited below 4.5:1 over paper.
+  assert.doesNotMatch(styles, /\.chat-verification-card\.is-skipped\s*\{[^}]*opacity/s);
+  assert.match(styles, /\.chat-verification-card\.is-skipped \.card-kicker > span\s*\{\s*color:\s*#5f7161;\s*\}/);
+  assert.match(styles, /\.chat-verification-card\.is-skipped strong\s*\{\s*color:\s*#556958;\s*\}/);
+  // Live steps/commands counters and grant stepper values stay legible.
+  assert.match(styles, /\.budget-usage\s*\{[^}]*font:\s*600 10px "DM Mono", monospace;/s);
+  assert.match(styles, /\.budget-stepper strong\s*\{[^}]*color:\s*#5d4a1e;/s);
 });

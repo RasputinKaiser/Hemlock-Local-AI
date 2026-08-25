@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Notification, ipcMain, shell, dialog } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -8,15 +8,22 @@ const { ContextBroker } = require("./context_broker.cjs");
 const { AgentKernel } = require("./agent_kernel.cjs");
 const { AgentOrchestrator } = require("./agent_orchestrator.cjs");
 const { AgentIntentQueue, isActiveTask } = require("./agent_queue.cjs");
-const { DEFAULT_BUDGET, mergeBudget, compactObservation } = require("./agent_contracts.cjs");
+const { DEFAULT_BUDGET, mergeBudget, clampBudgetOverrides, compactObservation } = require("./agent_contracts.cjs");
 const { ThreadManager, DEFAULT_PROVIDER_CAPS, workspaceFingerprint } = require("./thread_manager.cjs");
 const { CodingWorkspace } = require("./coding_workspace.cjs");
 const { CodingAutopilot } = require("./coding_autopilot.cjs");
+const { chooseVerificationProfile, verificationSummary, skippedVerification } = require("./verification_profile.cjs");
+const { assertAnswerable } = require("./task_answer.cjs");
 const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
+const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
-const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, digest: streamDigest } = require("./stream_protocol.cjs");
+const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
+const { nextReadinessDelay, classifyHealthFailure, missingCheckpointItem } = require("./readiness_probe.cjs"); // T9-H1
+const { cacheStats } = require("./prompt_cache_stats.cjs");
+const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, shouldCheckpointStream, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
+const { firstTokenWatchdog } = require("./stream_watchdog.cjs");
 const {
   PROVIDER_DEFINITIONS,
   normalizeSelection,
@@ -28,7 +35,12 @@ const {
   isMapleTransportError,
 } = require("./maple_runtime.cjs");
 const { classifyIntent: classifyScopedIntent, resolveInteraction } = require("./interaction_modes.cjs");
+const { shouldAutoDemote } = require("./memory_fitness.cjs");
+const { buildGroundedContext } = require("./prompt_context.cjs");
+const { applyDigestCompaction, insertDigestBlock } = require("./thread_digest.cjs");
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
+const { createWorkNotifier, trackChatResponseJob } = require("./work_notifications.cjs");
+const { COMPARISON_SCHEMA, canRunComparison, lastUserMessage, buildComparisonRecord } = require("./comparison_lane.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -127,7 +139,34 @@ const modelCandidates = [
   path.join(os.homedir(), "Models", "Hemlock", "maple-2bit-mlx"),
   path.join(repoRoot, "maple-2bit-mlx"),
 ].filter(Boolean).map((candidate) => path.resolve(candidate));
-const modelPath = modelCandidates.find((candidate) => fs.existsSync(candidate)) || modelCandidates[0];
+// T9-H1: prefer candidates that look like real MLX checkpoints (a bogus dir
+// used to spawn blindly and 404 later); fall through so startServer explains.
+function mlxCheckpointProblem(dirPath) {
+  let names = [];
+  try {
+    if (!fs.statSync(dirPath).isDirectory()) return "a readable model directory";
+    names = fs.readdirSync(dirPath);
+  } catch {
+    return "a readable model directory";
+  }
+  return missingCheckpointItem(names);
+}
+const modelPath = modelCandidates.find((candidate) => !mlxCheckpointProblem(candidate)) || modelCandidates[0];
+
+// Local MLX model registry for the picker. "default_model" is the Maple
+// launch model; other entries are absolute model directories served by the
+// same mlx_lm server, which lazy-loads whatever path a request names.
+const LOCAL_MODEL_PATHS = {
+  "default_model": modelPath,
+  "lfm25-8b": path.join(os.homedir(), "Models", "Hemlock", "LFM2.5-8B-A1B-mlx-4bit"),
+};
+
+function resolveLocalModelPath(model) {
+  const resolved = LOCAL_MODEL_PATHS[String(model || "")];
+  // T9-H1: an existing-but-invalid dir would lazy-load to a 404 mid-chat;
+  // fall back to the validated default instead.
+  return resolved && !mlxCheckpointProblem(resolved) ? resolved : "default_model";
+}
 const minimumDreamFreeBytes = Number(process.env.HEMLOCK_MIN_FREE_BYTES || 10 * 1024 ** 3);
 
 function digestText(value) {
@@ -241,15 +280,47 @@ const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
   ? Math.max(4096, requestedMapleMaxTokens)
   : 16384;
 const maplePromptCacheSize = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE))
-  ? Math.max(1, Math.min(10, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
-  : 4;
-const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "512M");
+  ? Math.max(1, Math.min(16, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
+  : 12;
+const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "768M");
 const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY)))
   : 1;
 const mapleDecodeConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY)))
   : 1;
+
+// ── Maple-Preview performance optimizations ──────────────────────────────
+//
+// 1. KV cache quantization (--kv-bits): 4-bit reduces KV cache memory by
+//    ~75%, letting the prompt cache hold more entries and context extend
+//    farther on the same hardware. Disable with HEMLOCK_KV_BITS=0.
+//
+// 2. Prefill step size (--prefill-step-size): smaller chunks improve
+//    responsiveness on long prompts. Tune with HEMLOCK_PREFILL_STEP_SIZE.
+// Persistent cross-restart prompt caching (--prompt-cache-file) is NOT available:
+// mlx_lm's HTTP server exposes only in-memory --prompt-cache-size/--prompt-cache-bytes
+// (both already tuned below); the on-disk cache flag exists only in generate.py CLI.
+// Verified 2026-08-22 — do not re-attempt against this server without an upstream change.
+// n-gram speculative drafting is architecturally incompatible with Maple
+// (SWA-512 RotatingKVCache defeats the verifier's cache rewind —
+// mlx_lm/speculative.py:476 fallback). FlashHead (checkpoint flash_head) is
+// the decode-speed lever; enabled below.
+// KV cache quantization is DISABLED by default (HEMLOCK_KV_BITS=0). The
+// maple-2bit-mlx model uses a RotatingKVCache, and MLX raises
+// `NotImplementedError: RotatingKVCache Quantization NYI` then aborts the GPU
+// command buffer (SIGABRT) when --kv-bits is set. That silently kills the
+// server mid-session and the app records an empty `conversation-failed`
+// inference — the real cause of "Maple-Preview never responds". Only enable
+// it if a future model uses a quantizable KV cache; override with
+// HEMLOCK_KV_BITS=n (0 disables).
+const mapleKvBits = Number.isFinite(Number(process.env.HEMLOCK_KV_BITS))
+  ? Math.max(0, Math.min(8, Math.round(Number(process.env.HEMLOCK_KV_BITS))))
+  : 0;
+const maplePrefillStepSize = Number.isInteger(Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  ? Math.max(256, Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  : 1024;
+
 const serverArgs = [
   "mlx_lm",
   "server",
@@ -279,6 +350,12 @@ const serverArgs = [
   String(mapleDecodeConcurrency),
   "--log-level",
   "INFO",
+  // ── Performance optimizations ──────────────────────────────
+  // KV cache quantization: 4-bit saves ~75% KV cache memory
+  ...(mapleKvBits > 0 ? ["--kv-bits", String(mapleKvBits)] : []),
+  // Prefill in smaller chunks for better responsiveness
+  "--prefill-step-size",
+  String(maplePrefillStepSize),
 ];
 const serverUrl = "http://127.0.0.1:8080";
 const readinessTimeoutMs = 180000;
@@ -316,9 +393,11 @@ function createWindow() {
     if (mainWindow === window) mainWindow = null;
   });
 
-  const url = isDev
-    ? process.env.MAPLE_DEV_URL || "http://127.0.0.1:5173"
-    : `file://${__dirname}/../dist/index.html`;
+  const url = process.env.HEMLOCK_PROD_UI === "1"
+    ? `file://${__dirname}/../dist/index.html`
+    : isDev
+      ? process.env.MAPLE_DEV_URL || "http://127.0.0.1:5173"
+      : `file://${__dirname}/../dist/index.html`;
   window.loadURL(url);
   window.webContents.setWindowOpenHandler(({ url: target }) => {
     // Artifact previews are sandboxed renderer documents. No preview content
@@ -337,11 +416,14 @@ let sipsCycleActive = false;
 const activeChildren = new Set();
 let serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
 let serverLaunchPromise = null;
+let mapleCrashTimestamps = []; // bounded respawn budget (crash_policy.cjs)
 let agentInferenceEndpoint = serverUrl;
 const providerStatusCache = new Map();
 const activeStreams = new Map();
 const streamRing = new Map();
 const STREAM_RING_LIMIT = 240;
+// T11-A: bound on the appendAgentEvent dedup set (recent-window dedup only).
+const AGENT_EVENT_ID_WINDOW = 4096;
 let activeArtifactId = null;
 
 const providerCommandCandidates = {
@@ -571,6 +653,12 @@ let agentTask = {
 };
 
 fs.mkdirSync(sessionDir, { recursive: true });
+// Persist the initial task state immediately. Without this, the session's
+// state.json on disk can still describe the *previous* session's task (e.g.
+// status "running" from a session that crashed mid-task), and a later
+// restart would restore that stale task and queue every new intent behind
+// an action loop that can never run.
+writeAgentState();
 
 let agentKernel = new AgentKernel({ root: runtimeDataRoot, repoRoot, task: agentTask });
 let agentOrchestrator = null;
@@ -587,6 +675,11 @@ const artifactRegistry = new ArtifactRegistry({
   workspaceId: agentKernel.workspaceId,
   onEvent: artifactEvent,
   changeSet: ({ artifact, taskId }) => prepareArtifactChangeSet({ artifact, taskId }),
+});
+const changesetApplier = new ChangeSetApplier({
+  changesetRoot: path.join(sipsDir, "workspaces", "changesets"),
+  readArtifactManifest: (taskId, artifactId) => { try { return artifactRegistry.read(taskId, artifactId); } catch { return null; } },
+  onEvent: (type, status, payload, extra = {}) => appendAgentEvent(type, status, payload, { reversible: true, ...extra }),
 });
 const previewSessions = new PreviewSessionManager({
   emit: (type, status, payload) => appendAgentEvent(type, status, payload, { reversible: true }),
@@ -690,6 +783,16 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
   };
   if (agentEventIds.has(event.id)) return event;
   agentEventIds.add(event.id);
+  // T11-A: the dedup set grew one entry per event for the process lifetime
+  // (agentEvents itself is capped at 160, but this Set never was). Bound it to
+  // a recent window — insertion order makes oldest ids drop first, so retry-
+  // window dedup semantics are preserved while memory stays flat.
+  if (agentEventIds.size > AGENT_EVENT_ID_WINDOW) {
+    for (const staleId of agentEventIds) {
+      agentEventIds.delete(staleId);
+      if (agentEventIds.size <= AGENT_EVENT_ID_WINDOW / 2) break;
+    }
+  }
   agentEvents.push(event);
   if (agentEvents.length > 160) agentEvents.shift();
   fs.appendFileSync(sessionEventsPath, `${JSON.stringify(event)}\n`, "utf-8");
@@ -750,6 +853,10 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
   if (!stream.channels[normalizedChannel]) stream.channels[normalizedChannel] = "";
   stream.channels[normalizedChannel] += normalizedDelta;
   if (normalizedChannel === "content") stream.text += normalizedDelta;
+  // T11-A: account raw delta bytes incrementally so the checkpoint throttle
+  // never needs to serialize the full accumulated channels just to measure
+  // growth (the old code JSON.stringify'd every channel on every call).
+  stream.channelBytes = (stream.channelBytes || 0) + Buffer.byteLength(normalizedDelta, "utf8");
   const frame = { channel: normalizedChannel, delta: normalizedDelta, terminal, status, usage, stopReason, time: new Date().toISOString() };
   if (terminal) {
     stream.frameCoalescer?.flush();
@@ -765,23 +872,29 @@ function publishStreamFrame(stream, { delta = "", channel = "content", terminal 
 function checkpointStream(stream, { force = false } = {}) {
   if (!stream || !Object.values(stream.channels || {}).some(Boolean)) return;
   const now = Date.now();
-  const bytes = Buffer.byteLength(JSON.stringify(stream.channels), "utf8");
-  if (!force && now - stream.lastCheckpointAt < 750 && bytes - stream.lastCheckpointBytes < 2048) return;
+  // T11-A: throttle decision now uses incrementally-accounted delta bytes
+  // (shouldCheckpointStream) instead of serializing the entire channel map on
+  // every call — the old code paid O(total-output) JSON.stringify per SSE
+  // chunk even when the checkpoint was going to be skipped.
+  if (!shouldCheckpointStream(stream, { force, now })) return;
+  const serialized = JSON.stringify(stream.channels);
+  const bytes = Buffer.byteLength(serialized, "utf8");
   stream.lastCheckpointAt = now;
   stream.lastCheckpointBytes = bytes;
+  stream.lastMarkBytes = stream.channelBytes || 0;
   appendAgentEvent(stream.kind === "model_text" ? "inference.stream.checkpoint" : "operation.output.checkpoint", "checkpoint", {
     streamId: stream.streamId,
     operationId: stream.operationId,
     kind: stream.kind,
     sequence: stream.sequence - 1,
-    digest: streamDigest(JSON.stringify(stream.channels)),
+    digest: streamDigest(serialized),
     bytes,
     channels: streamChannelRecords(stream).map(({ name, digest, text }) => ({ name, digest, tail: text.slice(-2400) })),
   }, { reversible: true });
 }
 
 function startStream({ taskId = agentTask.id, operationId = null, kind = "model_text", provider = "maple" } = {}) {
-  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, provider, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, controller: null, abortReason: null, frameCoalescer: null };
+  const stream = { streamId: createStreamId(kind), taskId, operationId, kind, provider, sequence: 0, text: "", channels: {}, terminal: false, startedAt: Date.now(), lastCheckpointAt: Date.now(), lastCheckpointBytes: 0, channelBytes: 0, lastMarkBytes: 0, controller: null, abortReason: null, frameCoalescer: null };
   stream.frameCoalescer = createStreamFrameCoalescer({ emit: (frame) => emitStreamFrame(stream, frame) });
   activeStreams.set(stream.streamId, stream);
   appendAgentEvent(kind === "model_text" ? "inference.stream.started" : "operation.output.started", "running", { streamId: stream.streamId, taskId, operationId, kind, provider });
@@ -809,6 +922,10 @@ function finishStream(stream, { status = "completed", stopReason = null, usage =
     channels: streamChannelRecords(stream),
   }, { reversible: true });
   activeStreams.delete(stream.streamId);
+  // T11-A: the per-stream frame ring was write-only replay memory that no code
+  // path ever read back; without this delete every finished stream leaked up
+  // to STREAM_RING_LIMIT retained frames in streamRing for the process lifetime.
+  streamRing.delete(stream.streamId);
 }
 
 function abortStreamsForTask(taskId, reason = "cancelled") {
@@ -845,6 +962,14 @@ const codingWorkspace = new CodingWorkspace({
 });
 
 function updateAgentTask(patch, { emit = true } = {}) {
+  // T7-S1: pin the pending question durably on the projection while the task
+  // waits on the user (Chat reads task.question), and clear it the moment the
+  // phase moves on so a stale question never lingers.
+  if (patch.phase === "waiting_for_user" && patch.question === undefined) {
+    patch = { ...patch, question: { prompt: String(patch.foregroundStep || agentTask.foregroundStep || "").trim(), askedAt: new Date().toISOString() } };
+  } else if (patch.phase && patch.phase !== "waiting_for_user" && patch.question === undefined) {
+    patch = { ...patch, question: null };
+  }
   agentTask = { ...agentTask, ...patch, updatedAt: new Date().toISOString() };
   writeAgentState();
   agentKernel?.syncTask(agentTask);
@@ -1047,6 +1172,18 @@ async function processAgentIntent(payload = {}) {
   appendAgentEvent("task.created", "accepted", { task: agentTask, source: payload.source || "command-center" });
   appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 500), intent, interactionMode, source: payload.source || "command-center" });
   threadManager.appendConversation(agentTask.threadId, { role: "user", content: text, provider: selection.provider, model: selection.model, reasoning: selection.reasoning });
+  // Auto-title: a thread still carrying its default title takes its name from
+  // the first user message, so the picker shows recognizable identities.
+  {
+    const autoTitleThread = threadManager.thread(agentTask.threadId);
+    if (autoTitleThread && (!autoTitleThread.title || autoTitleThread.title === "New Hemlock thread" || autoTitleThread.title === "Hemlock thread")) {
+      const derivedTitle = text.replace(/\s+/g, " ").trim().slice(0, 60) || autoTitleThread.title;
+      if (derivedTitle && derivedTitle !== autoTitleThread.title) {
+        threadManager.updateThread(agentTask.threadId, { title: derivedTitle });
+        agentTask = { ...agentTask, objective: agentTask.objective && agentTask.objective !== "New Hemlock thread" ? agentTask.objective : derivedTitle };
+      }
+    }
+  }
 
   let context = null;
   try {
@@ -1068,16 +1205,28 @@ async function processAgentIntent(payload = {}) {
     status: intent === "conversation" ? "running" : "planning",
     foregroundStep: intent === "conversation" ? `${selection.label} is answering from the selected Hemlock lane` : "Choose the next bounded action from context and evidence",
     evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(context?.evidenceRefs || []), ...(recall?.evidenceRefs || [])])],
+    recall: { ...recall },
   });
 
   // Casual conversation is a first-class local interaction, not a coding plan.
   // It still receives a durable task and command receipt, but it should not
   // force the user through a plan-approval ceremony for “hey, how are ya?”.
   if (intent === "conversation" && payload.directChat !== false) {
-    const messages = Array.isArray(payload.messages) && payload.messages.length
-      ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })).filter((message) => ["system", "user", "assistant"].includes(message.role) && message.content)
-      : [{ role: "user", content: text }];
-    const inference = await runInference({
+    // Thread-owned context: the authoritative transcript is the thread's
+    // stored conversation, not the renderer's local state. The renderer's
+    // message array can contain cross-thread bleed or stale entries; the
+    // backend conversation log cannot. Fall back to the payload only if the
+    // thread has no stored history yet (first message of a fresh thread).
+    const storedConversation = agentTask.threadId ? threadManager.readConversation(agentTask.threadId) : [];
+    const storedMessages = storedConversation
+      .map((entry) => ({ role: entry.role, content: String(entry.content || "") }))
+      .filter((message) => ["user", "assistant"].includes(message.role) && message.content);
+    const messages = storedMessages.length
+      ? [...storedMessages, { role: "user", content: text }]
+      : Array.isArray(payload.messages) && payload.messages.length
+        ? payload.messages.map((message) => ({ role: message.role, content: String(message.content || "") })).filter((message) => ["system", "user", "assistant"].includes(message.role) && message.content)
+        : [{ role: "user", content: text }];
+    let inference = await runInference({
       apiBase: payload.apiBase,
       adapterPath: payload.adapterPath,
       provider: selection.provider,
@@ -1093,6 +1242,32 @@ async function processAgentIntent(payload = {}) {
       top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
       max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
     });
+    // Length-guard: if the model consumed its entire token budget on the
+    // thinking channel and produced no visible answer, retry once with the
+    // thinking channel disabled so the user gets a real response instead of
+    // an empty transcript row. Only for local lanes that honor the flag.
+    const lengthChoice = inference.payload?.choices?.[0] || {};
+    const lengthMessage = lengthChoice.message || {};
+    const lengthAnswer = String(inference.answer || lengthMessage.content || "").trim();
+    if (lengthChoice.finish_reason === "length" && !lengthAnswer && selection.provider === "maple") {
+      appendAgentEvent("inference.retrying", "running", { reason: "token budget consumed by reasoning channel; retrying without thinking", threadId: agentTask.threadId }, { reversible: true });
+      inference = await runInference({
+        apiBase: payload.apiBase,
+        adapterPath: payload.adapterPath,
+        provider: selection.provider,
+        model: selection.model,
+        reasoning: "off",
+        messages,
+        taskId: agentTask.id,
+        threadId: agentTask.threadId,
+        workspaceRoot: agentTask.workspaceRoot,
+        operationId: payload.operationId || null,
+        temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
+        top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
+        top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
+        max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
+      });
+    }
     const choice = inference.payload?.choices?.[0]?.message || {};
     // Streaming responses carry text in ordered deltas, not in the final SSE
     // chunk's `message` field. Use the durable inference answer assembled by
@@ -1102,6 +1277,7 @@ async function processAgentIntent(payload = {}) {
       schema: "hemlock.agent.conversation.response.v1",
       requestId: payload.requestId || null,
       taskId: agentTask.id,
+      threadId: agentTask.threadId,
       answer,
       channels: inference.channels || [],
       rawOutputRef: inference.rawOutputRef || null,
@@ -1213,22 +1389,9 @@ function recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, 
     rawOutputRef,
     channels: modelChannelRecords(channels, selection.provider),
   });
-  if (selection.provider === "maple" && taskId === agentTask.id && agentTask.threadId) {
-    const existing = threadManager.listSuggestions({ threadId: agentTask.threadId, status: "unread" }).find((item) => item.kind === "provider-escalation");
-    if (!existing) {
-      const suggestion = threadManager.createSuggestion({
-        threadId: agentTask.threadId,
-        projectId: agentTask.projectId,
-        kind: "provider-escalation",
-        title: "Maple-Preview needs a provider decision",
-        summary: "The selected local Maple lane did not produce a usable response.",
-        reason: detail,
-        evidenceRefs: rawOutputRef ? [rawOutputRef] : [],
-        recommendedAction: { command: "task.escalate-provider", providers: ["codex", "claude"], requiresUserAction: true },
-      });
-      appendAgentEvent("suggestion.created", "candidate", { suggestion }, { evidenceRefs: suggestion.evidenceRefs, reversible: true });
-    }
-  }
+  // T8-F6: provider escalation removed — Hemlock runs ONLY the selected lane.
+  // A failed Maple inference surfaces through the normal failure receipts; no
+  // Codex/Claude escape-hatch suggestion is created.
 }
 
 function providerCommand(provider, selection, prompt, structured = false, cwd = repoRoot) {
@@ -1290,6 +1453,12 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   }
   const { executable, args } = command;
   const stream = startStream({ taskId, operationId: payload.operationId || null, kind: "model_text", provider: selection.provider });
+  // Work-notification boundary: conversation-mode chat responses announce
+  // completion when the run outlives the notifier threshold and the window is
+  // unfocused; structured-action calls never notify. Settle BEFORE any risky
+  // post-terminal work (persistModelOutput) so a receipt-write throw can never
+  // leak the pending job; cancel() is a no-op after finish().
+  const cliNotify = mode === "conversation" ? trackChatResponseJob(workNotifier, `maple-${stream.streamId}`) : null;
   const parserState = { text: "" };
   let stdoutBuffer = "";
   let stderr = "";
@@ -1353,6 +1522,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
 
   const interrupted = stream.abortReason;
   if (interrupted) {
+    cliNotify?.cancel();
     finishStream(stream, { status: interrupted === "steering" ? "interrupted_by_steering" : "cancelled", stopReason: interrupted });
     if (interrupted === "steering" && mode === "conversation") {
       const steeringStart = Number.isInteger(payload.__steeringCount) ? payload.__steeringCount : 0;
@@ -1381,6 +1551,7 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   if (processResult.error || lastError || processResult.exitCode !== 0) {
     const detail = lastError || processResult.error?.message || stderr.trim().slice(-600) || `${selection.label} exited with code ${processResult.exitCode ?? "-"}.`;
     const error = new Error(`${selection.label} inference failed: ${detail}`);
+    cliNotify?.finish({ ok: false, detail: error.message });
     const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-failed`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
     finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
     error.rawOutputRef = rawOutputRef;
@@ -1389,24 +1560,30 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   }
   if (!stream.text.trim()) {
     const error = new Error(`${selection.label} returned no final response.`);
+    cliNotify?.finish({ ok: false, detail: error.message });
     const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode: `${mode}-empty`, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode } });
     finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef });
     error.rawOutputRef = rawOutputRef;
     recordCliInferenceFailure(error, { taskId, selection, mode, startedAt, rawOutputRef, streamId: stream.streamId, channels: stream.channels });
     throw error;
   }
+  cliNotify?.finish({ ok: true });
   const rawOutputRef = persistModelOutput({ taskId, operationId: payload.operationId || null, streamId: stream.streamId, mode, provider: selection.provider, channels: stream.channels, rawPayload: { stderr: stderr.slice(-4000), exitCode: processResult.exitCode, usage } });
   finishStream(stream, { status: "completed", stopReason: "provider_cli_completed", usage, rawOutputRef });
   const answer = stream.text.trim();
   const channels = modelChannelRecords(stream.channels, selection.provider);
+  const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? null;
   const telemetry = {
     provider: selection.provider,
     model: selection.model || "provider-default",
     reasoning: selection.reasoning,
     elapsedMs: Date.now() - startedAt,
     finishReason: "provider_cli_completed",
+    contextChars: (Array.isArray(payload.messages) ? payload.messages : []).reduce((sum, message) => sum + String(message?.content || "").length, 0),
     promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null,
     completionTokens: usage?.output_tokens ?? usage?.completion_tokens ?? null,
+    cachedTokens,
+    cacheHitRatio: cacheStats({ promptTokens: usage?.input_tokens ?? usage?.prompt_tokens ?? null, cachedTokens }).hitRatio,
     tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
     outputDigest: streamDigest(JSON.stringify(stream.channels)),
     contentDigest: digestText(answer),
@@ -1433,8 +1610,93 @@ async function runCliInference(payload = {}, selection, { mode = "conversation",
   };
 }
 
+// T6-P1: comparison lane. Re-runs ONLY the last user message on ONE alternate
+// provider lane. Read-only inference — no tools run, so no plan/approval gate.
+// One comparison at a time (module flag); each provider's own lease still
+// serializes against normal inference on that lane via withProvider.
+let comparisonInFlight = false;
+async function runComparisonLane(payload = {}) {
+  const currentSelection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  const guard = canRunComparison({ inFlight: comparisonInFlight, targetProvider: payload.targetProvider, currentProvider: currentSelection.provider });
+  if (!guard.ok) {
+    appendAgentEvent("comparison.blocked", "blocked", { reason: guard.reason, requested: String(payload.targetProvider || "") }, { reversible: true });
+    throw new Error(guard.reason);
+  }
+  const promptText = lastUserMessage(threadManager.readConversation(String(agentTask.threadId || "")));
+  if (!promptText) throw new Error("No user message is available in this thread to compare.");
+  const messages = [{ role: "user", content: promptText }];
+  // T7-S4 FIX 2 (context symmetry): maple's runInference already assembles
+  // injectGroundedContext internally — wrapping here too would double-inject —
+  // so only the bare CLI lane wraps here. Both lanes read the same
+  // agentTask.recall snapshot, so the assembled system block is identical.
+  const cliMessages = await injectGroundedContext(messages);
+  const contextApplied = cliMessages.length > messages.length && cliMessages[0]?.role === "system";
+  // Maple's conversation bookkeeping stamps completion state onto the live
+  // task; a comparison must stay read-only, so restore what it touches.
+  const taskRestore = { phase: agentTask.phase, status: agentTask.status, foregroundStep: agentTask.foregroundStep, blockedReason: agentTask.blockedReason };
+  comparisonInFlight = true;
+  appendAgentEvent("comparison.started", "running", { targetProvider: guard.targetProvider, threadId: agentTask.threadId || null }, { reversible: true });
+  try {
+    let result;
+    if (guard.targetProvider === "maple") {
+      result = await runInference({ provider: "maple", messages, threadId: agentTask.threadId || undefined, taskId: agentTask.id });
+      updateAgentTask(taskRestore, { emit: false });
+    } else {
+      // mode "comparison" skips conversation-mode task mutation; the CLI lane
+      // runs exactly like normal inference otherwise (lease, stream, receipt).
+      result = await runCliInference({ messages: cliMessages, taskId: agentTask.id, threadId: agentTask.threadId || undefined }, normalizeSelection({ provider: guard.targetProvider }), { mode: "comparison" });
+    }
+    const comparison = buildComparisonRecord({ targetProvider: guard.targetProvider, promptText, answer: result.answer, contextApplied, telemetry: result.telemetry || null });
+    updateAgentTask({ comparison });
+    appendAgentEvent("comparison.completed", "passed", { comparison }, { evidenceRefs: result.rawOutputRef ? [result.rawOutputRef] : [], reversible: true });
+    return { schema: COMPARISON_SCHEMA, status: "completed", comparison, task: agentTask };
+  } catch (error) {
+    // A failed maple comparison still stamps the task "blocked" from inside
+    // runInference's catch; restore the pre-comparison state either way so the
+    // read-only contract holds on failure paths too.
+    updateAgentTask(taskRestore, { emit: false });
+    appendAgentEvent("comparison.failed", "failed", { error: error.message, targetProvider: guard.targetProvider }, { reversible: true });
+    throw error;
+  } finally {
+    comparisonInFlight = false;
+  }
+}
+
+// Receipt-bearing memory injection (T6-G1): prepend the labeled promoted-memory
+// block as its own system-role message — host additions stay labeled, never
+// blended into model output. One receipt per inference when injection happened.
+// T7-S4 FIX 3: optional refreshQuery re-runs SIPS recall first so call sites
+// that bypass the intent path (inference.respond) don't reuse whatever
+// agentTask.recall last held. Only inference.respond passes it.
+async function injectGroundedContext(messages = [], refreshQuery = "") {
+  let recall = agentTask.recall;
+  const query = String(refreshQuery || "").trim();
+  if (query) {
+    try {
+      recall = await runSipsRuntime({ action: "recall", query, limit: 6 });
+      updateAgentTask({ recall });
+      appendAgentEvent("memory.recalled", "passed", { query, count: recall.records?.length || 0, records: recall.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
+    } catch (error) {
+      appendAgentEvent("memory.recall.failed", "degraded", { query, error: error.message }, { reversible: true });
+    }
+  }
+  const grounded = buildGroundedContext({ recall });
+  if (!grounded.systemBlock) return messages;
+  appendAgentEvent("context.injected", "passed", { count: grounded.citations.length, citationIds: grounded.citations.map((citation) => citation.id) }, { reversible: true });
+  return [{ role: "system", content: grounded.systemBlock }, ...messages];
+}
+
+// Rolling thread digest (T6-G2): compaction that admits what it drops. The
+// digest block re-enters the prompt as its own system message, ahead of the
+// retained tail; the receipt fires once per inference.
+function compactWithDigest(payload = {}) {
+  const { messages: compacted, digest } = applyDigestCompaction(payload.messages);
+  if (!digest) return compacted;
+  appendAgentEvent("thread.digest.created", "passed", { lines: digest.summaryLines.length, droppedCount: digest.droppedCount, chars: digest.chars, threadId: payload.threadId || agentTask.threadId || null }, { reversible: true });
+  return insertDigestBlock(compacted, digest);
+}
+
 async function runInference(payload = {}) {
-  const initialMessages = compactInferenceMessages(payload.messages);
   const selection = normalizeSelection({ provider: payload.provider || payload.modelProvider || agentTask.provider, model: payload.model || agentTask.model, reasoning: payload.reasoning || agentTask.reasoning });
   if (!payload.__providerLease) {
     return threadManager.withProvider(selection.provider, payload.threadId || payload.taskId || agentTask.threadId || agentTask.id, (lease) => runInference({ ...payload, __providerLease: true }, { __providerLease: true }).then((result) => {
@@ -1442,11 +1704,13 @@ async function runInference(payload = {}) {
       return result;
     }));
   }
-  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: initialMessages }, selection, { mode: "conversation" });
+  // Compaction (and its digest receipt) runs once, inside the lease.
+  const initialMessages = compactWithDigest(payload);
+  if (selection.provider !== "maple") return runCliInference({ ...payload, messages: await injectGroundedContext(initialMessages, payload.refreshQuery) }, selection, { mode: "conversation" });
   const requestedAdapter = String(payload.adapterPath || "");
   const endpoint = String(payload.apiBase || serverUrl).replace(/\/$/, "");
   const startedAt = Date.now();
-  let messages = initialMessages;
+  let messages = await injectGroundedContext(initialMessages, payload.refreshQuery);
   let recovered = false;
   let stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
   let responsePayload = {};
@@ -1457,20 +1721,43 @@ async function runInference(payload = {}) {
   let steeringIndex = 0;
   let mapleTransportRetries = 0;
   await ensureMapleRuntime();
+  // Work-notification boundary (see runCliInference): long Maple conversation
+  // responses announce completion while unfocused. Settled at every terminal
+  // outcome below; retry/steering paths keep the same pending job on purpose.
+  const mapleNotify = trackChatResponseJob(workNotifier, `maple-${stream.streamId}`);
   while (true) {
     const controller = new AbortController();
     stream.controller = controller;
     const timeoutHandle = setTimeout(() => controller.abort("timeout"), inferenceTimeoutMs);
+    // T8-S3: first-token stall watchdog — Maple can accept the request and then
+    // wedge without emitting a single SSE byte; abort in 45s (not the full
+    // inferenceTimeoutMs) so the bounded transport recovery below takes over.
+    const stallStartedAt = Date.now();
+    let firstByteAt = null;
+    const stallHandle = setTimeout(() => {
+      if (!firstTokenWatchdog({ now: Date.now(), startedAt: stallStartedAt, firstByteAt }).stalled) return;
+      const stallError = new Error("first-token stall (no SSE bytes in 45s)");
+      stallError.code = "MAPLE_FIRST_TOKEN_STALL";
+      controller.abort(stallError);
+    }, 45000);
     try {
       const base = {
-        model: "default_model",
+        model: selection.provider === "maple" ? resolveLocalModelPath(selection.model) : "default_model",
         messages,
         temperature: Number.isFinite(payload.temperature) ? payload.temperature : 0.7,
         top_p: Number.isFinite(payload.top_p) ? payload.top_p : 0.95,
         top_k: Number.isFinite(payload.top_k) ? payload.top_k : 20,
         max_tokens: Number.isFinite(payload.max_tokens) ? payload.max_tokens : mapleMaxTokens,
         stream: true,
-        chat_template_kwargs: { enable_thinking: true },
+        // T8-F3: mlx_lm only emits a usage chunk when include_usage is set —
+        // without it telemetry has no completionTokens and tok/s renders "—".
+        stream_options: { include_usage: true },
+        // Reasoning toggle: "off" explicitly disables the thinking channel
+        // (LFM2.5 honors enable_thinking:false and skips CoT entirely — much
+        // faster for casual chat). "on" leaves the flag unset: Maple emits its
+        // reasoning channel regardless, so forcing the flag only added server
+        // overhead (~23% slower first response, no content difference).
+        ...(payload.reasoning === "off" ? { chat_template_kwargs: { enable_thinking: false } } : {}),
       };
       let response = await fetch(`${endpoint}/v1/chat/completions`, {
         method: "POST",
@@ -1511,6 +1798,7 @@ async function runInference(payload = {}) {
         let done = false;
         while (!done) {
           const result = await reader.read();
+          if (firstByteAt === null && result.value?.length) { firstByteAt = Date.now(); clearTimeout(stallHandle); } // T8-S3: first byte disarms the stall watchdog
           const parsedEvents = parser.push(result.value || new Uint8Array(), { final: result.done === true });
           for (const event of parsedEvents) {
             const parsed = parseSsePayload(event);
@@ -1533,7 +1821,14 @@ async function runInference(payload = {}) {
       // even though the identical request can return visible content in a
       // buffered response. Keep the SSE attempt and its receipt, then use one
       // bounded buffered retry instead of surfacing an empty answer.
-      if (!bufferedFallback && !stream.text.trim()) {
+      // Fire the buffered retry when the visible CONTENT channel is empty
+      // (reasoning-only streams, or an empty delta) rather than only when the
+      // whole stream text is empty. An empty content channel is what the app
+      // would otherwise render as a blank "· content" block.
+      const streamHasContent = Boolean(String(stream.channels.content || "").trim());
+      const streamHasReasoning = Boolean(String(stream.channels.reasoning || "").trim());
+      if (!bufferedFallback && !streamHasContent) {
+        if (streamHasReasoning) bumpAgentMetrics({ mapleReasoningOnlyStream: 1 });
         const fallbackResponse = await fetch(`${endpoint}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1555,19 +1850,60 @@ async function runInference(payload = {}) {
         bufferedFallback = true;
         for (const channel of extractModelChannels(fallbackChoice.message)) publishStreamFrame(stream, { channel: channel.name, delta: channel.text, usage, stopReason: finishReason });
       }
+      // Bounded second retry: if even the buffered fallback returned an empty
+      // CONTENT channel, try once more with a slightly raised temperature. This
+      // contains the rare double-empty KV-warmup hiccup instead of rendering a
+      // blank response. At most ONE extra request ever fires per inference.
+      const fallbackContentEmpty = !String(stream.channels.content || "").trim();
+      if (bufferedFallback && fallbackContentEmpty) {
+        bumpAgentMetrics({ mapleDoubleEmptyRetry: 1 });
+        const retryResponse = await fetch(`${endpoint}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...base, stream: false, temperature: Math.min(1, Number(base.temperature ?? 0.7) + 0.15) || 0.85 }),
+          signal: controller.signal,
+        });
+        if (retryResponse.ok) {
+          const retryPayload = await readResponse(retryResponse);
+          const retryChoice = retryPayload?.choices?.[0];
+          if (retryChoice?.message && String(retryChoice.message.content || "").trim()) {
+            rawPayloads.push(retryPayload);
+            responsePayload = retryPayload;
+            finishReason = retryChoice.finish_reason || null;
+            usage = retryPayload.usage || null;
+            for (const channel of extractModelChannels(retryChoice.message)) publishStreamFrame(stream, { channel: channel.name, delta: channel.text, usage, stopReason: finishReason });
+          }
+        }
+      }
       const channels = modelChannelRecords(stream.channels);
       const answerText = String(stream.channels.content || responsePayload?.choices?.[0]?.message?.content || "").trim();
       const choice = responsePayload?.choices?.[0] || {};
-      const rawOutputRef = persistModelOutput({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId || null, streamId: stream.streamId, mode: "conversation", channels: stream.channels, rawPayload: rawPayloads.length ? rawPayloads : responsePayload });
+      mapleNotify.finish({ ok: true });
+      // Guarded receipt write: if persistModelOutput throws (disk full, etc.)
+      // the notification job is already settled and the error still surfaces.
+      let rawOutputRef = null;
+      try {
+        rawOutputRef = persistModelOutput({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId || null, streamId: stream.streamId, mode: "conversation", channels: stream.channels, rawPayload: rawPayloads.length ? rawPayloads : responsePayload });
+      } catch (receiptError) {
+        appendAgentEvent("model-output.persist.failed", "failed", { streamId: stream.streamId, error: receiptError.message }, { reversible: true });
+      }
       finishStream(stream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
+      const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? null;
       const telemetry = {
         provider: "maple",
         model: "default_model",
         reasoning: "native",
         elapsedMs: Date.now() - startedAt,
         finishReason,
+        contextChars: messages.reduce((sum, message) => sum + message.content.length, 0),
         promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null,
-        completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null,
+        // T8-F3: honest fallback — if the server never sent a usage chunk,
+        // estimate tokens from streamed output (≈4 chars/token) rather than
+        // rendering "tok/s —". Marked approximate.
+        completionTokens: usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? (Math.round((String(stream.channels.content || "").length + String(stream.channels.reasoning || stream.channels.reasoning_content || "").length) / 4) || null),
+        completionTokensApproximate: (usage?.completion_tokens ?? responsePayload.usage?.completion_tokens ?? null) == null,
+        cachedTokens,
+        cacheHitRatio: cacheStats({ promptTokens: usage?.prompt_tokens ?? responsePayload.usage?.prompt_tokens ?? null, cachedTokens }).hitRatio,
         tokensPerSecond: tokensPerSecond(usage, Date.now() - startedAt),
         outputDigest: streamDigest(JSON.stringify(stream.channels)),
         contentDigest: streamDigest(answerText),
@@ -1607,6 +1943,9 @@ async function runInference(payload = {}) {
       if (!reason && isMapleTransportError(error) && mapleTransportRetries < 1 && !stream.text.trim()) {
         mapleTransportRetries += 1;
         finishStream(stream, { status: "restarting", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
+        // T7.5-R2: recovery must be visible, not silent — the receipt rides
+        // the existing HOST ACTIVITY rail via conciseAgentNote.
+        appendAgentEvent("maple.recovery", "degraded", { attempt: mapleTransportRetries, reason: error.message, streamId: stream.streamId }, { reversible: true });
         await restartMapleRuntime(error.message || "Maple transport failed during inference.");
         stream = startStream({ taskId: payload.taskId || agentTask.id, operationId: payload.operationId, kind: "model_text", provider: "maple" });
         rawPayloads = [];
@@ -1631,18 +1970,40 @@ async function runInference(payload = {}) {
         continue;
       }
       if (reason === "cancelled" || reason === "interrupted") {
+        mapleNotify.cancel();
         finishStream(stream, { status: "cancelled", stopReason: reason, rawOutputRef: interruptedRawOutputRef });
+        // T8-F1: a cancel must not vaporize minutes of streamed output. If the
+        // model produced real content before the cut, keep it in the thread as
+        // an honest partial reply instead of discarding it (17K-char story
+        // incident, 2026-08-24: full output existed only in raw receipts).
+        const partialText = stream.text.trim();
+        if (partialText) {
+          threadManager.appendConversation(String(payload.threadId || agentTask.threadId || ""), {
+            role: "assistant",
+            content: partialText,
+            channels: modelChannelRecords(stream.channels),
+            provider: "maple",
+            model: "default_model",
+            reasoning: "native",
+            rawOutputRef: interruptedRawOutputRef,
+            partial: true,
+            stopReason: reason,
+          });
+          appendAgentEvent("conversation.partial", "degraded", { taskId: agentTask.id, streamId: stream.streamId, chars: partialText.length, reason }, { reversible: true });
+        }
         const cancellation = new Error("Inference was cancelled before completion.");
         cancellation.code = "CANCELLED";
         throw cancellation;
       }
       finishStream(stream, { status: "failed", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
+      mapleNotify.finish({ ok: false, detail: error.message });
       serverState = { ...serverState, inferenceReady: false };
       updateAgentTask({ phase: "blocked", status: "blocked", blockedReason: error.message, foregroundStep: "Inference blocked; inspect the command trace" });
       appendAgentEvent("inference.failed", "failed", { error: error.message, adapterPath: requestedAdapter || null, elapsedMs: Date.now() - startedAt, streamId: stream.streamId, rawOutputRef: interruptedRawOutputRef, channels: modelChannelRecords(stream.channels) });
       throw error;
     } finally {
       clearTimeout(timeoutHandle);
+      clearTimeout(stallHandle); // T8-S3: disarm the stall watchdog on every exit
     }
   }
 }
@@ -1922,8 +2283,12 @@ const agentCommands = {
   "receipt.inspect": { label: "Inspect a local receipt", capability: "read", auto: true, approval: "none", timeoutMs: 15000 },
   recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
+  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true },
   "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false },
   "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  "conversation.reset": { label: "Reset thread to fresh context", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false },
   "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
@@ -1931,22 +2296,25 @@ const agentCommands = {
   "thread.pause": { label: "Pause Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.resume": { label: "Resume Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
+  "thread.restore": { label: "Restore archived Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "context.compile": { label: "Compile compact thread context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "task.checkpoint": { label: "Record task checkpoint", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "task.escalate-provider": { label: "Escalate task provider", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  // T8-F6: task.escalate-provider removed — single-lane policy, no provider switching.
   "suggestion.list": { label: "List Hemlock suggestions", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
   "suggestion.accept": { label: "Accept Hemlock suggestion", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "suggestion.snooze": { label: "Snooze Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
   "inference.respond": { label: "Run selected provider inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
+  "comparison.run": { label: "Compare last reply across lanes", capability: "read", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
   "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "task.resume": { label: "Resume approved task", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
+  "task.answer": { label: "Answer Maple's question", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "action.accept": { label: "Accept proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "action.reject": { label: "Reject proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
   "task.ask": { label: "Ask the user for a decision", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
@@ -1977,6 +2345,7 @@ const agentCommands = {
   "memory.promote": { label: "Promote memory candidate", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
   "memory.demote": { label: "Demote project lesson", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
   "memory.rollback": { label: "Rollback memory promotion", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
+  "memory.feedback": { label: "Record recall usefulness feedback", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
   "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
@@ -1987,6 +2356,7 @@ const agentCommands = {
   "artifact.compare": { label: "Compare artifact revisions", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.freeze": { label: "Freeze artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
   "artifact.export": { label: "Export artifact change set", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
+  "changeset.apply": { label: "Apply an exported artifact change set to the thread repository", capability: "task", auto: false, approval: "explicit", timeoutMs: 60000 },
   "artifact.preview.open": { label: "Open isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.preview.inspect": { label: "Inspect isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
   "artifact.preview.interact": { label: "Interact with isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
@@ -2015,6 +2385,13 @@ async function runAgentCommand(action, payload = {}) {
     let result;
     if (command === "intent.submit") result = await submitAgentIntent({ ...payload, operationId: payload.operationId || operation.id });
     else if (command === "thread.list") result = threadManager.snapshot();
+    else if (command === "thread.search") {
+      // Bounded title+body search over recent threads. Read-only; results feed
+      // the palette THREADS section's content matches.
+      const query = String(payload.query || "");
+      const limit = Number.isFinite(Number(payload.limit)) ? Math.max(1, Math.min(20, Math.round(Number(payload.limit)))) : 6;
+      result = { schema: "hemlock.agent.thread.search.v1", status: "searched", query, results: threadManager.searchThreads(query, { limit }) };
+    }
     else if (command === "provider.capacity") result = { schema: "hemlock.agent.provider.capacity.v1", status: "updated", providerCaps: threadManager.setProviderCaps(payload.caps || payload) };
     else if (command === "thread.create") {
       const thread = threadManager.createThread(payload);
@@ -2023,7 +2400,24 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "thread.switch") {
       const thread = threadManager.switchThread(String(payload.threadId || ""));
       if (thread.taskSnapshot && typeof thread.taskSnapshot === "object") {
-        agentTask = { ...thread.taskSnapshot, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy };
+        // A thread's taskSnapshot may be from a previous session that
+        // crashed or was closed mid-task, leaving status "running" or
+        // "waiting_for_approval".  Treat that as blocked so the queue
+        // does not enqueue every new intent behind a stale action loop.
+        const staleSnapshot = thread.taskSnapshot;
+        const sessionBoundary = staleSnapshot.startedAt
+          && Date.now() - new Date(staleSnapshot.startedAt).getTime() > 600000; // 10 min
+        agentTask = {
+          ...staleSnapshot,
+          threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot,
+          provider: thread.provider, model: thread.model, reasoning: thread.reasoning,
+          autonomy: thread.autonomy,
+          status: sessionBoundary ? "blocked" : staleSnapshot.status,
+          phase: sessionBoundary ? "blocked" : staleSnapshot.phase,
+          blockedReason: sessionBoundary
+            ? "The previous session was interrupted; inspect and resume the task."
+            : staleSnapshot.blockedReason || null,
+        };
       } else {
         agentTask = { ...agentTask, id: thread.taskId || `task-${thread.id}`, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, objective: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase || "conversation", status: thread.status || "ready", blockedReason: thread.blockedReason || null };
       }
@@ -2033,6 +2427,17 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "switched", thread, task: agentTask, context: compileThreadContext(thread.id), conversation: threadManager.readConversation(thread.id) };
     }
     else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
+    else if (command === "conversation.reset") {
+      // T8-F2: fresh context. A poisoned history (refusal loops, dead-end
+      // tangents) follows the model every turn; this archives the old
+      // conversation file and starts clean, keeping the thread identity.
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const reset = threadManager.resetConversation(threadId);
+      appendAgentEvent("conversation.reset", "accepted", { threadId, archivedMessages: reset.archivedMessages, archivePath: reset.archivePath }, { reversible: false });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "reset", threadId, ...reset };
+    }
+    else if (command === "conversation.history") result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId: String(payload.threadId || agentTask.threadId || ""), conversation: threadManager.readConversation(String(payload.threadId || agentTask.threadId || "")) };
+    else if (command === "comparison.run") result = await runComparisonLane(payload);
     else if (command === "thread.pause") {
       const threadId = String(payload.threadId || agentTask.threadId);
       const checkpoint = threadManager.checkpoint(threadId, { taskId: agentTask.id, phase: "paused", status: "paused", reason: payload.reason || "paused-by-user", evidenceRefs: agentTask.evidenceRefs, artifactRepair: agentTask.artifactRepair, verificationIssues: agentTask.artifactRepair?.issues || [] });
@@ -2046,6 +2451,11 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "resumable", thread, checkpoint: threadManager.latestCheckpoint(threadId), context: compileThreadContext(threadId) };
     }
     else if (command === "thread.archive") result = { schema: "hemlock.agent.thread.result.v1", status: "archived", thread: threadManager.archiveThread(String(payload.threadId || agentTask.threadId)) };
+    else if (command === "thread.restore") {
+      const threadId = String(payload.threadId || "");
+      const thread = threadManager.updateThread(threadId, { status: "ready", phase: "conversation", archivedAt: null, blockedReason: null });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "restored", thread };
+    }
     else if (command === "thread.cancel") result = { schema: "hemlock.agent.thread.result.v1", status: "cancelled", thread: threadManager.cancelThread(String(payload.threadId || agentTask.threadId)) };
     else if (command === "project.list") result = { schema: "hemlock.agent.project.result.v1", status: "ready", projects: threadManager.snapshot().projects };
     else if (command === "project.register") result = { schema: "hemlock.agent.project.result.v1", status: "registered", project: threadManager.registerProject(payload) };
@@ -2055,24 +2465,21 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "context.compile") result = compileThreadContext(String(payload.threadId || agentTask.threadId));
     else if (command === "task.checkpoint") result = threadManager.checkpoint(String(payload.threadId || agentTask.threadId), { ...payload, taskId: payload.taskId || agentTask.id, phase: payload.phase || agentTask.phase, status: payload.status || agentTask.status, evidenceRefs: payload.evidenceRefs || agentTask.evidenceRefs, artifactRepair: payload.artifactRepair || agentTask.artifactRepair, autonomyPolicy: payload.autonomy || agentTask.autonomy });
-    else if (command === "task.escalate-provider") {
-      const provider = String(payload.provider || "");
-      if (!["maple", "codex", "claude"].includes(provider)) throw new Error(`Unsupported provider escalation target: ${provider}`);
-      const threadId = String(payload.threadId || agentTask.threadId);
-      const thread = threadManager.updateThread(threadId, { provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", blockedReason: null });
-      updateAgentTask({ provider, model: payload.model || null, reasoning: payload.reasoning || null, status: "paused", phase: "paused", foregroundStep: `Provider changed to ${provider}; resume explicitly to continue` });
-      result = { schema: "hemlock.agent.provider.escalation.v1", status: "escalated", provider, thread };
-    }
     else if (command === "suggestion.list") result = { schema: "hemlock.agent.suggestion.result.v1", status: "ready", suggestions: threadManager.listSuggestions({ threadId: payload.threadId || agentTask.threadId, status: payload.status }) };
     else if (["suggestion.accept", "suggestion.dismiss", "suggestion.snooze"].includes(command)) {
       const status = command.split(".")[1] === "accept" ? "accepted" : command.split(".")[1] === "dismiss" ? "dismissed" : "snoozed";
       const suggestion = threadManager.transitionSuggestion(String(payload.suggestionId || ""), status);
       result = { schema: "hemlock.agent.suggestion.result.v1", status, suggestion };
     }
-    else if (command === "inference.respond") result = await runInference(payload);
+    else if (command === "inference.respond") {
+      // T7-S4 FIX 3: this path bypasses intent, so refresh recall from the
+      // live prompt before injectGroundedContext builds context.
+      const recallQuery = String(payload.refreshQuery || payload.query || lastUserMessage(threadManager.readConversation(String(agentTask.threadId || ""))) || "");
+      result = await runInference({ ...payload, refreshQuery: recallQuery });
+    }
     else if (command === "training.prepare") result = prepareTrainingDataset(payload);
     else if (command === "training.start") result = await runDream(payload);
-    else if (command === "maple.launch") result = await launchMapleRuntime();
+    else if (command === "maple.launch") result = await launchMapleRuntime({ resetCrashLoop: true });
     else if (command === "status") result = await runSipsRuntime({ action: "status" });
     else if (command === "context.refresh") result = await contextBroker.refresh({ reason: payload.reason || "command" });
     else if (command === "context.search") result = contextBroker.search(payload.query || "");
@@ -2093,6 +2500,11 @@ async function runAgentCommand(action, payload = {}) {
       if (payload.__fromAgentAction && !approvedPlanAction) throw new Error("Applying a coding edit requires an approved Hemlock plan action.");
       result = codingWorkspace.apply({ threadId: payload.threadId || agentTask.threadId, source: payload.source, patches: payload.patches, baseDigests: payload.baseDigests, reason: payload.reason || agentTask.objective });
       updateAgentTask({ evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(result.evidenceRefs || [])])], foregroundStep: "Scoped coding edit applied; verification is next" });
+      // Conversational Build flow: surface post-apply verification in Chat.
+      // The coding repair autopilot runs its own verify loop, so stay out of
+      // its way. Fire-and-forget: apply's result must not block on a long
+      // verification run.
+      if (!String(payload.__agentActionId || "").startsWith("code-repair")) void runPostApplyVerification(result);
     }
     else if (command === "code.rollback") result = codingWorkspace.rollback({ threadId: payload.threadId || agentTask.threadId, changeSetId: payload.changeSetId });
     else if (command === "git.status") result = await gitStatusTool(payload);
@@ -2152,6 +2564,7 @@ async function runAgentCommand(action, payload = {}) {
     }
     else if (command === "change.approve") result = await transitionChangeSet(payload, "approve");
     else if (command === "change.reject") result = await transitionChangeSet(payload, "reject");
+    else if (command === "changeset.apply") result = await changesetApplier.apply({ ...payload, threadWorkspaceRoot: agentTask.workspaceRoot || null });
     else if (command === "candidate.create") {
       const candidate = agentKernel.createCandidate(payload);
       appendAgentEvent("candidate.created", "candidate", { candidate }, { evidenceRefs: candidate.sourceRefs || [], reversible: true });
@@ -2168,14 +2581,46 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "dream") result = await runDream(payload);
     else if (command === "selfloop" || command.startsWith("selfloop.")) result = await runSipsRuntime({ action: "selfloop", selfloopAction: command.startsWith("selfloop.") ? command.split(".")[1] : payload.selfloopAction, focus: payload.focus, outcome: payload.outcome, receiptPath: payload.receiptPath });
     else if (command === "remember") result = await recordAgentMemory(payload);
+    else if (command === "memory.feedback") {
+      // T6-M1b: recall usefulness feedback. The ledger append is additive in
+      // sips_runtime.py (sidecar feedback.jsonl); the demote policy reuses
+      // memory_fitness.shouldAutoDemote and the EXISTING demote transition
+      // (with its rollback receipt) — no new demote path is invented here.
+      result = await runSipsRuntime({ action: "memory-feedback", recordId: payload.recordId, kind: payload.kind, query: payload.query });
+      const counts = { useful: Math.max(0, Math.floor(Number(result?.counts?.useful))) || 0, irrelevant: Math.max(0, Math.floor(Number(result?.counts?.irrelevant))) || 0 };
+      const autoDemote = String(result?.recordStatus || "") === "active" && shouldAutoDemote(counts);
+      if (autoDemote) {
+        const demoted = await runSipsRuntime({ action: "memory-transition", transition: "demote", targetId: payload.recordId, note: payload.note || `Auto-demoted after ${counts.irrelevant} not-relevant recall votes vs ${counts.useful} useful votes.`, evidencePath: sessionEventsPath, provenance: "Hemlock recall usefulness auto-demote" });
+        appendAgentEvent("memory.demote", "recorded", { targetId: payload.recordId, reason: "recall-feedback-auto-demote", record: demoted.record }, { evidenceRefs: [demoted.memoryPath], reversible: true });
+      }
+      result = { ...result, autoDemoted: autoDemote };
+      appendAgentEvent("memory.feedback", "recorded", { recordId: payload.recordId, kind: payload.kind, query: payload.query || "", counts, autoDemoted: autoDemote }, { evidenceRefs: [result.feedbackPath], reversible: true });
+    }
     else if (command.startsWith("memory.")) {
       result = await runSipsRuntime({ action: "memory-transition", transition: command.split(".")[1], targetId: payload.targetId, note: payload.note, evidencePath: sessionEventsPath, provenance: `Hemlock memory command ${command}` });
       appendAgentEvent(`memory.${command.split(".")[1]}`, "recorded", { targetId: payload.targetId, record: result.record }, { evidenceRefs: [result.memoryPath], reversible: true });
     }
     else if (command === "plan.propose") result = agentOrchestrator.proposePlan(agentTask, payload);
-    else if (command === "plan.approve") result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
+    else if (command === "plan.approve") {
+      // T7-S3: clamp user-granted budget overrides and pin them on the task (mergeBudget semantics) before approval resumes it.
+      const overrides = clampBudgetOverrides(payload.budgetOverrides);
+      if (Object.keys(overrides).length) agentOrchestrator.updateTask({ budget: mergeBudget({ ...agentOrchestrator.task().budget, ...overrides }) });
+      result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
+    }
     else if (command === "plan.reject") result = agentOrchestrator.rejectPlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""), String(payload.reason || "Rejected by user"));
     else if (command === "task.resume") result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
+    else if (command === "task.answer") {
+      // T7-S1: answer-in-place. The user's reply is persisted exactly like any
+      // other user message so thread history stays consistent, the pending
+      // question is cleared from the projection, and the task resumes through
+      // the normal resumeTask path.
+      const gate = assertAnswerable(agentTask, payload.answer);
+      if (!gate.ok) throw new Error(gate.reason);
+      threadManager.appendConversation(agentTask.threadId, { role: "user", content: gate.text });
+      updateAgentTask({ question: null, foregroundStep: `Answer received; resuming with your reply` });
+      appendAgentEvent("task.answered", "passed", { taskId: agentTask.id, chars: gate.text.length }, { reversible: true });
+      result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
+    }
     else if (command === "action.accept") result = await agentOrchestrator.acceptAction(String(payload.taskId || agentTask.id), String(payload.actionId || agentTask.activeActionId || ""));
     else if (command === "action.reject") result = agentOrchestrator.rejectAction(String(payload.taskId || agentTask.id), String(payload.actionId || agentTask.activeActionId || ""), String(payload.reason || "Rejected by user"));
     else if (command === "task.ask") result = agentOrchestrator.askUser(String(payload.taskId || agentTask.id), String(payload.question || payload.prompt || ""), payload.context || {});
@@ -2255,7 +2700,7 @@ async function inferStructuredAction(prompt) {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify({
-      model: "default_model",
+      model: resolveLocalModelPath(selection.model),
       messages,
       temperature: 0,
       top_p: 1,
@@ -2265,6 +2710,7 @@ async function inferStructuredAction(prompt) {
       // done; mapleMaxTokens is only the transport/server ceiling.
       max_tokens: mapleMaxTokens,
       stream: true,
+      stream_options: { include_usage: true },
       response_format: { type: "json_object" },
       chat_template_kwargs: { enable_thinking: true },
     }),
@@ -2361,6 +2807,8 @@ async function inferStructuredAction(prompt) {
       finishReason: payload.choices?.[0]?.finish_reason || null,
       promptTokens: payload.usage?.prompt_tokens ?? null,
       completionTokens: payload.usage?.completion_tokens ?? null,
+      cachedTokens: payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? null,
+      cacheHitRatio: cacheStats({ promptTokens: payload.usage?.prompt_tokens ?? null, cachedTokens: payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? null }).hitRatio,
       tokensPerSecond: tokensPerSecond(payload.usage, Date.now() - startedAt),
       outputDigest: digestText(content),
       modelChannels: channels.map((channel) => ({ name: channel.name, digest: digestText(channel.text) })),
@@ -2566,6 +3014,33 @@ async function runVerification(profileId, emit = null, options = {}) {
   }
 }
 
+// Conversational Build flow (T6-V1): after an approved code.apply lands a
+// change set, run the matched allowlisted verification profile ONCE and pin
+// the result on the task so Chat can render a VERIFICATION card. Only
+// allowlisted profiles can run; with no match we record an honest skip.
+async function runPostApplyVerification(changeSet) {
+  const changeSetId = String(changeSet?.id || "");
+  if (changeSetId && agentTask.verification?.status !== "skipped" && agentTask.verification?.schema === "hemlock.agent.verification.v1" && agentTask.verification?.changeSetId === changeSetId) return;
+  const appliedPaths = (Array.isArray(changeSet?.files) ? changeSet.files : []).map((file) => file?.path).filter(Boolean);
+  const profiles = Object.fromEntries(Object.entries(verificationProfiles).map(([id, profile]) => [id, { label: profile.label, command: profile.command, timeoutMs: profile.timeoutMs }]));
+  const choice = chooseVerificationProfile(profiles, appliedPaths);
+  if (!choice) {
+    updateAgentTask({ verification: skippedVerification("no matching profile") });
+    appendAgentEvent("verification.ran", "skipped", { reason: "no matching profile", changeSetId }, { reversible: true });
+    return;
+  }
+  const startedAt = Date.now();
+  try {
+    const receipt = await runVerification(choice.id, null, { workspaceRoot: agentTask.workspaceRoot });
+    const summary = verificationSummary({ choice, receipt, durationMs: Date.now() - startedAt, changeSetId });
+    updateAgentTask({ verification: summary, evidenceRefs: [...new Set([...(agentTask.evidenceRefs || []), ...(receipt.evidenceRefs || [])])] });
+    appendAgentEvent("verification.ran", summary.status, { verification: summary }, { reversible: true, evidenceRefs: receipt.evidenceRefs || [] });
+  } catch (error) {
+    updateAgentTask({ verification: { schema: "hemlock.agent.verification.v1", status: "failed", reason: error.message, ranAt: new Date().toISOString() } });
+    appendAgentEvent("verification.ran", "failed", { error: error.message, changeSetId }, { reversible: true });
+  }
+}
+
 async function repoMap(payload = {}) {
   const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
   const [branch, status, files] = await Promise.all([
@@ -2615,10 +3090,34 @@ async function codingInference(prompt, adapterPath = "") {
   return { content: String(choice.message.content || "").trim(), reasoning: String(choice.message.reasoning || "").trim(), usage: payload.usage || null };
 }
 
-function startServer(adapterPath = "") {
+async function startServer(adapterPath = "") {
   if (serverProcess && !serverProcess.killed) return;
-  if (!fs.existsSync(modelPath)) {
-    throw new Error(`Maple-Preview model was not found at ${modelPath}. Set HEMLOCK_MODEL_PATH to a local MLX model directory.`);
+  // T9-H1: validate the checkpoint BEFORE spawning so a bad selection fails
+  // with a fixable message instead of a server-side 404 after boot.
+  const checkpointProblem = mlxCheckpointProblem(modelPath);
+  if (checkpointProblem) {
+    throw new Error(`Model at ${modelPath} is not a valid MLX checkpoint (missing ${checkpointProblem}). Open Settings → Model to fix.`);
+  }
+  // Adopt an already-running Maple server instead of colliding with it. A
+  // leftover server from a prior launch, a crashed process, or an external
+  // test can hold 127.0.0.1:8080; spawning our own would then fail with
+  // EADDRINUSE and surface to the user as a misleading "Failed to fetch"
+  // transport error. If a healthy server already answers on the port, reuse
+  // it so chat works without a restart.
+  try {
+    const probe = await fetchWithTimeout(`${serverUrl}/health`, {}, 1500);
+    if (probe.ok) {
+      serverState = { processReady: true, inferenceReady: false, adapterPath };
+      console.log(`[hemlock] adopted existing Maple-Preview server on ${serverUrl}`);
+      // Health already answered OK above; mark the process ready so the UI
+      // heartbeat reflects reality instead of showing DOWN until the first
+      // inference completes.
+      serverState = { processReady: true, inferenceReady: false, adapterPath };
+      appendAgentEvent("maple.server.ready", "passed", { adopted: true, processReady: true, inferenceReady: false }, { reversible: true });
+      return;
+    }
+  } catch {
+    // No server answering yet; fall through and spawn our own.
   }
   const args = [...serverArgs];
   if (adapterPath) args.push("--adapter-path", adapterPath);
@@ -2649,9 +3148,24 @@ function startServer(adapterPath = "") {
     if (serverProcess === child) {
       if (!serverState.processReady) serverProcessError = { message: `Maple server exited before readiness (code=${code ?? "-"}, signal=${signal ?? "-"}).`, code, signal };
       serverProcess = null;
-      serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
+      serverState = child.mapleStopRequested === true
+        ? { processReady: false, inferenceReady: false, adapterPath: "" }
+        : handleUnexpectedMapleExit();
     }
   });
+}
+
+// Unexpected maple death (not our own stopServer path — e.g. MLX Metal
+// GPU-timeout SIGABRT): record the crash against a bounded budget. Under
+// budget, fall through to the normal lazy respawn (ensure/restart on next
+// use). Over budget, stop respawning and surface an honest degraded state.
+function handleUnexpectedMapleExit() {
+  mapleCrashTimestamps = recordCrash(mapleCrashTimestamps, Date.now());
+  const verdict = shouldRespawn({ crashTimestamps: mapleCrashTimestamps });
+  if (verdict.respawn) return { processReady: false, inferenceReady: false, adapterPath: "" };
+  serverState = { processReady: false, inferenceReady: false, adapterPath: "", crashLooped: true, crashLoopReason: verdict.reason };
+  appendAgentEvent("maple.crashloop.detected", "blocked", { reason: verdict.reason, crashes: mapleCrashTimestamps.length }, { reversible: true });
+  return serverState;
 }
 
 function stopServer() {
@@ -2662,6 +3176,9 @@ function stopServer() {
       return;
     }
     const child = serverProcess;
+    // Mark OUR termination intent on the child itself so its exit handler can
+    // tell a deliberate stop from a real crash (SIGABRT/SIGKILL from MLX).
+    child.mapleStopRequested = true;
     const timeout = setTimeout(() => {
       if (!child.killed) child.kill("SIGKILL");
       serverProcess = null;
@@ -2679,7 +3196,14 @@ function stopServer() {
 async function waitForServer(timeoutMs = 180000, { preserveInference = false } = {}) {
   const startedAt = Date.now();
   let lastError = null;
-  while (Date.now() - startedAt < timeoutMs) {
+  let attempt = 0;
+  const loggedReasons = new Set();
+  // T9-H1(d): exit during readiness wakes the poll sleep and throws at once.
+  const exited = new Promise((resolve) => {
+    if (!serverProcess || serverProcess.killed) return resolve(serverProcessError || { code: null, signal: null });
+    serverProcess.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  while (true) {
     if (serverProcessError) {
       const error = new Error(`The local Maple-Preview server failed before becoming ready: ${serverProcessError.message}`);
       Object.assign(error, serverProcessError);
@@ -2691,27 +3215,58 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
     try {
       const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
       if (response.ok) {
+        const wasReady = serverState.processReady === true;
         serverState = { ...serverState, processReady: true, inferenceReady: preserveInference ? serverState.inferenceReady === true : false };
+        if (!wasReady) appendAgentEvent("maple.server.ready", "passed", { processReady: true, inferenceReady: serverState.inferenceReady === true }, { reversible: true });
         return { processReady: true, inferenceReady: serverState.inferenceReady };
       }
       lastError = new Error(`Maple-Preview health returned HTTP ${response.status}`);
+      lastError.status = response.status;
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(50, timeoutMs - (Date.now() - startedAt)))));
+    // T9-H1(b): log each distinct failure reason once, not per-poll spam.
+    const classification = classifyHealthFailure(lastError);
+    if (!loggedReasons.has(classification)) {
+      loggedReasons.add(classification);
+      console.log(`[hemlock] Maple health check waiting: ${classification} (${lastError?.message || "unknown"})`);
+    }
+    // T9-H1(a): capped exponential backoff via the pure helper.
+    const step = nextReadinessDelay({ attempt: attempt++, startedAt, timeoutMs });
+    if (step.done) break;
+    await Promise.race([
+      new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt))))),
+      exited,
+    ]);
   }
-  throw new Error(`The local Maple-Preview server process did not become ready: ${lastError?.message || "timeout"}.`);
+  // T9-H1(c): the deadline error names the last failure classification.
+  throw new Error(`The local Maple-Preview server process did not become ready (last: ${classifyHealthFailure(lastError)}): ${lastError?.message || "timeout"}.`);
 }
 
-async function launchMapleRuntime() {
+async function launchMapleRuntime({ resetCrashLoop = false } = {}) {
   if (serverLaunchPromise) return serverLaunchPromise;
+  // A user-initiated maple.launch clears the crash-loop degraded state and
+  // resets the budget — a human explicitly decided to try again. Auto-recovery
+  // (restartMapleRuntime) deliberately does NOT pass this flag so crashes keep
+  // accumulating toward the loop verdict.
+  if (resetCrashLoop) {
+    mapleCrashTimestamps = [];
+    const { crashLooped: _clearedLooped, crashLoopReason: _clearedReason, ...rest } = serverState;
+    serverState = rest;
+  }
   serverLaunchPromise = (async () => {
     const startedAt = Date.now();
     try {
-      if (!serverProcess || serverProcess.killed) startServer();
+      if (!serverProcess || serverProcess.killed) await startServer();
       await waitForServer(readinessTimeoutMs, { preserveInference: true });
       const result = createMapleLaunchResult({ server: serverState, startedAt });
       appendAgentEvent("maple.launch.completed", "passed", result, { reversible: true });
+      // Background GPU warmup: fire a 1-token inference probe to compile
+      // Metal shaders before the first user message arrives. This makes the
+      // first real inference ~2-5s faster. The probe is best-effort — if it
+      // fails (e.g. the server is loading safetensors), the user's first
+      // inference pays the normal compile cost.
+      probeInference("").catch(() => { /* warmup is best-effort */ });
       return result;
     } catch (error) {
       serverState = { ...serverState, processReady: false, inferenceReady: false };
@@ -2740,6 +3295,15 @@ async function ensureMapleRuntime() {
 }
 
 async function restartMapleRuntime(reason = "Maple runtime recovery requested.") {
+  // Bounded auto-respawn gate: once the crash budget is spent, refuse to
+  // relaunch (a poison prompt would otherwise thrash forever) and keep the
+  // degraded state visible instead.
+  const crashVerdict = shouldRespawn({ crashTimestamps: mapleCrashTimestamps });
+  if (!crashVerdict.respawn) {
+    serverState = { processReady: false, inferenceReady: false, adapterPath: "", crashLooped: true, crashLoopReason: crashVerdict.reason };
+    appendAgentEvent("maple.crashloop.detected", "blocked", { reason: crashVerdict.reason, crashes: mapleCrashTimestamps.length }, { reversible: true });
+    return createMapleLaunchResult({ server: serverState });
+  }
   appendAgentEvent("maple.runtime.restarting", "running", { reason, cachePolicy: { size: maplePromptCacheSize, bytes: maplePromptCacheBytes, promptConcurrency: maplePromptConcurrency, decodeConcurrency: mapleDecodeConcurrency } }, { reversible: true });
   await stopServer();
   serverProcessError = null;
@@ -2753,7 +3317,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    // undici's default bodyTimeout (300s) aborts a response that sends no
+    // data within 5 minutes — but a local model prefilling under memory
+    // pressure can legitimately exceed that before its first SSE token.
+    // Our AbortController (timeoutMs, default 600s) is the real watchdog;
+    // disable undici's per-read timeouts for these long local streams.
+    let dispatcher;
+    try {
+      const { Agent } = require("undici");
+      dispatcher = new Agent({ bodyTimeout: 0, headersTimeout: Math.max(timeoutMs, 600000) });
+    } catch {
+      dispatcher = undefined;
+    }
+    return await fetch(url, { ...options, signal: controller.signal, ...(dispatcher ? { dispatcher } : {}) });
   } finally {
     clearTimeout(timer);
   }
@@ -2822,6 +3398,7 @@ async function probeInference(adapterPath = "") {
 async function waitForInference(adapterPath = "", timeoutMs = inferenceProbeTimeoutMs) {
   const startedAt = Date.now();
   let lastError = null;
+  let attempt = 0;
   while (Date.now() - startedAt < timeoutMs) {
     try {
       return await probeInference(adapterPath);
@@ -2831,15 +3408,17 @@ async function waitForInference(adapterPath = "", timeoutMs = inferenceProbeTime
       // repair the adapter and would only keep the UI looking busy.
       if (adapterPath && error.status >= 400) throw error;
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(1000, Math.max(50, timeoutMs - (Date.now() - startedAt)))));
+    const step = nextReadinessDelay({ attempt: attempt++, startedAt, timeoutMs }); // T9-H1(a)
+    if (step.done) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt)))));
   }
-  throw new Error(`Maple-Preview inference did not become ready: ${lastError?.message || "timeout"}.`);
+  throw new Error(`Maple-Preview inference did not become ready (last: ${classifyHealthFailure(lastError)}): ${lastError?.message || "timeout"}.`);
 }
 
 async function recoverBaseServer() {
   emitDreamProgress({ stage: "recovering Maple-Preview base server", progress: 96, elapsed: 0, log: "existing adapters and base weights are preserved" });
   await stopServer();
-  startServer();
+  await startServer();
   let processReady = false;
   let inferenceReady = false;
   let error = null;
@@ -2861,7 +3440,7 @@ function recoveryDescription(recovery) {
   return `Base Maple-Preview recovery: server process ${process}; inference ${inference}${detail}. Existing adapter files and base weights were preserved.`;
 }
 
-function runDream(payload) {
+async function runDream(payload) {
   if (dreamProcess) throw new Error("A Dream run is already in progress.");
   if (!fs.existsSync(modelPath)) {
     throw new Error(`Dream cannot start because the Maple-Preview model was not found at ${modelPath}. Set HEMLOCK_MODEL_PATH to a local MLX model directory.`);
@@ -2896,6 +3475,16 @@ function runDream(payload) {
     datasetRows: input.examples.length + input.facts.length + input.conversation.length,
     baseModel: modelPath,
   });
+  // Work-notification boundary (a): standalone Dream runs announce completion.
+  // When this run is nested inside a SIPS cycle (sipsCycleActive), it stays
+  // silent here — the enclosing SIPS cycle emits the single user-facing
+  // notification, so the user gets one ping per long job, not two.
+  const dreamJobId = `dream:${runId}`;
+  const dreamNotifies = !sipsCycleActive;
+  if (dreamNotifies) workNotifier.onJobStarted(dreamJobId, "Dream training");
+  const notifyDreamFinished = (ok, detail) => {
+    if (dreamNotifies) workNotifier.onJobFinished(dreamJobId, { ok, detail });
+  };
   return new Promise((resolve, reject) => {
     emitDreamProgress({ stage: "stopping Maple-Preview server before local training", progress: 4, elapsed: 0, log: "" });
     stopServer().then(() => {
@@ -2942,6 +3531,7 @@ function runDream(payload) {
         const recovery = await recoverBaseServer();
         settled = true;
         appendAgentEvent("dream.failed", "failed", { runId, runDir, error: message, recovery: { processReady: recovery.processReady, inferenceReady: recovery.inferenceReady, error: recovery.error?.message || null } }, { evidenceRefs: [runDir], reversible: true });
+        notifyDreamFinished(false, message);
         reject(new Error(`${message} ${recoveryDescription(recovery)}`));
       };
       dreamProcess.stdout.on("data", (chunk) => consume(chunk));
@@ -2967,7 +3557,11 @@ function runDream(payload) {
           }
           const adapterPath = reportedAdapterPath || path.join(runDir, "adapters");
           emitDreamProgress({ stage: "local adapter saved — checking server process readiness", progress: 94, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "" });
-          startServer();
+          // startServer() adopts an existing server or spawns one; the
+          // waitForServer().then() below owns readiness detection, so this
+          // call is intentionally fire-and-forget (it lives inside a
+          // non-async 'exit' event handler).
+          void startServer();
           waitForServer(readinessTimeoutMs).then(async (processStatus) => {
             emitDreamProgress({ stage: "server process ready — verifying adapter inference", progress: 95, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "HTTP liveness is not an inference result", serverProcessReady: processStatus.processReady, inferenceReady: false });
             try {
@@ -2976,6 +3570,7 @@ function runDream(payload) {
               settled = true;
               const result = { adapterPath, runDir, elapsed: Math.round((Date.now() - startedAt) / 1000), processReady: processStatus.processReady, inferenceReady: inferenceStatus.inferenceReady, trainingReceipt, trainingReceiptPath };
               appendAgentEvent("dream.completed", "passed", { runId, ...result, baseWeightsUnchanged: trainingReceipt.baseWeightsUnchanged === true }, { evidenceRefs: [trainingReceiptPath || runDir], reversible: false });
+              notifyDreamFinished(true, adapterPath);
               resolve(result);
             } catch (adapterError) {
               await rejectWithRecovery(`Dream adapter was saved at ${adapterPath}, but its local inference probe failed: ${adapterError.message}.`);
@@ -2997,7 +3592,7 @@ async function ensureBaseInference() {
     return;
   } catch {
     await stopServer();
-    startServer();
+    await startServer();
     await waitForServer(readinessTimeoutMs);
     await waitForInference("", inferenceProbeTimeoutMs);
   }
@@ -3022,6 +3617,13 @@ async function runSipsCycle(payload) {
   sipsCycleActive = true;
   fs.mkdirSync(runDir, { recursive: true });
   appendAgentEvent("sips.cycle.started", "running", { runId, objective, verifyProfile: profileId, trainingProfile, datasetExamples: examples.length, runDir });
+  // Work-notification boundary (b): the SIPS cycle is the single user-facing
+  // job for this whole pipeline (baseline → dataset → nested Dream run →
+  // comparison), so only the cycle itself notifies; the nested runDream() call
+  // suppresses its own notification while sipsCycleActive is true.
+  const sipsJobId = `sips:${runId}`;
+  workNotifier.onJobStarted(sipsJobId, `SIPS cycle · ${objective.slice(0, 60)}`);
+
   let baselineVerification = null;
   let finalVerification = null;
   let baselineModel = null;
@@ -3094,6 +3696,11 @@ async function runSipsCycle(payload) {
     }
     emitSipsProgress({ stage: receipt.status === "candidate-ready" ? "SIPS cycle complete · candidate ready for review" : "SIPS cycle complete · verification blocked", progress: 100, elapsed: receipt.elapsed, log: receiptPath, receiptPath, status: receipt.status });
     appendAgentEvent("sips.cycle.completed", receipt.status === "candidate-ready" ? "passed" : "blocked", { runId, receipt, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+    // A blocked cycle (verification failed) is not a success for the user.
+    workNotifier.onJobFinished(sipsJobId, {
+      ok: receipt.status === "candidate-ready",
+      detail: receipt.status === "candidate-ready" ? `receipt ${receiptPath}` : `verification blocked · receipt ${receiptPath}`,
+    });
     return { ...receipt, receiptPath };
   } catch (error) {
     const receipt = {
@@ -3116,9 +3723,90 @@ async function runSipsCycle(payload) {
     }
     emitSipsProgress({ stage: "SIPS cycle failed", progress: 100, elapsed: receipt.elapsed, log: error.message, receiptPath, status: "failed" });
     appendAgentEvent("sips.cycle.failed", "failed", { runId, error: error.message, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+    workNotifier.onJobFinished(sipsJobId, { ok: false, detail: error.message });
     throw error;
   } finally {
     sipsCycleActive = false;
+  }
+}
+
+// --- Host UX (Lane B): confirm dialog, notifications, window inventory ------
+//
+// Pure helpers below are exported at the bottom of this file so node:test
+// files can exercise them without launching Electron.
+
+const NOTIFICATION_TITLE_MAX_LENGTH = 80;
+const NOTIFICATION_BODY_MAX_LENGTH = 240;
+// The renderer owns workspace window state: it persists it to localStorage
+// under WINDOWS_KEY ("hemlock-os-windows-v2") in src/main.jsx, and the
+// "agent:windows" handler above already documents that boundary as
+// "renderer-owned". The main process keeps no authoritative copy of that
+// state, so the simplest honest path for windows:list is a read-only pull:
+// executeJavaScript reads the renderer's persisted snapshot and this module
+// normalizes it into {windowId,label,state,zOrder} rows. Nothing is written
+// back; the renderer remains the source of truth.
+const WINDOWS_STORAGE_KEY = "hemlock-os-windows-v2";
+const WINDOW_LABELS = {
+  center: "Command Center",
+  chat: "Chat / Code",
+  artifact: "Artifact Studio",
+  activity: "Activity",
+  receipts: "Receipts",
+  sips: "SIPS Control",
+  memory: "Memory Garden",
+  dream: "Dream Lab",
+  map: "Project Map",
+  settings: "Settings",
+};
+
+function clampNotificationText(value, maxLength) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function mapConfirmChoice(response) {
+  // dialog.showMessageBox resolves with the chosen button index; index 0 is
+  // the confirm button, anything else (cancel/Escape/closed) is a rejection.
+  return response === 0;
+}
+
+function parseWindowListSnapshot(raw) {
+  let source;
+  try {
+    source = JSON.parse(String(raw ?? ""));
+  } catch {
+    return [];
+  }
+  const entries = Array.isArray(source)
+    ? source.map((item) => [item?.windowId, item])
+    : Object.entries(source && typeof source === "object" ? source : []);
+  const windows = [];
+  for (const [key, item] of entries) {
+    if (!item || typeof item !== "object") continue;
+    const windowId = String(item.windowId || key || "");
+    if (!windowId) continue;
+    const state = ["normal", "minimized", "maximized"].includes(item.state) ? item.state : "closed";
+    if (state === "closed") continue; // closed windows are excluded by contract
+    windows.push({
+      windowId,
+      label: WINDOW_LABELS[windowId] || windowId,
+      state,
+      zOrder: Math.max(0, Math.floor(Number(item.zOrder)) || 0),
+    });
+  }
+  return windows.sort((a, b) => a.zOrder - b.zOrder || a.windowId.localeCompare(b.windowId));
+}
+
+async function readWorkspaceWindowList(contents) {
+  const empty = { schema: "hemlock.window.list.v1", source: "unavailable", windows: [] };
+  if (!contents || typeof contents.executeJavaScript !== "function" || contents.isDestroyed?.()) {
+    return { ...empty, error: "No renderer window is available to read workspace window state from." };
+  }
+  try {
+    const raw = await contents.executeJavaScript(`localStorage.getItem(${JSON.stringify(WINDOWS_STORAGE_KEY)})`, true);
+    return { schema: "hemlock.window.list.v1", source: "renderer-localstorage", windows: parseWindowListSnapshot(raw) };
+  } catch (error) {
+    return { ...empty, error: `Unable to read workspace window state: ${error.message}` };
   }
 }
 
@@ -3126,6 +3814,88 @@ ipcMain.handle("providers:status", () => inspectProviders());
 ipcMain.handle("providers:login", (_event, provider) => openProviderLogin(String(provider || ""), "login"));
 ipcMain.handle("providers:logout", (_event, provider) => openProviderLogin(String(provider || ""), "logout"));
 ipcMain.handle("maple:launch", () => runAgentCommand("maple.launch"));
+ipcMain.handle("dialog:pick-directory", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Choose a project directory for the new thread",
+    properties: ["openDirectory", "createDirectory"],
+    buttonLabel: "Use this folder",
+  });
+  if (result.canceled || !result.filePaths?.length) return { canceled: true };
+  return { canceled: false, path: result.filePaths[0] };
+});
+ipcMain.handle("dialog:confirm", async (_event, options = {}) => {
+  const message = typeof options?.message === "string" ? options.message.trim() : "";
+  if (!message) throw new Error("dialog:confirm requires a non-empty message string.");
+  const tone = options.tone === "danger" ? "danger" : "default";
+  const confirmLabel = typeof options.confirmLabel === "string" && options.confirmLabel.trim() ? options.confirmLabel.trim() : tone === "danger" ? "Destroy" : "Confirm";
+  const cancelLabel = typeof options.cancelLabel === "string" && options.cancelLabel.trim() ? options.cancelLabel.trim() : "Cancel";
+  try {
+    const { response } = await dialog.showMessageBox({
+      type: tone === "danger" ? "warning" : "question",
+      message,
+      ...(typeof options.detail === "string" && options.detail.trim() ? { detail: options.detail.trim() } : {}),
+      buttons: [confirmLabel, cancelLabel],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    return mapConfirmChoice(response);
+  } catch (error) {
+    throw new Error(`dialog:confirm failed: ${error.message}`);
+  }
+});
+// Shared routine behind both the renderer-facing "notification:show" IPC
+// channel and main-process work notifications, so every OS notification in the
+// app goes through one validation + clamping path.
+function showHostNotification(payload = {}) {
+  try {
+    const title = clampNotificationText(payload?.title, NOTIFICATION_TITLE_MAX_LENGTH);
+    const body = clampNotificationText(payload?.body, NOTIFICATION_BODY_MAX_LENGTH);
+    if (!title) throw new Error("notification:show requires a non-empty title string (max 80 characters).");
+    const notificationOptions = { title, body };
+    // Electron stamps the host app name/icon onto notifications from the app
+    // bundle; make the app name explicit on macOS via the subtitle slot.
+    if (process.platform === "darwin") notificationOptions.subtitle = app.name || "Hemlock";
+    new Notification(notificationOptions).show();
+    return { shown: true };
+  } catch (error) {
+    return { shown: false, error: error.message };
+  }
+}
+
+ipcMain.handle("notification:show", (_event, payload = {}) => showHostNotification(payload));
+
+// --- Work notifications (Lane B): long-running local jobs announce completion
+//
+// The main process spawns and supervises Dream training and SIPS cycles, so it
+// is the legitimate observer of their lifecycle. The notifier below queues job
+// starts and only fires an OS notification when the job ran at least the
+// configured threshold (default 30s) — short jobs stay silent.
+//
+// FOCUS GUARD: the simplest honest version of "don't ping someone who is
+// already watching" — if the main Hemlock window is focused, the completion is
+// visible in the UI and the OS notification is skipped entirely. There is no
+// renderer flag involved: this is a main-process-only check on
+// mainWindow.isFocused(), so it needs no renderer cooperation and can never go
+// stale. (A richer "renderer says the user is watching the Dream/SIPS pane"
+// signal would require renderer changes, which are out of scope here.)
+const workNotifier = createWorkNotifier({
+  notify: (payload) => {
+    if (mainWindow && typeof mainWindow.isFocused === "function" && mainWindow.isFocused()) {
+      return { shown: false, skipped: "window-focused" };
+    }
+    return showHostNotification(payload);
+  },
+  config: {
+    thresholdMs: Number(process.env.HEMLOCK_WORK_NOTIFY_THRESHOLD_MS) > 0
+      ? Number(process.env.HEMLOCK_WORK_NOTIFY_THRESHOLD_MS)
+      : undefined, // undefined falls back to the module default (30s)
+  },
+});
+
+// See the Host UX comment block above for why this reads renderer-owned
+// localStorage state instead of a main-process window registry.
+ipcMain.handle("windows:list", () => readWorkspaceWindowList(mainWindow?.webContents));
 ipcMain.handle("agent:state", () => getAgentState());
 ipcMain.handle("agent:intent", (_event, payload = {}) => runAgentCommand("intent.submit", payload));
 ipcMain.handle("agent:threads", (_event, payload = {}) => {
@@ -3199,7 +3969,34 @@ ipcMain.handle("agent:cancel", (_event, taskId) => {
   appendAgentEvent("task.updated", "cancelled", { reason: "cancel requested by user" }, { reversible: true });
   updateAgentTask({ status: "cancelled", phase: "stopped", foregroundStep: "Stopped by user", blockedReason: null });
   appendAgentEvent("operation.cancelled", "cancelled", { taskId: agentTask.id, operationIds: cancelledOperations }, { reversible: true });
-  return getAgentState();
+  try {
+    // Electron structured-clones IPC returns; agent state can carry
+    // non-serializable values, which historically surfaced as
+    // "An object could not be cloned" on this channel (see Launch.log).
+    JSON.stringify(getAgentState());
+    return getAgentState();
+  } catch {
+    return { ok: true, taskId: String(taskId || agentTask.id), status: "cancelled", timestamp: new Date().toISOString() };
+  }
+});
+// Stream-only stop: abort in-flight model streams without cancelling the task,
+// killing dream/SIPS children, or tearing down operations. This is the
+// "stop this reply" affordance in Chat.
+ipcMain.handle("agent:stream-cancel", (_event, payload = {}) => {
+  const reason = "stopped by user";
+  let stopped = 0;
+  const requestedStreamId = payload.streamId ? String(payload.streamId) : null;
+  for (const stream of activeStreams.values()) {
+    if (stream.terminal) continue;
+    if (requestedStreamId && stream.streamId !== requestedStreamId) continue;
+    if (!requestedStreamId && stream.kind !== "model_text") continue;
+    stream.abortReason = reason;
+    stream.controller?.abort(reason);
+    finishStream(stream, { status: "cancelled", stopReason: "stopped_by_user" });
+    stopped += 1;
+  }
+  appendAgentEvent("inference.stopped", "cancelled", { stopped, streamId: requestedStreamId, scope: requestedStreamId ? "stream" : "model_text" }, { reversible: true });
+  return { stopped, state: getAgentState() };
 });
 ipcMain.handle("dream:start", (_event, payload) => runAgentCommand("dream", payload));
 ipcMain.handle("sips:cycle", (_event, payload) => runAgentCommand("cycle", payload));
@@ -3209,10 +4006,14 @@ ipcMain.handle("sips:command", async (_event, payload) => {
 });
 
 if (hasSingleInstanceLock) {
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     if (app.isPackaged || process.env.MAPLE_AUTOSTART_SERVER === "1") {
       try {
-        startServer();
+        await startServer();
+        // Adopted/spawned server: confirm readiness now so serverState is
+        // true before the renderer's first getState() hydration, and the
+        // maple.server.ready event lands in THIS session's journal.
+        await waitForServer(readinessTimeoutMs, { preserveInference: false });
       } catch (error) {
         serverProcessError = { message: error.message, code: error.code || null };
         console.error(`[maple-server] unable to launch: ${error.message}`);
@@ -3234,3 +4035,21 @@ app.on("before-quit", () => {
   if (dreamProcess && !dreamProcess.killed) dreamProcess.kill("SIGTERM");
   if (serverProcess && !serverProcess.killed) serverProcess.kill("SIGTERM");
 });
+
+// Test-only exports: pure Lane B host-UX helpers plus the constants they read.
+// Requiring this module in node:test is safe only with a mocked "electron"
+// module and HEMLOCK_DATA_DIR pointed at a temp directory; see
+// electron/host_ux_ipc.test.cjs for the harness that does exactly that.
+module.exports = {
+  WINDOWS_STORAGE_KEY,
+  NOTIFICATION_TITLE_MAX_LENGTH,
+  NOTIFICATION_BODY_MAX_LENGTH,
+  clampNotificationText,
+  mapConfirmChoice,
+  parseWindowListSnapshot,
+  readWorkspaceWindowList,
+  // Work-notification wiring (Lane B): exposed so node:test files can drive
+  // job boundaries without launching Electron.
+  showHostNotification,
+  workNotifier,
+};

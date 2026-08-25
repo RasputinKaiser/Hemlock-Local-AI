@@ -64,3 +64,78 @@ test("cancels a queued request without touching the active request", async () =>
   release[0]();
   await active;
 });
+
+test("steering while a request is mid-flight leaves the durable FIFO order untouched", async () => {
+  const calls = [];
+  let releaseActive;
+  const activeGate = new Promise((resolve) => { releaseActive = resolve; });
+  const task = { id: "task-active", status: "ready" };
+  const queue = new AgentIntentQueue({
+    getTask: () => task,
+    execute: async (payload) => {
+      task.status = "running";
+      calls.push(payload.text);
+      if (payload.text === "first") await activeGate;
+      return { status: "completed", answer: payload.text };
+    },
+    steer: async () => ({ content: "steered" }),
+    emit: () => {},
+  });
+
+  const active = queue.submit({ requestId: "req-first", text: "first" });
+  await tick();
+  await queue.submit({ requestId: "req-second", text: "second" });
+  await queue.submit({ requestId: "req-third", text: "third" });
+  const steering = await queue.submit({ requestId: "req-steer", text: "steer me instead", mode: "steer" });
+
+  assert.equal(steering.status, "steered");
+  // The steer payload must never enter the durable pending list, and the two
+  // queued entries keep their original positions.
+  let snapshot = queue.snapshot();
+  assert.equal(snapshot.pending.length, 2);
+  assert.deepEqual(snapshot.pending.map((entry) => entry.requestId), ["req-second", "req-third"]);
+  assert.deepEqual(snapshot.pending.map((entry) => entry.position), [1, 2]);
+  assert.equal(snapshot.pending.some((entry) => entry.requestId === "req-steer"), false);
+
+  releaseActive();
+  await active;
+  for (let attempt = 0; attempt < 20 && calls.length < 3; attempt += 1) await tick();
+  assert.deepEqual(calls, ["first", "second", "third"]);
+  snapshot = queue.snapshot();
+  assert.equal(snapshot.active, null);
+  assert.equal(snapshot.pending.length, 0);
+});
+
+test("rejects a duplicate queued objective without starting work or reordering the queue", async () => {
+  const calls = [];
+  let releaseActive;
+  const activeGate = new Promise((resolve) => { releaseActive = resolve; });
+  const task = { id: "task-active", status: "ready" };
+  const queue = new AgentIntentQueue({
+    getTask: () => task,
+    execute: async (payload) => {
+      task.status = "running";
+      calls.push(payload.text);
+      if (payload.text === "active") await activeGate;
+      return { status: "completed", answer: payload.text };
+    },
+    emit: () => {},
+  });
+
+  const active = queue.submit({ requestId: "req-active", text: "active" });
+  await tick();
+  const first = await queue.submit({ requestId: "req-original", text: "Summarize the Hemlock repo" });
+  assert.equal(first.status, "queued");
+
+  const duplicate = await queue.submit({ requestId: "req-duplicate", text: "  summarize the hemlock repo  " });
+  assert.equal(duplicate.status, "duplicate");
+  assert.equal(duplicate.requestId, "req-original");
+  assert.equal(duplicate.queueEntry.position, 1);
+  const snapshot = queue.snapshot();
+  assert.equal(snapshot.pending.length, 1);
+  assert.equal(snapshot.pending[0].requestId, "req-original");
+  assert.deepEqual(calls, ["active"]);
+
+  releaseActive();
+  await active;
+});
