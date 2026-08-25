@@ -1017,7 +1017,7 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
    the cascade regardless of source order — question card above plan dock. */
 .chat-surface > .chat-question-card { grid-column: 2; grid-row: 6; align-self: start; width: auto; max-height: min(40vh, 360px); margin: 8px 14px 0; z-index: 1; }
 .chat-surface.is-asking > .chat-question-card { grid-row: 6; }
-.chat-surface.is-asking > .chat-plan-card { grid-column: 2; grid-row: 7 !important; margin-top: 0; }
+.chat-surface.is-asking > .chat-plan-card { grid-column: 1; grid-row: 5; margin-top: 0; }
 .chat-surface.is-asking > .interaction-mode-bar { grid-column: 2; grid-row: 8 !important; }
 .chat-surface.is-asking > .chat-compose { grid-column: 2; grid-row: 9 !important; }
 .chat-host-rail { display: grid; gap: 6px; min-width: 0; max-height: min(15vh, 150px); margin: 0 14px 7px; overflow: auto; scrollbar-gutter: stable; }
@@ -1286,7 +1286,10 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-surface > .chat-scroll { grid-column: 1; grid-row: 4; min-width: 0; min-height: 0; width: auto; max-height: none; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 34px clamp(36px, 5vw, 72px) 28px; background: #fffefa; }
 .chat-surface > .chat-host-rail { grid-column: 2; grid-row: 3 / span 2; align-self: stretch; align-content: start; grid-auto-rows: max-content; width: auto; max-height: none; min-height: 0; margin: 0; padding: 10px 14px 7px; overflow: auto; border-left: 1px solid #d8e1d3; background: #f5f8f0; scrollbar-gutter: stable; }
 .chat-surface > .chat-evidence-rail { grid-column: 2; grid-row: 5; align-self: start; min-width: 0; margin: 7px 14px 0; }
-.chat-surface > .chat-plan-card { grid-column: 2; grid-row: 6; align-self: start; width: auto; max-height: min(50vh, 520px); margin: 8px 14px 7px; padding: 11px 12px; border-radius: 10px; box-shadow: 0 5px 16px rgba(47, 75, 54, .05); }
+/* Hotfix: the plan card owns grid row 5 in column 1 — directly BELOW the
+   transcript (row 4 shrinks to make room). It must never share a cell with
+   .chat-work-rail (col 2 / rows 3-8), which previously layered on top of it. */
+.chat-surface > .chat-plan-card { grid-column: 1; grid-row: 5; align-self: start; width: auto; min-width: 0; max-height: min(50vh, 520px); margin: 10px clamp(36px, 5vw, 72px) 12px; padding: 11px 12px; border-radius: 10px; box-shadow: 0 5px 16px rgba(47, 75, 54, .05); }
 .chat-surface > .interaction-mode-bar { grid-column: 2; grid-row: 7; width: auto; min-width: 0; margin: 0 14px 6px; padding: 0; }
 .chat-surface > .chat-compose { grid-column: 2; grid-row: 8; width: auto; min-width: 0; margin: 0 14px 14px; padding: 7px 7px 7px 11px; border-radius: 9px; box-shadow: 0 4px 13px rgba(47, 75, 54, .05); background: #fbfaf4; }
 .chat-compose textarea { min-height: 42px; max-height: 94px; font-size: 13px; }
@@ -1320,7 +1323,8 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .chat-live-stream-heading strong { font-size: 15px; }
 .chat-live-stream-body { max-height: 105px; margin: 6px 14px 8px; padding: 7px 9px; border-color: #d0e0ce; box-shadow: none; }
 .chat-live-channel pre { max-height: 90px; font-size: 11px; line-height: 1.45; }
-.chat-scroll > .chat-live-stream { margin: 0 0 22px; padding: 10px 0 14px; border: 0; border-bottom: 1px solid #cbdccc; border-radius: 0; box-shadow: none; background: transparent; }
+/* Live stream sits BELOW the transcript (reading order): separator above, not below. */
+.chat-scroll > .chat-live-stream { margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #cbdccc; border-radius: 0; box-shadow: none; background: transparent; }
 .chat-scroll > .chat-live-stream .chat-live-stream-heading { padding: 0; }
 .chat-scroll > .chat-live-stream .chat-live-stream-body { margin-right: 0; margin-left: 0; }
 .interaction-mode-bar small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

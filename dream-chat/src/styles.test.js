@@ -87,6 +87,22 @@ test("Chat keeps live model output visible and does not call stale evidence pass
   assert.match(mainSource, /chatPinnedRef\.current/);
 });
 
+test("Hotfix: live stream renders below the transcript and the plan card owns its own grid slot", () => {
+  // Reading-order invariant: streamed output follows sent messages, never precedes them.
+  const streamAt = mainSource.indexOf('{liveStreams.length > 0 && <section className="chat-live-stream"');
+  const transcriptAt = mainSource.indexOf("{messages.map((message, messageIndex) =>");
+  const jumpAt = mainSource.indexOf('className="chat-jump-latest"');
+  assert.ok(streamAt > -1 && transcriptAt > -1 && jumpAt > -1);
+  assert.ok(streamAt > transcriptAt && streamAt < jumpAt, "live stream must sit between messages.map and the jump-to-latest/thinking block");
+  assert.match(mainSource, /aria-label="Live model stream" aria-live="polite"/);
+  // Plan card occupies grid row 5 in column 1 (below the transcript) — it must
+  // never share column 2 rows 3-8 with .chat-work-rail again.
+  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*5;/s);
+  assert.doesNotMatch(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*2;/s);
+  // flushStreamedMessages only appends new streams at the end of the transcript.
+  assert.match(mainSource, /return \[\.\.\.current, \{ id: crypto\.randomUUID\(\), role: "assistant"/);
+});
+
 test("Displayed workspace paths redact the macOS home-directory identity", () => {
   assert.match(mainSource, /function redactUserPaths\(value\)/);
   assert.match(mainSource, /replace\(\/.*Users/);

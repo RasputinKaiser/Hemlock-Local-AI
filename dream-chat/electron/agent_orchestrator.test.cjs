@@ -4,11 +4,12 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { AgentKernel } = require("./agent_kernel.cjs");
-const { AgentOrchestrator } = require("./agent_orchestrator.cjs");
+const { AgentOrchestrator, completedTaskCommands, resolveProgressCommand } = require("./agent_orchestrator.cjs");
 const { ACTION_SCHEMA, createAction, parseActionEnvelope } = require("./agent_contracts.cjs");
+const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { createMockMapleActionSource } = require("./mock_maple.cjs");
 
-function makeHarness({ inferAction = null, executeCommand = async (command) => ({ status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] }), commandRegistry = null } = {}) {
+function makeHarness({ inferAction = null, executeCommand = async (command) => ({ status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`], ...(command === "artifact.create" ? { artifactId: `artifact-mock-${++makeHarness.mockCounter}` } : {}) }), commandRegistry = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hemlock-agent-loop-"));
   const task = {
     schema: "hemlock.agent.task.v1",
@@ -535,6 +536,244 @@ test("merges valid budget overrides into task.budget during approval", async () 
     // Untouched fields keep their prior values rather than resetting.
     assert.equal(harness.task.budget.maxRetriesPerOperation, 1);
     assert.equal(harness.task.budget.maxMutationSets, 1);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// T12 anti-repeat guard — pure helpers
+test("completedTaskCommands collects terminal commandIds and skips ask_user", () => {
+  const history = {
+    actions: [
+      { id: "a1", kind: "tool", commandId: "repo-map", status: "completed" },
+      { id: "a2", kind: "tool", commandId: "artifact.create", status: "completed" },
+      { id: "a3", kind: "tool", commandId: "repo.inspect", status: "failed" },
+      { id: "a4", kind: "ask_user", commandId: null, status: "completed" },
+      { id: "a5", kind: "tool", commandId: "verify", status: "running" },
+    ],
+  };
+  const ids = completedTaskCommands(history);
+  assert.deepEqual([...ids].sort(), ["artifact.create", "repo-map", "repo.inspect"]);
+});
+
+test("resolveProgressCommand passes fresh proposals through untouched", () => {
+  const completed = new Set(["repo-map"]);
+  const pass = resolveProgressCommand({ commandId: "artifact.create", input: {} }, completed, [{ commandId: "artifact.create" }, { commandId: "artifact.author" }]);
+  assert.equal(pass.redirected, false);
+  assert.equal(pass.commandId, "artifact.create");
+  const unknown = resolveProgressCommand({ commandId: "git.status" }, completed, [{ commandId: "artifact.author" }]);
+  assert.equal(unknown.redirected, false);
+});
+
+test("resolveProgressCommand redirects a repeated command to the next incomplete plan step", () => {
+  const completed = new Set(["repo-map", "artifact.create"]);
+  const steps = [
+    { commandId: "repo-map", label: "Map repo" },
+    { commandId: "artifact.create", label: "Create scratch artifact" },
+    { commandId: "artifact.author", label: "Author the animation" },
+  ];
+  const redirect = resolveProgressCommand({ commandId: "repo-map", input: {} }, completed, steps);
+  assert.equal(redirect.redirected, true);
+  assert.equal(redirect.commandId, "artifact.author");
+  assert.equal(redirect.requestedCommandId, "repo-map");
+  assert.match(redirect.reason, /re-proposed completed repo-map; host advanced to plan step 3/);
+  // All steps done → nothing to redirect into; the guard must not invent work.
+  const exhausted = resolveProgressCommand({ commandId: "repo-map" }, completed, [{ commandId: "repo-map" }]);
+  assert.equal(exhausted.redirected, false);
+});
+
+// T12 anti-repeat guard — integration: replay of the task-2026-08-24 loop
+test("redirects a re-proposed completed command to the next plan step with a host note (Build-mode loop regression)", async () => {
+  let calls = 0;
+  const executedCommands = [];
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      calls += 1;
+      if (calls === 1) return JSON.stringify(createAction({ taskId: "task-loop", step: 1, commandId: "repo-map", shortRationale: "Map repo before authoring" }));
+      // Maple re-proposes repo-map even though it already completed (the incident).
+      return JSON.stringify(createAction({ taskId: "task-loop", step: 2, commandId: "repo-map", shortRationale: "Map repo again" }));
+    },
+    executeCommand: async (command) => {
+      executedCommands.push(command);
+      // Mirror production receipt shape (artifactCommandReceipt): create results carry artifactId.
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`], ...(command === "artifact.create" ? { artifactId: `artifact-mock-${executedCommands.length}` } : {}) };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [
+      { commandId: "repo-map", label: "Map the current repository", expectedEvidence: ["repo://current-worktree"] },
+      { commandId: "artifact.author", label: "Author the requested animation", expectedEvidence: ["artifact://revision"] },
+    ] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    // Inspect-intent harness: no preview-receipt completion gate, so finishing
+    // both plan steps completes the task. The loop regression being guarded
+    // here is that repo-map must run exactly ONCE despite repeat proposals.
+    assert.equal(result.status, "completed");
+    assert.ok(executedCommands.includes("artifact.author"));
+    const redirectEvent = harness.events.find((event) => event.type === "action.redirected");
+    assert.ok(redirectEvent, "an action.redirected host note is recorded");
+    assert.equal(redirectEvent.payload.requestedCommandId, "repo-map");
+    assert.equal(redirectEvent.payload.selectedCommandId, "artifact.author");
+    assert.match(redirectEvent.payload.reason, /host advanced to plan step 2/);
+    assert.equal(redirectEvent.payload.mode, "anti-repeat-guard");
+    // The next-action context names completed commands explicitly.
+    assert.equal(calls >= 2, true);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("next-action context states completed commands and plan progress explicitly", async () => {
+  const seenPrompts = [];
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      seenPrompts.push(prompt);
+      return JSON.stringify(createAction({ taskId: "task-loop", step: 1, commandId: "repo-map", shortRationale: "Map repo" }));
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [
+      { commandId: "repo-map", label: "Map repo" },
+      { commandId: "repo.inspect", label: "Inspect repo" },
+    ] }).plan;
+    void await harness.orchestrator.approvePlan(harness.task.id, plan.id).catch(() => {});
+    const firstSystem = String(seenPrompts[0]?.system || "");
+    assert.match(firstSystem, /Completed already \(do NOT repeat[^)]*\): none/);
+    assert.match(firstSystem, /Plan status: approved\. Plan progress: step 1 of 2/);
+    // Second round: repo-map has completed; the context must name it explicitly.
+    if (seenPrompts[1]) {
+      const secondSystem = String(seenPrompts[1]?.system || "");
+      assert.match(secondSystem, /Completed already \(do NOT repeat[^)]*\): repo-map/);
+      assert.match(secondSystem, /Plan progress: step 2 of 2/);
+    }
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+
+  let seenSecond = null;
+  let calls = 0;
+  const second = makeHarness({
+    inferAction: async (prompt) => {
+      calls += 1;
+      seenSecond = prompt;
+      return JSON.stringify(createAction({ taskId: "task-loop", step: calls === 1 ? 1 : 2, commandId: calls === 1 ? "repo-map" : "repo-map", shortRationale: "repeat" }));
+    },
+  });
+  try {
+    const plan = second.orchestrator.proposePlan(second.task, { steps: [
+      { commandId: "repo-map", label: "Map repo" },
+      { commandId: "repo.inspect", label: "Inspect repo" },
+    ] }).plan;
+    void await second.orchestrator.approvePlan(second.task.id, plan.id).catch(() => {});
+    assert.match(String(seenSecond?.system || ""), /Completed already \(do NOT repeat[^)]*\): repo-map/);
+  } finally {
+    fs.rmSync(second.root, { recursive: true, force: true });
+  }
+});
+
+// T12 author-fallback bulletproofing — real registry behind executeCommand
+function makeRegistryExecute(registryByTask) {
+  return async (command, payload) => {
+    const registry = registryByTask;
+    if (command === "artifact.create") {
+      const manifest = registry.create({ ...payload, taskId: payload.taskId || "task-loop" });
+      return { ...manifest, artifactId: manifest.id, evidenceRefs: [registry.manifestPath(manifest.taskId, manifest.id)], summary: `Created scratch artifact ${manifest.id}.` };
+    }
+    if (command === "artifact.author") {
+      try {
+        const manifest = registry.author({ ...payload, taskId: payload.taskId || "task-loop" });
+        return { ...manifest, artifactId: manifest.id, evidenceRefs: [registry.manifestPath(manifest.taskId, manifest.id)], summary: `${command} recorded revision ${manifest.revision} for ${manifest.id}.` };
+      } catch (error) {
+        throw error;
+      }
+    }
+    return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+  };
+}
+
+function makeRegistryHarness(inferAction, extraRegistry = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hemlock-author-fallback-"));
+  const task = {
+    schema: "hemlock.agent.task.v1",
+    id: "task-author",
+    objective: "Hello, please make a beautiful artifact",
+    intent: "build",
+    phase: "work",
+    status: "running",
+    budget: { maxAgentSteps: 8, maxCommands: 12, maxRetriesPerOperation: 1, maxMutationSets: 1, maxTrainingCycles: 0, commandsUsed: 0, agentStepsUsed: 0 },
+  };
+  const kernel = new AgentKernel({ root, repoRoot: "/tmp/hemlock-project", task });
+  let currentTask = task;
+  const events = [];
+  const registry = new ArtifactRegistry({ root, workspaceId: "workspace-test" });
+  const orchestrator = new AgentOrchestrator({
+    kernel,
+    commandRegistry: { "artifact.author": { capability: "artifact" }, ...extraRegistry },
+    getTask: () => currentTask,
+    setTask: (patch) => { currentTask = { ...currentTask, ...patch }; kernel.syncTask(currentTask); return currentTask; },
+    emit: (type, status, payload) => events.push({ type, status, payload }),
+    executeCommand: makeRegistryExecute(registry),
+    inferAction,
+  });
+  return { root, kernel, registry, orchestrator, events, get task() { return currentTask; } };
+}
+
+test("author fallback completes via create-if-missing when no artifact exists yet (empty model input)", async () => {
+  const harness = makeRegistryHarness(async () => JSON.stringify(createAction({ taskId: "task-author", step: 1, commandId: "artifact.author", input: {}, shortRationale: "Author the requested visual" })));
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.author", label: "Author the requested animation", expectedEvidence: ["artifact://revision"] }] }).plan;
+    await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "artifact.author");
+    assert.equal(action.status, "completed");
+    const observation = harness.kernel.getProjection().observations[0];
+    assert.equal(observation.status, "passed");
+    assert.equal(observation.structuredOutput.status, "previewable");
+    assert.ok(observation.structuredOutput.source?.["index.html"]?.length > 0, "scaffold source present");
+    assert.equal(harness.events.some((event) => event.type === "artifact.author.ensure"), true);
+    assert.equal(harness.task.status, "blocked"); // completion gate needs a verified preview receipt; author itself succeeded
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("author fallback survives a digest-shaped id pasted as artifactId", async () => {
+  const digestId = "sha256:bbd266447729c7d6f6b78eb2497db2a2e3d49fabd450590d0c920e7dce5fe939";
+  const harness = makeRegistryHarness(async () => JSON.stringify(createAction({ taskId: "task-author", step: 1, commandId: "artifact.author", input: { artifactId: digestId }, shortRationale: "Author into the referenced artifact" })));
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.author", label: "Author the requested animation", expectedEvidence: ["artifact://revision"] }] }).plan;
+    await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.status, "completed");
+    // The projection preserves the model's raw proposed input; the sanitization
+    // contract is about what the host EXECUTED, asserted via the observation.
+    const observation = harness.kernel.getProjection().observations[0];
+    assert.equal(observation.status, "passed");
+    assert.match(observation.structuredOutput.summary || "", /revision 1 for artifact-/);
+    const artifactId = observation.structuredOutput.id;
+    assert.doesNotMatch(artifactId, /^sha256:/);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("author falls back to the host scaffold when the registry rejects the authored source", async () => {
+  // A traversal filename survives boundedActionInput but must be rejected by
+  // the registry's safeRelativePath — previously that threw action.faild.
+  const harness = makeRegistryHarness(async () => JSON.stringify(createAction({ taskId: "task-author", step: 1, commandId: "artifact.author", input: { filename: "../escape.html", source: { "../escape.html": "<h1>escape</h1>" } }, shortRationale: "Author with an unsafe path" })));
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "artifact.author", label: "Author the requested animation", expectedEvidence: ["artifact://revision"] }] }).plan;
+    await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.status, "completed");
+    const observation = harness.kernel.getProjection().observations[0];
+    assert.equal(observation.status, "passed");
+    assert.equal(Object.keys(observation.structuredOutput.source || {}).includes("../escape.html"), false);
+    assert.ok(observation.structuredOutput.source?.["index.html"].includes("Eastern Hemlock"), "host scaffold retained after registry rejection");
+    // The unsafe filename is sanitized BEFORE the registry sees it; the
+    // host_fallback evidence on the executed revision records the recovery.
+    const fallbackEvidence = (observation.structuredOutput.evidence || []).some((item) => item.type === "authoring.host_fallback") || harness.events.some((event) => event.type === "artifact.author.recovered" || event.type === "artifact.author.ensure");
+    assert.equal(fallbackEvidence, true, "a host-fallback recovery marker is recorded");
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
   }

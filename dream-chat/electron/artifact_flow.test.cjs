@@ -61,11 +61,11 @@ function makeHarness({ objective = "Build an animated HTML artifact preview", bu
       commandCalls.push({ commandId, input });
       switch (commandId) {
         case "artifact.create":
-          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Scratch artifact created.", id: ARTIFACT_ID, revision: 1, evidenceRefs: ["artifact://manifest"] };
+          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Scratch artifact created.", id: ARTIFACT_ID, artifactId: ARTIFACT_ID, revision: 1, evidenceRefs: ["artifact://manifest"] };
         case "artifact.author":
-          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Artifact authored.", id: input.artifactId || ARTIFACT_ID, revision: 2, evidenceRefs: ["artifact://revision"] };
+          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Artifact authored.", id: input.artifactId || ARTIFACT_ID, artifactId: input.artifactId || ARTIFACT_ID, revision: 2, evidenceRefs: ["artifact://revision"] };
         case "artifact.update":
-          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Repair candidate written.", id: input.artifactId || ARTIFACT_ID, revision: 2, evidenceRefs: ["artifact://revision"] };
+          return { schema: "hemlock.agent.artifact.v1", status: "passed", summary: "Repair candidate written.", id: input.artifactId || ARTIFACT_ID, artifactId: input.artifactId || ARTIFACT_ID, revision: 2, evidenceRefs: ["artifact://revision"] };
         case "artifact.preview.open":
           return { schema: "hemlock.agent.preview.open.v1", status: "passed", summary: "Isolated preview opened.", session: { id: `preview-session-${commandCalls.length}`, artifactId: input.artifactId || ARTIFACT_ID }, evidenceRefs: ["preview://session"] };
         case "artifact.preview.inspect":
@@ -165,7 +165,10 @@ test("author-without-create uses the host scaffold fallback source", async () =>
     await harness.orchestrator.executeAction(action.id);
     const authorCall = harness.commandCalls.find((call) => call.commandId === "artifact.author");
     assert.ok(authorCall, "executeCommand was called for artifact.author");
-    assert.equal(authorCall.input.artifactId, undefined, "no invented artifactId is forwarded when nothing was created");
+    // T12: the host ensures a scratch artifact exists BEFORE authoring, so the
+    // executed author targets the ensured id instead of forwarding none.
+    assert.equal(typeof authorCall.input.artifactId, "string");
+    assert.match(authorCall.input.artifactId, /^artifact-/);
     const scaffold = authorCall.input.source?.["index.html"];
     assert.equal(typeof scaffold, "string");
     assert.ok(scaffold.length > 0, "host fallbackAnimationSource scaffold is non-empty");
