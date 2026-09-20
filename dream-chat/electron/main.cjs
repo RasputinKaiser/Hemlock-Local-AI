@@ -41,6 +41,7 @@ const { applyDigestCompaction, insertDigestBlock } = require("./thread_digest.cj
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
 const { createWorkNotifier, trackChatResponseJob } = require("./work_notifications.cjs");
 const { COMPARISON_SCHEMA, canRunComparison, lastUserMessage, buildComparisonRecord } = require("./comparison_lane.cjs");
+const { runExperiment, EXPERIMENTS } = require("./physics_sandbox.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -625,6 +626,12 @@ const sessionId = `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${p
 const sessionDir = path.join(sessionsDir, sessionId);
 const sessionEventsPath = path.join(sessionDir, "events.jsonl");
 const sessionStatePath = path.join(sessionDir, "state.json");
+// World habitat: deterministic experiment receipts and the findings dataset
+// that Dream consumes. Both live beside the other SIPS artifacts so the same
+// storage boundary rules apply.
+const experimentDatasetPath = path.join(sipsDir, "experiment-dataset.jsonl");
+const experimentReceiptsDir = path.join(sipsDir, "experiments");
+const experimentRuns = new Map(); // this-session run receipts for finding citation
 const agentEvents = readEventLog(previousEventsPath).slice(-120);
 const agentEventIds = new Set(agentEvents.map((event) => event.id).filter(Boolean));
 let sessionClosed = false;
@@ -1037,9 +1044,229 @@ function getAgentState() {
     context: contextBroker.getState(),
     contextSources: contextSources.getState(),
     queue: agentIntentQueue?.snapshot() || { schema: "hemlock.agent.queue.v1", active: null, pending: [], count: 0 },
+    experimentDataset: experimentDatasetSummary(),
     events: agentEvents.slice(-80),
     commands: Object.entries(agentCommands).map(([id, descriptor]) => ({ id, ...descriptor })),
   };
+}
+
+// --- Understory world experiments ------------------------------------------
+// Maple proposes; the host simulates deterministically and keeps the receipts.
+
+function readExperimentRows(limit = 400) {
+  let lines = [];
+  try {
+    lines = fs.readFileSync(experimentDatasetPath, "utf8").split("\n").filter(Boolean).slice(-limit);
+  } catch {
+    lines = [];
+  }
+  const rows = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter((row) => row?.schema === "hemlock.world.finding.v1");
+  return { rows, count: rows.length };
+}
+
+function experimentDatasetSummary() {
+  const { rows, count } = readExperimentRows(400);
+  const latest = rows.at(-1) || null;
+  return {
+    schema: "hemlock.world.dataset.summary.v1",
+    count,
+    datasetPath: experimentDatasetPath,
+    experiments: EXPERIMENTS,
+    latest: latest ? { id: latest.id, experiment: latest.experiment, recordedAt: latest.recordedAt } : null,
+  };
+}
+
+function experimentDatasetExamples(limit = 24) {
+  return readExperimentRows(400).rows.slice(-limit)
+    .map((row) => ({ messages: row.messages, metadata: row.metadata || { source: "experiment" } }))
+    .filter((row) => Array.isArray(row.messages) && row.messages.length >= 2);
+}
+
+function loadExperimentReceipt(experimentId) {
+  const safe = String(experimentId || "").replace(/[^a-zA-Z0-9-]/g, "");
+  if (!safe) return null;
+  if (experimentRuns.has(safe)) return experimentRuns.get(safe);
+  const file = path.join(experimentReceiptsDir, `${safe}.json`);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return parsed?.schema === "hemlock.world.experiment.receipt.v1" ? { ...parsed, receiptPath: file } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runWorldExperiment(payload = {}) {
+  const nested = payload.input && typeof payload.input === "object" ? payload.input : {};
+  appendAgentEvent("experiment.started", "running", { experiment: String(payload.experiment || nested.experiment || "").toLowerCase(), input: nested, hypothesis: String(payload.hypothesis || nested.hypothesis || "").trim() || null }, { reversible: true });
+  const result = runExperiment({
+    experiment: payload.experiment || nested.experiment,
+    input: Object.keys(nested).length && payload.experiment ? nested : { ...nested, ...payload },
+    seed: payload.seed ?? nested.seed,
+  });
+  // Deterministic id: the same spec always mints the same receipt name, so a
+  // repeated experiment re-verifies rather than silently multiplying evidence.
+  const runId = `exp-${crypto.createHash("sha256").update(JSON.stringify({ experiment: result.experiment, input: result.input })).digest("hex").slice(0, 12)}`;
+  fs.mkdirSync(experimentReceiptsDir, { recursive: true });
+  const receiptPath = path.join(experimentReceiptsDir, `${runId}.json`);
+  const receipt = {
+    schema: "hemlock.world.experiment.receipt.v1",
+    id: runId,
+    ...result,
+    hypothesis: String(payload.hypothesis || nested.hypothesis || "").trim() || null,
+    taskId: agentTask.id,
+    receiptPath,
+    recordedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2));
+  experimentRuns.set(runId, receipt);
+  while (experimentRuns.size > 32) experimentRuns.delete(experimentRuns.keys().next().value);
+  appendAgentEvent("experiment.completed", "passed", {
+    experimentId: runId,
+    experiment: result.experiment,
+    divergence: result.divergence?.worst ?? null,
+    steps: result.steps,
+    computeMs: result.computeMs,
+    input: result.input,
+    trail: result.trail,
+  }, { evidenceRefs: [receiptPath] });
+  return { schema: "hemlock.world.experiment.result.v1", status: "completed", experiment: receipt, receiptPath };
+}
+
+async function recordExperimentFinding(payload = {}) {
+  const input = { ...(payload.input && typeof payload.input === "object" ? payload.input : {}), ...payload };
+  delete input.input;
+  const receipt = loadExperimentReceipt(input.experimentId) || [...experimentRuns.values()].at(-1);
+  if (!receipt) throw new Error("No world experiment receipt exists yet — run experiment.run before recording a finding.");
+  const claim = String(input.claim || input.finding || "").trim();
+  if (!claim) throw new Error("An experiment finding needs a claim about what the world showed.");
+  const hypothesis = String(input.hypothesis || receipt.hypothesis || "").trim();
+  const divergence = Number.isFinite(receipt.divergence?.worst) ? receipt.divergence.worst : null;
+  const messages = [
+    { role: "user", content: `In the understory world, a ${receipt.experiment} experiment ran with inputs ${JSON.stringify(receipt.input)}.${hypothesis ? ` Hypothesis: ${hypothesis}` : ""} What did the world show?` },
+    { role: "assistant", content: `${claim} Measured: ${JSON.stringify(receipt.measured)}. Closed-form expectation: ${JSON.stringify(receipt.theory)}.${divergence != null ? ` Worst divergence: ${(divergence * 100).toFixed(2)}%.` : ""}` },
+  ];
+  const finding = {
+    schema: "hemlock.world.finding.v1",
+    id: `finding-${receipt.id}-${crypto.createHash("sha256").update(claim).digest("hex").slice(0, 8)}`,
+    experimentId: receipt.id,
+    experiment: receipt.experiment,
+    hypothesis: hypothesis || null,
+    claim,
+    measured: receipt.measured,
+    theory: receipt.theory,
+    divergence: receipt.divergence || null,
+    messages,
+    metadata: { source: "experiment", experimentId: receipt.id, experiment: receipt.experiment, divergence },
+    taskId: agentTask.id,
+    recordedAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(path.dirname(experimentDatasetPath), { recursive: true });
+  fs.appendFileSync(experimentDatasetPath, `${JSON.stringify(finding)}\n`);
+  // Mirror the finding into the Memory Garden review queue so world evidence
+  // is inspectable where other candidates live — deduped by fingerprint.
+  try {
+    const candidate = agentKernel.createCandidate({
+      kind: "experiment",
+      title: `World finding: ${receipt.experiment}`,
+      summary: claim,
+      sourceRefs: [receipt.receiptPath, experimentDatasetPath].filter(Boolean),
+      reason: "Recorded from a bounded world experiment",
+      confidence: divergence != null ? (divergence < 0.02 ? 0.7 : divergence < 0.1 ? 0.55 : 0.35) : 0.5,
+    });
+    appendAgentEvent("candidate.created", "candidate", { candidate }, { evidenceRefs: candidate.sourceRefs, reversible: true });
+  } catch { /* the dataset row is authoritative; the mirror is best-effort */ }
+  appendAgentEvent("experiment.note.recorded", "recorded", {
+    findingId: finding.id,
+    experimentId: receipt.id,
+    experiment: receipt.experiment,
+    divergence,
+  }, { evidenceRefs: [experimentDatasetPath, receipt.receiptPath].filter(Boolean) });
+  return { schema: "hemlock.world.finding.result.v1", status: "recorded", finding, datasetPath: experimentDatasetPath, datasetRows: readExperimentRows().count };
+}
+
+const graftsPath = path.join(sipsDir, "grafts.jsonl");
+
+function readGrafts(limit = 20) {
+  try {
+    const rows = fs.readFileSync(graftsPath, "utf8").split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    return { rows: rows.slice(-limit), count: rows.length };
+  } catch {
+    return { rows: [], count: 0 };
+  }
+}
+
+// Graft registry: every auto-grafted Dream adapter is recorded so the active
+// graft is auditable and detachable — the base checkpoint itself is never
+// touched (LoRA adapters only).
+function registerGraft({ adapterPath, runId, trainingReceipt }) {
+  const entry = {
+    schema: "hemlock.dream.graft.v1",
+    adapterPath,
+    runId,
+    baseModel: modelPath,
+    adapterSha256: trainingReceipt?.trainingProof?.adapterArtifact?.sha256 || null,
+    profile: trainingReceipt?.profile || null,
+    graftedAt: new Date().toISOString(),
+  };
+  try {
+    fs.mkdirSync(path.dirname(graftsPath), { recursive: true });
+    fs.appendFileSync(graftsPath, `${JSON.stringify(entry)}\n`);
+  } catch { /* registry is best-effort; the adapter file itself is authoritative */ }
+  appendAgentEvent("dream.adapter.grafted", "passed", entry, { evidenceRefs: [graftsPath, adapterPath].filter(Boolean) });
+  return entry;
+}
+
+async function detachGraft() {
+  const previous = serverState.adapterPath || null;
+  const previousModel = serverState.modelPath && serverState.modelPath !== modelPath ? serverState.modelPath : null;
+  await stopServer();
+  void startServer();
+  appendAgentEvent("dream.adapter.detached", "passed", { previousAdapter: previous, previousModel }, { reversible: true });
+  return { schema: "hemlock.dream.graft.result.v1", status: "detached", previousAdapter: previous, previousModel, grafts: readGrafts() };
+}
+
+function runPythonCommand(args, { timeoutMs = 600000, cwd = repoRoot } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawnPython([...pythonFlags, ...args], { cwd, env: pythonEnvironment(), stdio: ["ignore", "pipe", "pipe"] });
+    const stderrTail = [];
+    child.stderr.on("data", (chunk) => { stderrTail.push(String(chunk)); if (stderrTail.length > 12) stderrTail.shift(); });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`python ${args[0]} timed out after ${Math.round(timeoutMs / 60000)}m`)); }, timeoutMs);
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`python ${args.join(" ").slice(0, 120)} exited ${code ?? signal}: ${stderrTail.join("").slice(-400)}`));
+    });
+  });
+}
+
+// Fuse a verified graft into a NEW checkpoint dir and serve it. The base
+// checkpoint is left on disk untouched — rollback is detachGraft(), which
+// restarts on the base path. Weights are mutable policy, not an invariant;
+// the fuse receipt keeps the mutation auditable.
+async function fuseGraft(payload = {}) {
+  const adapterPath = path.resolve(String(payload.adapterPath || serverState.adapterPath || ""));
+  if (!adapterPath || !fs.existsSync(adapterPath)) throw new Error("No grafted adapter to fuse — run a Dream first (or pass adapterPath).");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const fusedDir = path.join(sipsDir, "fused", `maple-fused-${stamp}`);
+  appendAgentEvent("dream.fuse.started", "running", { adapterPath, baseModel: modelPath, fusedDir }, { reversible: true });
+  await runPythonCommand(["-m", "mlx_lm", "fuse", "--model", modelPath, "--adapter-path", adapterPath, "--save-path", fusedDir, "--trust-remote-code"]);
+  const problem = mlxCheckpointProblem(fusedDir);
+  if (problem) throw new Error(`Fused checkpoint at ${fusedDir} is incomplete (missing ${problem}).`);
+  await stopServer();
+  void startServer("", fusedDir);
+  const entry = { schema: "hemlock.dream.graft.v1", kind: "fused", adapterPath, fusedModelPath: fusedDir, baseModel: modelPath, fusedAt: new Date().toISOString() };
+  try { fs.mkdirSync(path.dirname(graftsPath), { recursive: true }); fs.appendFileSync(graftsPath, `${JSON.stringify(entry)}\n`); } catch { /* registry is best-effort */ }
+  appendAgentEvent("dream.fused", "passed", entry, { evidenceRefs: [graftsPath, fusedDir], reversible: true });
+  return { schema: "hemlock.dream.fuse.result.v1", status: "fused", fusedModelPath: fusedDir, adapterPath, rollback: "dream.detach returns to the base checkpoint", grafts: readGrafts() };
+}
+
+function experimentDataset(payload = {}) {
+  const limit = Math.max(1, Math.min(400, Math.round(Number(payload.limit ?? payload.input?.limit) || 60)));
+  const { rows, count } = readExperimentRows(limit);
+  return { schema: "hemlock.world.dataset.v1", status: "read", count, rows, datasetPath: experimentDatasetPath, evidenceRefs: [experimentDatasetPath] };
 }
 
 async function recordAgentMemory(payload = {}) {
@@ -1309,6 +1536,33 @@ async function processAgentIntent(payload = {}) {
     plan = agentOrchestrator.proposePlan(agentTask, {
       rationale: `The ${intent} intent is bounded to registered local actions. Context and memory are attached as evidence; source mutation and Dream training remain separately gated.`,
     });
+  }
+  // Graduated autonomy: guided/autonomous tasks (and campaign intents) skip
+  // the approval park — the user opted in at submit time or via the autonomy
+  // control, every step still emits receipts and events, and pause/cancel
+  // stay live. Budget overrides are clamped by approvePlan itself.
+  const taskAutonomy = payload.mode === "campaign" ? "bounded-campaign" : String(payload.autonomy || agentTask.autonomy || "bounded-local");
+  const autoApprove = payload.autoApprove === true || payload.mode === "campaign" || ["guided", "autonomous", "bounded-campaign"].includes(taskAutonomy);
+  if (plan?.plan && autoApprove) {
+    if (agentTask.autonomy !== taskAutonomy) updateAgentTask({ autonomy: taskAutonomy });
+    appendAgentEvent("plan.auto_approved", "passed", {
+      taskId: agentTask.id,
+      planId: plan.plan.id,
+      autonomy: taskAutonomy,
+      mode: payload.mode === "campaign" ? "campaign" : "autonomy",
+      reason: "The task's autonomy level approves its own plan; budgets and the command allowlist still apply.",
+    });
+    const result = await agentOrchestrator.approvePlan(agentTask.id, plan.plan.id, payload.budgetOverrides || null);
+    return {
+      schema: "hemlock.agent.intent.result.v1",
+      status: result?.status || "completed",
+      task: agentTask,
+      context,
+      recall,
+      plan: plan.plan,
+      autoApproved: true,
+      claimBoundary: `The plan was auto-approved under ${taskAutonomy} autonomy; the reported status is the task's terminal state, and all actions carry receipts.`,
+    };
   }
   return {
     schema: "hemlock.agent.intent.result.v1",
@@ -1928,6 +2182,7 @@ async function runInference(payload = {}) {
       };
       appendAgentEvent("conversation.episode.completed", "passed", { episode }, { reversible: true });
       updateAgentTask({ phase: "complete", status: "completed", foregroundStep: "Ready for the next local task", blockedReason: null });
+      bumpAgentMetrics({ inferenceLatencyMs: telemetry?.elapsedMs || 0 });
       appendAgentEvent("inference.completed", "passed", { adapterPath: recovered ? null : requestedAdapter || null, recovered, usage: usage || responsePayload.usage || null, telemetry, channels, rawOutputRef });
       return { schema: "hemlock.agent.inference.result.v1", status: "passed", provider: "maple", model: "default_model", reasoning: "native", payload: responsePayload, recovered, adapterPath: recovered ? "" : requestedAdapter, processReady: true, inferenceReady: true, telemetry, answer: answerText, channels, rawOutputRef };
     } catch (error) {
@@ -2264,103 +2519,159 @@ function inspectReceipt(payload = {}) {
   return { schema: "hemlock.agent.receipt.inspection.v1", status: "passed", path: absolute, receipt, summary: `Inspected local receipt ${path.relative(runtimeDataRoot, absolute)}.`, evidenceRefs: [absolute] };
 }
 
+function agentCapabilities() {
+  const autonomy = String(agentTask.autonomy || "bounded-local");
+  const autonomyLevel = autonomy === "autonomous" || autonomy === "bounded-campaign" ? "autonomous" : autonomy === "guided" ? "guided" : "supervised";
+  const commands = Object.entries(agentCommands).map(([commandId, descriptor]) => ({ commandId, label: descriptor.label, capability: descriptor.capability, auto: descriptor.auto === true, approval: descriptor.approval, inputHint: descriptor.inputHint || null }));
+  return { schema: "hemlock.agent.capabilities.v1", status: "passed", taskId: agentTask.id, autonomy, autonomyLevel, commands, summary: `${commands.length} allowlisted commands; autonomy ${autonomyLevel} (${autonomy}).`, evidenceRefs: ["registry://agent-commands"] };
+}
+
+const MAX_PROPOSAL_CHANGE_BYTES = 8 * 1024;
+
+function proposeImprovement(payload = {}) {
+  const summary = String(payload.summary || "").trim();
+  const rationale = String(payload.rationale || "").trim();
+  if (!summary) throw new Error("improve.propose needs a summary of the bounded change.");
+  if (!rationale) throw new Error("improve.propose needs a rationale grounded in local evidence.");
+  const change = typeof payload.change === "string" ? payload.change.trim() : "";
+  if (Buffer.byteLength(change, "utf8") > MAX_PROPOSAL_CHANGE_BYTES) throw new Error("improve.propose change text exceeds the 8KB bound.");
+  const thread = threadManager.thread(String(payload.threadId || agentTask.threadId || ""));
+  const workspaceRoot = path.resolve(thread?.workspaceRoot || agentTask.workspaceRoot || repoRoot);
+  const files = (Array.isArray(payload.files) ? payload.files : []).slice(0, 24).map((item) => {
+    const absolute = thread
+      ? threadManager.assertScopedPath(thread.id, path.join(workspaceRoot, String(item)))
+      : scopedRepoPath(item, workspaceRoot);
+    return path.relative(workspaceRoot, absolute);
+  });
+  const confidence = Number.isFinite(Number(payload.confidence)) ? Math.max(0, Math.min(1, Number(payload.confidence))) : null;
+  const proposalId = `improve-${crypto.createHash("sha256").update(JSON.stringify({ summary, rationale, files, change })).digest("hex").slice(0, 12)}`;
+  const receipt = {
+    schema: "hemlock.agent.improve-proposal.v1",
+    id: proposalId,
+    status: "proposed",
+    taskId: agentTask.id,
+    threadId: thread?.id || null,
+    workspaceRoot,
+    summary,
+    rationale,
+    files,
+    change: change || null,
+    confidence,
+    autoApplied: false,
+    createdAt: new Date().toISOString(),
+    claimBoundary: "This is a bounded proposal only; no repository source was mutated. Application requires code.apply under an approved plan.",
+  };
+  const receiptPath = path.join(sipsDir, "proposals", `${proposalId}.receipt.json`);
+  writeJsonFile(receiptPath, receipt);
+  appendAgentEvent("improve.proposed", "passed", { proposalId, summary, files, confidence }, { evidenceRefs: [receiptPath], reversible: true });
+  return { schema: "hemlock.agent.improve-proposal.result.v1", status: "proposed", proposal: receipt, receiptPath, evidenceRefs: [receiptPath, "receipt://proposed-improvement"], summary: `Recorded bounded improvement proposal ${proposalId}; nothing was applied.` };
+}
+
 const agentCommands = {
-  status: { label: "System status", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "context.refresh": { label: "Refresh awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "context.search": { label: "Search awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "context.query": { label: "Query awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "sources.get": { label: "Inspect context sources", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "sources.policy": { label: "Change context source policy", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  routes: { label: "Discover routes", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "repo-map": { label: "Project map", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "repo.inspect": { label: "Inspect repository surface", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "file.read": { label: "Read a scoped file", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "file.search": { label: "Search scoped files", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "git.status": { label: "Inspect git status", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "git.diff": { label: "Inspect git diff", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "test.discover": { label: "Discover local tests", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "verification.list": { label: "List verification profiles", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "receipt.inspect": { label: "Inspect a local receipt", capability: "read", auto: true, approval: "none", timeoutMs: 15000 },
-  recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true },
-  "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false },
-  "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "conversation.reset": { label: "Reset thread to fresh context", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false },
-  "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "thread.rename": { label: "Rename Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "thread.pause": { label: "Pause Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "thread.resume": { label: "Resume Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "thread.restore": { label: "Restore archived Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "context.compile": { label: "Compile compact thread context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "task.checkpoint": { label: "Record task checkpoint", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
+  status: { label: "System status", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{}" },
+  "context.refresh": { label: "Refresh awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{reason?}" },
+  "context.search": { label: "Search awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{query:\"short search string\"}" },
+  "context.query": { label: "Query awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{query:\"short question\"} or {sourceId,...}" },
+  "sources.get": { label: "Inspect context sources", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "sources.policy": { label: "Change context source policy", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{sourceId, policy:{enabled?, permissionState?}}" },
+  routes: { label: "Discover routes", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{}" },
+  "repo-map": { label: "Project map", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{workspaceRoot?}" },
+  "repo.inspect": { label: "Inspect repository surface", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{paths?:[\"repo-relative\",...]}" },
+  "file.read": { label: "Read a scoped file", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{path:\"repo-relative\", maxBytes?}" },
+  "file.search": { label: "Search scoped files", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{query, path?:\"repo-relative\"}" },
+  "git.status": { label: "Inspect git status", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{workspaceRoot?}" },
+  "git.diff": { label: "Inspect git diff", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{paths?:[\"repo-relative\"], workspaceRoot?}" },
+  "test.discover": { label: "Discover local tests", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{}" },
+  "verification.list": { label: "List verification profiles", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "receipt.inspect": { label: "Inspect a local receipt", capability: "read", auto: true, approval: "none", timeoutMs: 15000, inputHint: "{path:\"receipt path under app data\"}" },
+  recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{query?, limit?}" },
+  "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{}" },
+  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true, inputHint: "{summary, rationale, files?:[\"repo-relative\"], change?:\"patch/spec <=8KB\", confidence?:0-1}" },
+  "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false, inputHint: "{text|objective:\"task\", intent?, autonomy?, threadId?|workspaceRoot?}" },
+  "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{query, limit?<=20}" },
+  "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
+  "conversation.reset": { label: "Reset thread to fresh context", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
+  "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{caps:{provider:maxConcurrent}}" },
+  "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{title?, workspaceRoot?, projectId?|projectName?, autonomy?}" },
+  "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId}" },
+  "thread.rename": { label: "Rename Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?, title}" },
+  "thread.pause": { label: "Pause Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?, reason?}" },
+  "thread.resume": { label: "Resume Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?}" },
+  "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?}" },
+  "thread.restore": { label: "Restore archived Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId}" },
+  "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?}" },
+  "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{workspaceRoot, displayName?}" },
+  "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{projectId} or {workspaceRoot, projectName?}" },
+  "context.compile": { label: "Compile compact thread context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
+  "task.checkpoint": { label: "Record task checkpoint", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?, phase?, status?, reason?}" },
   // T8-F6: task.escalate-provider removed — single-lane policy, no provider switching.
-  "suggestion.list": { label: "List Hemlock suggestions", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false },
-  "suggestion.accept": { label: "Accept Hemlock suggestion", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "suggestion.snooze": { label: "Snooze Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "inference.respond": { label: "Run selected provider inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
-  "comparison.run": { label: "Compare last reply across lanes", capability: "read", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false },
-  "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "task.resume": { label: "Resume approved task", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "task.answer": { label: "Answer Maple's question", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "action.accept": { label: "Accept proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "action.reject": { label: "Reject proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "task.ask": { label: "Ask the user for a decision", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "task.complete": { label: "Complete task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "task.block": { label: "Block task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "training.prepare": { label: "Prepare Dream dataset", capability: "training-preparation", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "training.start": { label: "Start explicit Dream training", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000 },
-  "maple.launch": { label: "Launch Maple/Dream runtime", capability: "runtime", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true },
-  verify: { label: "Run verification", capability: "verify", auto: true, approval: "none", timeoutMs: 300000 },
-  "change.prepare": { label: "Prepare isolated change set", capability: "write-preparation", auto: true, approval: "none", timeoutMs: 30000, reversible: true },
-  "code.inspect": { label: "Inspect assigned coding workspace", capability: "read", auto: true, approval: "none", timeoutMs: 30000 },
-  "code.apply": { label: "Apply scoped coding edit", capability: "write", auto: true, approval: "plan", timeoutMs: 30000, reversible: true },
-  "code.rollback": { label: "Roll back coding change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true },
-  "change.apply": { label: "Apply plan-approved change set", capability: "write", auto: false, approval: "plan", timeoutMs: 30000, reversible: true },
-  "change.approve": { label: "Apply approved change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true },
-  "change.reject": { label: "Reject prepared change set", capability: "write-preparation", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true },
-  "candidate.create": { label: "Create review candidate", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "candidate.accept": { label: "Accept review candidate", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  "candidate.dismiss": { label: "Dismiss review candidate", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true },
-  cycle: { label: "Run one SIPS cycle", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000 },
-  dream: { label: "Run Dream", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000 },
-  selfloop: { label: "Control self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "selfloop.start": { label: "Start self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "selfloop.pause": { label: "Pause self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "selfloop.resume": { label: "Resume self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "selfloop.complete": { label: "Complete self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000 },
-  remember: { label: "Record project lesson", capability: "memory", auto: true, approval: "none", timeoutMs: 30000 },
-  "memory.promote": { label: "Promote memory candidate", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "memory.demote": { label: "Demote project lesson", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "memory.rollback": { label: "Rollback memory promotion", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "memory.feedback": { label: "Record recall usefulness feedback", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "artifact.restore": { label: "Restore a verified artifact revision", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.repair.retry": { label: "Retry artifact repair", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: false },
-  "artifact.repair.use-last-good": { label: "Use last good artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.inspect": { label: "Inspect task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.compare": { label: "Compare artifact revisions", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.freeze": { label: "Freeze artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "artifact.export": { label: "Export artifact change set", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000 },
-  "changeset.apply": { label: "Apply an exported artifact change set to the thread repository", capability: "task", auto: false, approval: "explicit", timeoutMs: 60000 },
-  "artifact.preview.open": { label: "Open isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.preview.inspect": { label: "Inspect isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.preview.interact": { label: "Interact with isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false },
-  "artifact.preview.stop": { label: "Stop isolated artifact preview", capability: "preview", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false },
+  "suggestion.list": { label: "List Hemlock suggestions", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{status?}" },
+  "suggestion.accept": { label: "Accept Hemlock suggestion", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{suggestionId}" },
+  "suggestion.dismiss": { label: "Dismiss Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{suggestionId}" },
+  "suggestion.snooze": { label: "Snooze Hemlock suggestion", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{suggestionId}" },
+  "inference.respond": { label: "Run selected provider inference", capability: "inference", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false, inputHint: "{query:\"user text\", refreshQuery?}" },
+  "comparison.run": { label: "Compare last reply across lanes", capability: "read", auto: true, approval: "none", timeoutMs: inferenceTimeoutMs, countsAgainstBudget: false, inputHint: "{targetProvider?}" },
+  "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{rationale?, steps?:[{commandId, label}]}" },
+  "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?, planId?, budgetOverrides?}" },
+  "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{planId?, reason?}" },
+  "task.pause": { label: "Pause running task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?}" },
+  "task.resume": { label: "Resume approved task", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?}" },
+  "task.answer": { label: "Answer Maple's question", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{answer:\"the user reply\"}" },
+  "action.accept": { label: "Accept proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{actionId?}" },
+  "action.reject": { label: "Reject proposed action", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{actionId?, reason?}" },
+  "task.ask": { label: "Ask the user for a decision", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{question, context?}" },
+  "task.complete": { label: "Complete task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{reason?}" },
+  "task.block": { label: "Block task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{reason?}" },
+  "training.prepare": { label: "Prepare Dream dataset", capability: "training-preparation", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{examples?|conversation?|facts?, datasetId?}" },
+  "training.start": { label: "Start explicit Dream training", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000, inputHint: "{profile?:\"smoke|balanced|quality\", facts?|examples?|conversation?, iters?}" },
+  "dream.detach": { label: "Detach active Dream graft", capability: "train", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
+  "dream.fuse": { label: "Fuse a Dream graft into new served weights", capability: "train", auto: false, approval: "explicit", timeoutMs: 600000, countsAgainstBudget: false, reversible: true, inputHint: "{adapterPath?: \"defaults to the active graft\"}" },
+  "dream.grafts": { label: "List Dream grafts", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
+  "maple.launch": { label: "Launch Maple/Dream runtime", capability: "runtime", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
+  verify: { label: "Run verification", capability: "verify", auto: true, approval: "none", timeoutMs: 300000, inputHint: "{profile:\"app-build|diff-check|python-tests\", workspaceRoot?}" },
+  "change.prepare": { label: "Prepare isolated change set", capability: "write-preparation", auto: true, approval: "none", timeoutMs: 30000, reversible: true, inputHint: "{changeSetId?, patch?:\"unified diff\"}" },
+  "code.inspect": { label: "Inspect assigned coding workspace", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{threadId?}" },
+  "code.apply": { label: "Apply scoped coding edit", capability: "write", auto: true, approval: "plan", timeoutMs: 30000, reversible: true, inputHint: "{source:{file:\"complete contents\"}|patches:[{path,content:\"complete file\"}], baseDigests?, reason?}" },
+  "code.rollback": { label: "Roll back coding change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true, inputHint: "{changeSetId}" },
+  "change.apply": { label: "Apply plan-approved change set", capability: "write", auto: false, approval: "plan", timeoutMs: 30000, reversible: true, inputHint: "{changeSetId, confirm:true}" },
+  "change.approve": { label: "Apply approved change set", capability: "write", auto: false, approval: "explicit", timeoutMs: 30000, reversible: true, inputHint: "{changeSetId}" },
+  "change.reject": { label: "Reject prepared change set", capability: "write-preparation", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{changeSetId, note?}" },
+  "candidate.create": { label: "Create review candidate", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{kind, title, summary, sourceRefs?:[], confidence?:0-1}" },
+  "candidate.accept": { label: "Accept review candidate", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{candidateId}" },
+  "candidate.dismiss": { label: "Dismiss review candidate", capability: "context", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{candidateId}" },
+  cycle: { label: "Run one SIPS cycle", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000, inputHint: "{objective, examples?:[{messages}], verifyProfile?, trainingProfile?:\"smoke|balanced|quality\"}" },
+  dream: { label: "Run Dream", capability: "train", auto: false, approval: "explicit", timeoutMs: 900000, inputHint: "{profile?:\"smoke|balanced|quality\", facts?|examples?|conversation?, iters?}" },
+  selfloop: { label: "Control self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{selfloopAction?:\"start|pause|resume|complete|record\", focus?, outcome?, receiptPath?}" },
+  "selfloop.start": { label: "Start self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{focus?}" },
+  "selfloop.pause": { label: "Pause self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{outcome?}" },
+  "selfloop.resume": { label: "Resume self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{outcome?}" },
+  "selfloop.complete": { label: "Complete self-loop", capability: "train", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{outcome?, receiptPath?}" },
+  remember: { label: "Record project lesson", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{body:\"reusable lesson\", title?, tags?, tier?}" },
+  "memory.promote": { label: "Promote memory candidate", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{targetId, note?}" },
+  "memory.demote": { label: "Demote project lesson", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{targetId, note?}" },
+  "memory.rollback": { label: "Rollback memory promotion", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{targetId, note?}" },
+  "memory.feedback": { label: "Record recall usefulness feedback", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{recordId, kind:\"useful|irrelevant\", query?}" },
+  "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId?, title, kind?:\"html|svg|text|markdown|json\", entrypoint?, mime?}" },
+  "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{source:\"complete self-contained HTML\"|{file:\"contents\"}, artifactId?, filename?, kind?}" },
+  "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{artifactId?, source|patches:\"complete-file map\", repairFor?}" },
+  "artifact.restore": { label: "Restore a verified artifact revision", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId, revision}" },
+  "artifact.repair.retry": { label: "Retry artifact repair", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: false, inputHint: "{taskId?}" },
+  "artifact.repair.use-last-good": { label: "Use last good artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{taskId?}" },
+  "artifact.inspect": { label: "Inspect task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId?}" },
+  "artifact.compare": { label: "Compare artifact revisions", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId?, from:revision, to?:revision}" },
+  "artifact.freeze": { label: "Freeze artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{artifactId?}" },
+  "artifact.export": { label: "Export artifact change set", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{artifactId?}" },
+  "changeset.apply": { label: "Apply an exported artifact change set to the thread repository", capability: "task", auto: false, approval: "explicit", timeoutMs: 60000, inputHint: "{changeSetId}" },
+  "artifact.preview.open": { label: "Open isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId?, revision?}" },
+  "artifact.preview.inspect": { label: "Inspect isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{sessionId?} or {inspection, digest?}" },
+  "artifact.preview.interact": { label: "Interact with isolated artifact preview", capability: "preview", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{sessionId?, previewAction, ...actionInput}" },
+  "artifact.preview.stop": { label: "Stop isolated artifact preview", capability: "preview", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{sessionId?, reason?}" },
+  "experiment.run": { label: "Run a bounded world physics experiment", capability: "verify", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{experiment:\"pendulum|projectile|orbit|spring|collision|terminal\", input?, seed?, hypothesis?}" },
+  "experiment.note": { label: "Record an experiment finding into the Dream dataset", capability: "write", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{claim:\"what the world showed\", experimentId?, hypothesis?}" },
+  "experiment.dataset": { label: "List recorded experiment findings", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{limit?}" },
+  "agent.capabilities": { label: "Describe my available commands", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
 };
 
 async function runAgentCommand(action, payload = {}) {
@@ -2513,6 +2824,8 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "verification.list") result = verificationList();
     else if (command === "receipt.inspect") result = inspectReceipt(payload);
     else if (command === "receipts.query") result = queryReceipts(payload);
+    else if (command === "improve.propose") result = proposeImprovement(payload);
+    else if (command === "agent.capabilities") result = agentCapabilities();
     else if (command === "artifact.create") result = artifactCommandReceipt(artifactRegistry.create({ ...payload, taskId: payload.taskId || agentTask.id }), command);
     else if (command === "artifact.author") result = artifactCommandReceipt(artifactRegistry.author({ ...payload, taskId: payload.taskId || agentTask.id }), command);
     else if (command === "artifact.update") result = artifactCommandReceipt(artifactRegistry.update({ ...payload, taskId: payload.taskId || agentTask.id }), command);
@@ -2530,7 +2843,16 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.preview.open.v1", status: "ready", session, artifact, evidenceRefs, summary: `Opened preview session ${session.id} for revision ${session.revision}.` };
     }
     else if (command === "artifact.preview.inspect") {
-      const session = previewSessions.get(payload.sessionId);
+      // Maple's inspect step can arrive without a resolvable sessionId (an
+      // adaptive step before preview.open, or a stale model-supplied id). The
+      // host resolves the newest session — or opens one from the task's
+      // artifact — rather than blocking a receipt-backed plan on a missing id.
+      let session = payload.sessionId ? previewSessions.get(payload.sessionId) : [...previewSessions.sessions.values()].at(-1) || null;
+      if (!session) {
+        const artifact = artifactRegistry.read(payload.taskId || agentTask.id, payload.artifactId);
+        session = previewSessions.open({ taskId: artifact.taskId, artifactId: artifact.id, revision: payload.revision || artifact.revision });
+        appendAgentEvent("artifact.preview.ready", "ready", { session, artifactId: artifact.id, revision: session.revision, reason: "inspect arrived before any preview session; host opened one" }, { evidenceRefs: [artifactRegistry.manifestPath(artifact.taskId, artifact.id)], reversible: true });
+      }
       const artifact = artifactRegistry.read(session.taskId, session.artifactId);
       const staticVerification = verifyArtifactSource(artifact);
       const report = payload.report?.schema === "hemlock.agent.artifact.preview.report.v1" ? recordPreviewReport(payload.report) : payload.inspection ? recordPreviewReport({ schema: "hemlock.agent.artifact.preview.report.v1", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, sessionId: session.id, ready: true, inspection: payload.inspection, consoleErrors: payload.consoleErrors || [], inspectionDigest: payload.digest || null }) : awaitPreviewReport(session);
@@ -2542,6 +2864,7 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.preview.inspect.v1", status, session: previewSessions.inspect(session.id, { digest: finalVerification.inspectionDigest, inspection: report?.inspection || payload.inspection }), verification: finalVerification, inspectionReceiptPath: verification.receiptPath || null, evidenceRefs, summary: status === "passed" ? `Preview verification passed for revision ${session.revision}.` : `Preview verification needs repair: ${(finalVerification.issues || []).map((item) => item.message).join(" ")}` };
     }
     else if (command === "artifact.preview.interact") {
+      payload = { ...payload, sessionId: payload.sessionId || [...previewSessions.sessions.values()].at(-1)?.id };
       const authorization = previewSessions.authorize(payload.sessionId, String(payload.previewAction || payload.action || ""), payload);
       if (!authorization.allowed) {
         appendAgentEvent("artifact.interaction.blocked", "blocked", { sessionId: payload.sessionId, reason: authorization.reason, previewOnly: true }, { reversible: true });
@@ -2551,7 +2874,7 @@ async function runAgentCommand(action, payload = {}) {
         result = { schema: "hemlock.agent.preview.interact.v1", status: "passed", authorization, interaction };
       }
     }
-    else if (command === "artifact.preview.stop") result = { schema: "hemlock.agent.preview.stop.v1", status: "stopped", session: previewSessions.stop(payload.sessionId, payload.reason || "user_stopped").session };
+    else if (command === "artifact.preview.stop") result = { schema: "hemlock.agent.preview.stop.v1", status: "stopped", session: previewSessions.stop(payload.sessionId || [...previewSessions.sessions.values()].at(-1)?.id, payload.reason || "user_stopped").session };
     else if (command === "recall") {
       result = await runSipsRuntime({ action: "recall", query: payload.query, limit: payload.limit });
       appendAgentEvent("memory.recalled", "passed", { query: payload.query || "", count: result.records?.length || 0, records: result.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
@@ -2577,8 +2900,14 @@ async function runAgentCommand(action, payload = {}) {
       appendAgentEvent(`candidate.${transition}ed`, "recorded", { candidate }, { evidenceRefs: candidate.sourceRefs || [], reversible: true });
       result = { schema: "hemlock.agent.candidate.result.v1", status: candidate.status, candidate };
     }
+    else if (command === "experiment.run") result = await runWorldExperiment(payload);
+    else if (command === "experiment.note") result = await recordExperimentFinding(payload);
+    else if (command === "experiment.dataset") result = experimentDataset(payload);
     else if (command === "cycle") result = await runSipsCycle(payload);
     else if (command === "dream") result = await runDream(payload);
+    else if (command === "dream.detach") result = await detachGraft();
+    else if (command === "dream.fuse") result = await fuseGraft(payload);
+    else if (command === "dream.grafts") result = { schema: "hemlock.dream.grafts.v1", ...readGrafts(), activeAdapter: serverState.adapterPath || null };
     else if (command === "selfloop" || command.startsWith("selfloop.")) result = await runSipsRuntime({ action: "selfloop", selfloopAction: command.startsWith("selfloop.") ? command.split(".")[1] : payload.selfloopAction, focus: payload.focus, outcome: payload.outcome, receiptPath: payload.receiptPath });
     else if (command === "remember") result = await recordAgentMemory(payload);
     else if (command === "memory.feedback") {
@@ -2608,6 +2937,7 @@ async function runAgentCommand(action, payload = {}) {
       result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
     }
     else if (command === "plan.reject") result = agentOrchestrator.rejectPlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""), String(payload.reason || "Rejected by user"));
+    else if (command === "task.pause") result = agentOrchestrator.pauseTask(String(payload.taskId || agentTask.id));
     else if (command === "task.resume") result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
     else if (command === "task.answer") {
       // T7-S1: answer-in-place. The user's reply is persisted exactly like any
@@ -2663,12 +2993,15 @@ async function inferStructuredAction(prompt) {
     projectId: task.projectId || null,
     workspaceRoot: task.workspaceRoot || null,
     autonomy: task.autonomy || "bounded-local",
+    steering: (task.steering || []).slice(-4).map((item) => String(item?.content || "").slice(0, 200)).filter(Boolean),
   };
   const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
   const actionRequest = {
     task: compactTask,
     context: compactContext,
     nextStep: prompt.nextPlannedStep || null,
+    allowedNextCommands: prompt.allowedNextCommands || null,
+    progress: prompt.progress || null,
     completed: prompt.history || { actions: [], observations: [], operations: [] },
     repair: prompt.repair || null,
   };
@@ -2706,13 +3039,15 @@ async function inferStructuredAction(prompt) {
       top_p: 1,
       top_k: 0,
       // Maple's reasoning channel is model output, not a discardable hidden
-      // preamble. Keep reasoning enabled and let the model decide when it is
-      // done; mapleMaxTokens is only the transport/server ceiling.
+      // preamble — it stays on by default; mapleMaxTokens is only the
+      // transport/server ceiling. Same contract as conversation: "off" skips
+      // CoT entirely (much faster action turns); unset leaves Maple's default
+      // channel on without paying the forced enable_thinking flag overhead.
       max_tokens: mapleMaxTokens,
       stream: true,
       stream_options: { include_usage: true },
       response_format: { type: "json_object" },
-      chat_template_kwargs: { enable_thinking: true },
+      ...(selection.reasoning === "off" ? { chat_template_kwargs: { enable_thinking: false } } : {}),
     }),
   }, inferenceTimeoutMs);
   if (!response.ok) {
@@ -2796,6 +3131,7 @@ async function inferStructuredAction(prompt) {
   }
   finishStream(actionStream, { status: "completed", stopReason: finishReason, usage, rawOutputRef });
   serverState = { ...serverState, processReady: true, inferenceReady: true };
+  bumpAgentMetrics({ inferenceLatencyMs: Date.now() - startedAt });
   appendAgentEvent("inference.completed", "passed", {
     mode: "structured-action",
     usage: payload.usage || null,
@@ -2817,15 +3153,112 @@ async function inferStructuredAction(prompt) {
   return { content, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef, streamId: actionStream.streamId, actionChannel: selectedActionText.channel, reasoning: message.reasoning || message.reasoning_content || message.thought || "" };
 }
 
+// Scored-choice transport: same messages as inferStructuredAction, but the
+// server prefills once and teacher-scores each candidate continuation
+// (parallel constrained decoding). The forced <think> opener is closed via
+// prompt_suffix so continuations are pure JSON. A server without /v1/score
+// marks the path unsupported for the session instead of failing every step.
+let scoreEndpointUnsupported = false;
+async function scoreStructuredAction(prompt, candidates) {
+  if (scoreEndpointUnsupported) return null;
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  if (selection.provider !== "maple") return null;
+  if (!prompt.__providerLease) {
+    return threadManager.withProvider(selection.provider, agentTask.threadId || agentTask.id, (lease) => scoreStructuredAction({ ...prompt, __providerLease: true }, candidates).then((result) => {
+      if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
+      return result;
+    }));
+  }
+  const endpoint = agentInferenceEndpoint || serverUrl;
+  const task = agentTask;
+  const startedAt = Date.now();
+  bumpAgentMetrics({ inferenceCalls: 1 });
+  const compactTask = {
+    id: task.id,
+    objective: task.objective,
+    intent: task.intent,
+    interactionMode: task.interactionMode,
+    threadId: task.threadId || null,
+    projectId: task.projectId || null,
+    workspaceRoot: task.workspaceRoot || null,
+    autonomy: task.autonomy || "bounded-local",
+    steering: (task.steering || []).slice(-4).map((item) => String(item?.content || "").slice(0, 200)).filter(Boolean),
+  };
+  const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
+  const actionRequest = {
+    task: compactTask,
+    context: compactContext,
+    nextStep: prompt.nextPlannedStep || null,
+    allowedNextCommands: prompt.allowedNextCommands || null,
+    progress: prompt.progress || null,
+    completed: prompt.history || { actions: [], observations: [], operations: [] },
+    repair: prompt.repair || null,
+  };
+  appendAgentEvent("inference.started", "running", {
+    mode: "scored-choice",
+    taskId: task.id,
+    provider: "maple",
+    model: selection.model || null,
+    step: prompt.history?.actions?.length + 1 || 1,
+    candidateCount: candidates.length,
+  });
+  const response = await fetchMapleWithRecovery(`${endpoint}/v1/score`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: resolveLocalModelPath(selection.model),
+      messages: [
+        { role: "system", content: prompt.system },
+        { role: "user", content: JSON.stringify(actionRequest) },
+      ],
+      // Close the template's forced think block so candidate continuations
+      // are scored as the action JSON itself.
+      prompt_suffix: "</think>\n\n",
+      candidates,
+    }),
+  }, inferenceTimeoutMs);
+  const payload = await readResponse(response);
+  if (!response.ok) {
+    if (response.status === 404) {
+      scoreEndpointUnsupported = true;
+      return null;
+    }
+    const detail = payload?.error || payload?.raw || response.statusText || `HTTP ${response.status}`;
+    const error = new Error(`Maple action scoring returned HTTP ${response.status}: ${detail}`);
+    error.code = response.status >= 500 ? "RUNTIME_UNAVAILABLE" : "ACTION_SCORE_FAILED";
+    appendAgentEvent("inference.failed", "failed", { mode: "scored-choice", error: error.message, elapsedMs: Date.now() - startedAt });
+    throw error;
+  }
+  bumpAgentMetrics({ inferenceLatencyMs: Date.now() - startedAt });
+  appendAgentEvent("inference.completed", "passed", {
+    mode: "scored-choice",
+    telemetry: {
+      elapsedMs: Date.now() - startedAt,
+      promptTokens: payload.promptTokens ?? null,
+      cachedTokens: payload.cachedTokens ?? null,
+      cacheHitRatio: cacheStats({ promptTokens: payload.promptTokens ?? null, cachedTokens: payload.cachedTokens ?? null }).hitRatio,
+      candidateCount: Array.isArray(payload.candidates) ? payload.candidates.length : 0,
+    },
+  });
+  return payload;
+}
+
 let codingAutopilot = null;
 agentOrchestrator = new AgentOrchestrator({
   kernel: agentKernel,
   commandRegistry: agentCommands,
   getTask: () => agentTask,
   setTask: (patch) => updateAgentTask(patch),
-  emit: (type, status, payload, options) => appendAgentEvent(type, status, payload, options),
+  emit: (type, status, payload, options) => {
+    appendAgentEvent(type, status, payload, options);
+    // Queue drain on terminal only — a user-initiated cancel holds the queue
+    // (stopping the run shouldn't silently launch the next queued intent), and
+    // a blocked task waits for a human decision.
+    if (type === "task.completed") void agentIntentQueue?.notifyTaskSettled();
+  },
   executeCommand: (command, payload) => runAgentCommand(command, payload),
   inferAction: inferStructuredAction,
+  scoreActions: scoreStructuredAction,
   repairCoding: (input) => codingAutopilot?.run({
     threadId: agentTask.threadId,
     taskId: agentTask.id,
@@ -2841,6 +3274,15 @@ agentOrchestrator = new AgentOrchestrator({
     appendAgentEvent("suggestion.created", "candidate", { suggestion }, { evidenceRefs: suggestion.evidenceRefs, reversible: true });
     return suggestion;
   },
+  // Recent world findings for the action prompt — compact, evidence-backed,
+  // and read fresh each step so Maple sees what it just learned.
+  worldContext: () => experimentDatasetSummary().count
+    ? readExperimentRows(3).rows.map((row) => ({
+      experiment: row.experiment,
+      claim: String(row.claim || "").slice(0, 160),
+      divergence: Number.isFinite(row.divergence?.worst) ? Math.round(row.divergence.worst * 10000) / 100 : null,
+    }))
+    : null,
 });
 
 codingAutopilot = new CodingAutopilot({
@@ -3048,6 +3490,22 @@ async function repoMap(payload = {}) {
     runChild("git", ["status", "--short"], { cwd: workspaceRoot, timeoutMs: 15000 }),
     runChild("git", ["ls-files"], { cwd: workspaceRoot, timeoutMs: 15000 }),
   ]);
+  let fileList = files.exitCode === 0 ? files.stdout.split(/\r?\n/).filter(Boolean) : [];
+  let fileSource = "git";
+  if (!fileList.length && fs.existsSync(workspaceRoot)) {
+    // Non-git workspaces still map — rg respects ignore files and stays bounded.
+    const listed = await runChild("rg", ["--files", "--hidden", "--glob", "!.git", "--glob", "!node_modules"], { cwd: workspaceRoot, timeoutMs: 15000 });
+    fileList = listed.exitCode === 0 ? listed.stdout.split(/\r?\n/).filter(Boolean) : walkFiles(workspaceRoot, () => true).slice(0, 4000).map((filePath) => path.relative(workspaceRoot, filePath));
+    fileSource = listed.exitCode === 0 ? "rg" : "walk";
+  }
+  const dirCounts = new Map();
+  for (const file of fileList) {
+    const top = file.split("/")[0];
+    if (top && top !== file) dirCounts.set(top, (dirCounts.get(top) || 0) + 1);
+  }
+  const topDirs = [...dirCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 16).map(([dir, fileCount]) => ({ dir, fileCount }));
+  const keyFiles = ["package.json", "AGENTS.md", "README.md", "state.yaml", "dream-chat/package.json", "dream-chat/electron/main.cjs"]
+    .filter((name) => fs.existsSync(path.join(workspaceRoot, name)));
   return {
     schema: "hemlock.sips.repo-map.v1",
     status: "ready",
@@ -3055,8 +3513,15 @@ async function repoMap(payload = {}) {
     branch: branch.stdout.trim(),
     dirty: Boolean(status.stdout.trim()),
     statusShort: status.stdout.trim(),
-    files: files.stdout.split(/\r?\n/).filter(Boolean).slice(0, 160),
+    files: fileList.slice(0, 160),
+    fileCount: fileList.length,
+    fileSource,
+    topDirs,
+    keyFiles,
+    workspaceDigest: workspaceFingerprint(workspaceRoot),
     receipts: { branch, status, files },
+    summary: `Mapped ${fileList.length} ${fileSource}-listed files under ${workspaceRoot} across ${topDirs.length} top-level directories.`,
+    evidenceRefs: [`repo://${workspaceRoot}`, "repo://current-worktree"],
     claimBoundary: "Repo map is a current local worktree observation; it does not imply a patch was applied or committed.",
   };
 }
@@ -3090,13 +3555,14 @@ async function codingInference(prompt, adapterPath = "") {
   return { content: String(choice.message.content || "").trim(), reasoning: String(choice.message.reasoning || "").trim(), usage: payload.usage || null };
 }
 
-async function startServer(adapterPath = "") {
+async function startServer(adapterPath = "", modelOverride = "") {
   if (serverProcess && !serverProcess.killed) return;
+  const servingModelPath = modelOverride || modelPath;
   // T9-H1: validate the checkpoint BEFORE spawning so a bad selection fails
   // with a fixable message instead of a server-side 404 after boot.
-  const checkpointProblem = mlxCheckpointProblem(modelPath);
+  const checkpointProblem = mlxCheckpointProblem(servingModelPath);
   if (checkpointProblem) {
-    throw new Error(`Model at ${modelPath} is not a valid MLX checkpoint (missing ${checkpointProblem}). Open Settings → Model to fix.`);
+    throw new Error(`Model at ${servingModelPath} is not a valid MLX checkpoint (missing ${checkpointProblem}). Open Settings → Model to fix.`);
   }
   // Adopt an already-running Maple server instead of colliding with it. A
   // leftover server from a prior launch, a crashed process, or an external
@@ -3120,9 +3586,13 @@ async function startServer(adapterPath = "") {
     // No server answering yet; fall through and spawn our own.
   }
   const args = [...serverArgs];
+  if (modelOverride) {
+    const modelFlag = args.indexOf("--model");
+    if (modelFlag >= 0) args[modelFlag + 1] = modelOverride;
+  }
   if (adapterPath) args.push("--adapter-path", adapterPath);
   serverProcessError = null;
-  serverState = { processReady: false, inferenceReady: false, adapterPath };
+  serverState = { processReady: false, inferenceReady: false, adapterPath, modelPath: servingModelPath };
   console.log(`[hemlock] Maple launch python=${python} architecture=${pythonArchitecture || process.arch}`);
   const child = spawnPython([...pythonFlags, serverScript, ...args], {
     cwd: repoRoot,
@@ -3462,7 +3932,7 @@ async function runDream(payload) {
     runDir,
     facts: Array.isArray(payload?.facts) ? payload.facts : [],
     conversation: Array.isArray(payload?.conversation) ? payload.conversation : [],
-    examples: Array.isArray(payload?.examples) ? payload.examples : [],
+    examples: [...(Array.isArray(payload?.examples) ? payload.examples : []), ...experimentDatasetExamples()],
     profile,
     iters: Number.isFinite(payload?.iters) ? payload.iters : profileIters,
     numLayers: Number.isFinite(payload?.numLayers) ? payload.numLayers : 1,
@@ -3557,11 +4027,15 @@ async function runDream(payload) {
           }
           const adapterPath = reportedAdapterPath || path.join(runDir, "adapters");
           emitDreamProgress({ stage: "local adapter saved — checking server process readiness", progress: 94, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "" });
-          // startServer() adopts an existing server or spawns one; the
-          // waitForServer().then() below owns readiness detection, so this
-          // call is intentionally fire-and-forget (it lives inside a
-          // non-async 'exit' event handler).
-          void startServer();
+          // Auto-graft: restart the server WITH the trained adapter as the
+          // default (--adapter-path). A bare restart plus per-request
+          // `adapters` fields would pay a full model reload on every
+          // base<->adapter switch because model_key includes the adapter
+          // path. SIPS nested runs pass autoGraft:false and promote after
+          // their own base-vs-adapter comparison instead.
+          const graft = payload?.autoGraft !== false;
+          void startServer(graft ? adapterPath : undefined);
+          if (graft) registerGraft({ adapterPath, runId, trainingReceipt });
           waitForServer(readinessTimeoutMs).then(async (processStatus) => {
             emitDreamProgress({ stage: "server process ready — verifying adapter inference", progress: 95, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "HTTP liveness is not an inference result", serverProcessReady: processStatus.processReady, inferenceReady: false });
             try {
@@ -3646,6 +4120,9 @@ async function runSipsCycle(payload) {
       facts: [],
       conversation: [],
       examples: examples.map((example) => ({ ...example, metadata: { ...(example.metadata || {}), objective, source: "hemlock-chat" } })),
+      // SIPS owns promotion: it compares base-vs-adapter after training and
+      // decides whether the graft stays. Auto-graft is for standalone Dreams.
+      autoGraft: false,
       profile: trainingProfile,
       iters: Number.isFinite(payload?.iters) ? payload.iters : undefined,
       numLayers: Number.isFinite(payload?.numLayers) ? payload.numLayers : 1,

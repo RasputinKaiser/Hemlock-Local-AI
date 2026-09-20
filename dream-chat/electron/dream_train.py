@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 
+MAX_SEQ_LENGTH = 512
+
 TRAINING_PROFILES = {
     "smoke": {
         "iters": 1,
@@ -201,7 +203,67 @@ def capture_training_metric(line, metrics, observations=None):
         observations.setdefault("optimizerSteps", []).append(step)
 
 
-def write_dataset(run_dir, facts, conversation, examples=None):
+def load_tokenizer(model_path):
+    """Best-effort tokenizer for dataset budgeting; None falls back to a
+    character estimate. Runs under -S with PYTHONPATH-provided site-packages."""
+    try:
+        from transformers import AutoTokenizer  # noqa: PLC0415
+
+        return AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+    except Exception:
+        return None
+
+
+def make_token_counter(tokenizer):
+    if tokenizer is None:
+        def count(messages):
+            return sum(len(str(m.get("content", ""))) for m in messages) // 4 + 16
+        return count
+
+    def count(messages):
+        try:
+            return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
+        except Exception:
+            return sum(len(str(m.get("content", ""))) for m in messages) // 4 + 16
+    return count
+
+
+def split_oversize_row(messages, count_tokens, max_tokens, depth=0):
+    """Split an oversized conversation at an assistant boundary so every row
+    retains supervised content. Mid-row trainer truncation would silently
+    drop the tail — and with --mask-prompt a long prompt can yield zero
+    supervised tokens entirely."""
+    if len(messages) <= 2 or depth >= 4 or count_tokens(messages) <= max_tokens:
+        return [messages]
+    mid = len(messages) / 2
+    boundaries = [i for i in range(1, len(messages)) if messages[i - 1].get("role") == "assistant"]
+    if not boundaries:
+        return [messages]
+    cut = min(boundaries, key=lambda i: abs(i - mid))
+    head = split_oversize_row(messages[:cut], count_tokens, max_tokens, depth + 1)
+    tail = split_oversize_row(messages[cut:], count_tokens, max_tokens, depth + 1)
+    return head + tail
+
+
+def fit_oversize_row(messages, count_tokens, max_tokens):
+    """A row that cannot split further (e.g. one very long message) gets its
+    largest message trimmed to fit — recorded honestly in row metadata rather
+    than silently cut by the trainer's token truncation."""
+    if count_tokens(messages) <= max_tokens:
+        return messages, False
+    fitted = [dict(m) for m in messages]
+    for _ in range(8):
+        current = count_tokens(fitted)
+        if current <= max_tokens:
+            return fitted, True
+        longest = max(range(len(fitted)), key=lambda i: len(str(fitted[i].get("content", ""))))
+        content = str(fitted[longest].get("content", ""))
+        keep = max(64, int(len(content) * (max_tokens / current) * 0.9))
+        fitted[longest]["content"] = content[:keep].rstrip() + " …"
+    return fitted, True
+
+
+def write_dataset(run_dir, facts, conversation, examples=None, tokenizer=None, max_tokens=448):
     prepared_examples = []
     for example in (examples or []):
         if not isinstance(example, dict):
@@ -256,6 +318,24 @@ def write_dataset(run_dir, facts, conversation, examples=None):
         unique_examples.append(example)
     prepared_examples = unique_examples
 
+    # Token-budget the rows before the trainer sees them: a row longer than
+    # --max-seq-length is hard-truncated downstream, which drops the answer
+    # tail (or, with --mask-prompt, can zero out supervision entirely). Split
+    # at assistant boundaries instead so no content is silently lost.
+    count_tokens = make_token_counter(tokenizer)
+    budgeted = []
+    rows_split = 0
+    for example in prepared_examples:
+        pieces = split_oversize_row(example["messages"], count_tokens, max_tokens)
+        if len(pieces) > 1:
+            rows_split += 1
+        for piece in pieces:
+            fitted, trimmed = fit_oversize_row(piece, count_tokens, max_tokens)
+            budgeted.append({"messages": fitted, "metadata": {**example.get("metadata", {}), "splitFromSource": len(pieces) > 1, "contentTrimmed": trimmed}})
+    prepared_examples = budgeted
+    token_lengths = [count_tokens(row["messages"]) for row in prepared_examples]
+    oversized = sum(1 for length in token_lengths if length > max_tokens)
+
     # Make validation deterministic while retaining enough repeated examples
     # for a tiny personal dataset. A one-example validation set is sufficient
     # for the short local run and avoids an empty validation iterator.
@@ -286,6 +366,14 @@ def write_dataset(run_dir, facts, conversation, examples=None):
             "min": min(assistant_lengths) if assistant_lengths else 0,
             "max": max(assistant_lengths) if assistant_lengths else 0,
         },
+        "tokenBudget": max_tokens,
+        "tokenRange": {
+            "min": min(token_lengths) if token_lengths else 0,
+            "max": max(token_lengths) if token_lengths else 0,
+        },
+        "rowsSplit": rows_split,
+        "oversizedRowsRemaining": oversized,
+        "tokenizer": "chat-template" if tokenizer is not None else "char-estimate",
         "claimBoundary": "A one-row or non-holdout validation set measures liveness only; it is not generalization proof.",
     }
     write_json(data_dir / "manifest.json", manifest)
@@ -313,7 +401,8 @@ def main():
     before_manifest = base_weight_manifest(model_path)
     write_json(run_dir / "base-weights-before.json", before_manifest)
     emit("writing consented Dream dataset", 16, "facts and recent local turns")
-    data_dir, train_count, valid_count, dataset_manifest = write_dataset(run_dir, facts, conversation, coding_examples)
+    tokenizer = load_tokenizer(model_path)
+    data_dir, train_count, valid_count, dataset_manifest = write_dataset(run_dir, facts, conversation, coding_examples, tokenizer=tokenizer, max_tokens=MAX_SEQ_LENGTH - 64)
     adapter_dir = choose_adapter_dir(run_dir)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     emit("loading Maple checkpoint", 22, f"{train_count} training examples · {valid_count} validation example")
@@ -346,7 +435,7 @@ def main():
         "--save-every",
         str(iters),
         "--max-seq-length",
-        "256",
+        str(MAX_SEQ_LENGTH),
         "--adapter-path",
         str(adapter_dir),
         "--trust-remote-code",

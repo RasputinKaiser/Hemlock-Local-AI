@@ -11,6 +11,9 @@ const {
   boundedActionInput,
   clampBudgetOverrides,
   coerceActionPayload,
+  normalizeCompactChoice,
+  buildScoreCandidates,
+  pickScoredCandidate,
   extractActionEnvelope,
   mergeBudget,
   normalizeExpectedEvidence,
@@ -52,6 +55,9 @@ const COMMAND_EVIDENCE = Object.freeze({
   "artifact.preview.open": ["preview://session"],
   "artifact.preview.inspect": ["preview://inspection"],
   "artifact.preview.interact": ["preview://interaction"],
+  "experiment.run": ["experiment://receipt"],
+  "experiment.note": ["experiment://finding"],
+  "experiment.dataset": ["experiment://dataset"],
 });
 
 function expectedEvidenceForCommand(commandId, fallback = []) {
@@ -60,29 +66,78 @@ function expectedEvidenceForCommand(commandId, fallback = []) {
     : normalizeExpectedEvidence(fallback, [`receipt://${String(commandId || "command").replace(/[^a-z0-9._-]+/gi, "-")}`]);
 }
 
-function modelMaySelectCommand(commandId, descriptor = {}, plan = { steps: [] }) {
+// Recovery guidance appended to thrown-command observation summaries so the
+// next bounded turn can fix the input instead of re-failing the same way.
+const ACTIONABLE_HINTS = Object.freeze({
+  "artifact.create": "input carries only artifactId, title, kind, entrypoint, mime — never source or HTML",
+  "artifact.author": "supply input.source as a complete self-contained HTML document",
+  "artifact.update": "supply input.source as a complete relative-file map or input.patches as complete-file replacements",
+  "artifact.preview.open": "provide input.artifactId from an artifact.create receipt",
+  "artifact.preview.inspect": "open a preview first or provide input.sessionId",
+  "artifact.preview.interact": "open a preview first or provide input.sessionId",
+  "code.apply": "supply input.source as a complete relative-file map or input.patches as complete-file replacements",
+  "context.query": "supply input.query as a short question",
+  "context.search": "supply input.query as a short search string",
+  "experiment.run": "input.experiment must be one of pendulum|projectile|orbit|spring|collision|terminal",
+  "experiment.note": "supply input.claim; experimentId defaults to the latest run receipt",
+  "file.read": "supply input.path as a repo-relative file path",
+  "file.search": "supply input.query as a short search string",
+  verify: "input.profile must be one of app-build|diff-check|python-tests",
+});
+
+// Guided autonomy widens adaptive selection to sandboxed capabilities only —
+// artifact authoring and preview sessions are versioned and isolated, so they
+// can run without a per-action click. Autonomous additionally permits every
+// capability except train, which always requires an explicit user action.
+const GUIDED_AUTO_CAPABILITIES = new Set(["artifact", "preview"]);
+
+function autonomyLevel(task = {}) {
+  const value = String(task?.autonomy || "bounded-local").toLowerCase();
+  if (value === "autonomous" || value === "bounded-campaign") return "autonomous";
+  if (value === "guided") return "guided";
+  return "supervised";
+}
+
+function autonomyPermitsCommand(task, commandId, commandRegistry = {}) {
+  const level = autonomyLevel(task);
+  if (level === "supervised") return false;
+  const capability = String(commandRegistry?.[commandId]?.capability || "").toLowerCase();
+  if (level === "guided") return GUIDED_AUTO_CAPABILITIES.has(capability);
+  return capability !== "train";
+}
+
+function modelMaySelectCommand(commandId, descriptor = {}, plan = { steps: [] }, autonomy = "supervised") {
   const capability = String(descriptor.capability || "").toLowerCase();
   const planned = (plan.steps || []).some((step) => step.commandId === commandId);
   if (!commandId || !capability || FORBIDDEN_ADAPTIVE_CAPABILITIES.has(capability)) return false;
-  if (!SAFE_ADAPTIVE_CAPABILITIES.has(capability)) return false;
+  const autonomyOpens = autonomy === "guided"
+    ? GUIDED_AUTO_CAPABILITIES.has(capability)
+    : autonomy === "autonomous" && capability !== "train";
+  if (!autonomyOpens && !SAFE_ADAPTIVE_CAPABILITIES.has(capability)) return false;
   // A command already present in the user-approved plan is available even if
   // its descriptor is normally explicit (artifact authoring is the important
-  // example). New model-selected commands must be host-marked auto-safe.
-  if (!planned && descriptor.auto !== true) return false;
-  if (!planned && descriptor.approval === "explicit") return false;
+  // example). New model-selected commands must be host-marked auto-safe —
+  // unless the task's autonomy level opens that capability.
+  if (!planned && !autonomyOpens && descriptor.auto !== true) return false;
+  if (!planned && !autonomyOpens && descriptor.approval === "explicit") return false;
   return true;
 }
 
-function allowedNextCommands(commandRegistry = {}, plan = { steps: [] }, history = {}) {
+function allowedNextCommands(commandRegistry = {}, plan = { steps: [] }, history = {}, autonomy = "supervised") {
+  const inputHintOf = (commandId) => {
+    const hint = commandRegistry[commandId]?.inputHint;
+    return typeof hint === "string" && hint.trim() ? { hint: hint.trim() } : {};
+  };
   const planned = (plan.steps || []).slice(Number(history.actions?.length || 0)).map((step) => ({
     commandId: step.commandId,
     label: step.label,
     capability: commandRegistry[step.commandId]?.capability || "planned",
     source: "approved-plan",
+    ...inputHintOf(step.commandId),
   })).filter((item) => item.commandId);
   const adaptive = Object.entries(commandRegistry)
-    .filter(([commandId, descriptor]) => modelMaySelectCommand(commandId, descriptor, plan))
-    .map(([commandId, descriptor]) => ({ commandId, label: descriptor.label || commandId, capability: descriptor.capability, source: "adaptive-safe" }));
+    .filter(([commandId, descriptor]) => modelMaySelectCommand(commandId, descriptor, plan, autonomy))
+    .map(([commandId, descriptor]) => ({ commandId, label: descriptor.label || commandId, capability: descriptor.capability, source: "adaptive-safe", ...inputHintOf(commandId) }));
   const seen = new Set();
   return [...planned, ...adaptive].filter((item) => {
     if (seen.has(item.commandId)) return false;
@@ -104,9 +159,39 @@ function completedTaskCommands(history = {}) {
     .map((action) => action.commandId));
 }
 
-function resolveProgressCommand(proposal, completedIds, planSteps = []) {
+// Commands whose input selects genuinely different work — a world experiment
+// sweep (pendulum length 1 vs 2) or a different file read is new evidence, not
+// a loop. For these, a repeat means the same command AND the same effective
+// input. For everything else, a completed commandId is a repeat regardless of
+// input, so junk-parameter evasion still redirects.
+const PARAMETERIZED_REPEAT_COMMANDS = new Set([
+  "experiment.run", "experiment.note", "experiment.dataset",
+  "file.read", "file.search", "context.search", "context.query",
+  "recall", "receipt.inspect", "receipts.query", "verify", "test.discover",
+  "code.inspect", "artifact.inspect", "artifact.compare",
+]);
+
+function stableDigest(value) {
+  if (Array.isArray(value)) return `[${value.map(stableDigest).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableDigest(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+function completedWorkKeys(history = {}) {
+  return new Set((history.actions || [])
+    .filter((action) => TERMINAL_ACTION_STATUSES.has(action.status) && action.kind !== "ask_user" && action.commandId)
+    .map((action) => `${action.commandId}::${stableDigest(action.input || {})}`));
+}
+
+function resolveProgressCommand(proposal, completedIds, completedWork, planSteps = []) {
   const requested = String(proposal?.commandId || "").trim();
-  if (!requested || !completedIds?.has(requested)) return { commandId: requested || null, redirected: false };
+  if (!requested) return { commandId: null, redirected: false };
+  const repeated = PARAMETERIZED_REPEAT_COMMANDS.has(requested)
+    ? completedWork?.has(`${requested}::${stableDigest(proposal?.input || {})}`)
+    : completedIds?.has(requested);
+  if (!repeated) return { commandId: requested || null, redirected: false };
   const nextIndex = planSteps.findIndex((step) => step?.commandId && !completedIds.has(step.commandId));
   const redirect = nextIndex >= 0 ? planSteps[nextIndex] : null;
   return {
@@ -130,6 +215,12 @@ function actionInputContract(commandId) {
       return "input should be {} unless the host-provided preview/session identifier is required.";
     case "code.apply":
       return "input must contain either a complete source map under source or a bounded list of complete-file replacements under patches.";
+    case "experiment.run":
+      return "input must contain experiment (one of projectile, pendulum, spring, orbit, collision, terminal) and may contain input (bounded numeric parameters), seed, and hypothesis. The host clamps parameters and runs the deterministic simulation; you do not compute results.";
+    case "experiment.note":
+      return "input should contain experimentId (defaults to the latest run receipt) and claim — your interpretation of what the measured result showed. The host attaches the real measurements verbatim.";
+    case "experiment.dataset":
+      return "input may contain only limit (max 400).";
     default:
       return "input should be {}. The host supplies task identity, command identity, approval, and evidence.";
   }
@@ -138,6 +229,11 @@ function actionInputContract(commandId) {
 function defaultPlanSteps(intent, objective = "") {
   if (intent === "verify") return [{ commandId: "verification.list", label: "Select an allowlisted verification", expectedEvidence: ["verification://profiles"] }, { commandId: "verify", label: "Run the selected verification", expectedEvidence: ["receipt://verification"] }];
   if (intent === "memory") return [{ commandId: "recall", label: "Recall scoped project lessons", expectedEvidence: ["memory://scoped"] }];
+  if (intent === "experiment") return [
+    { commandId: "experiment.run", label: "Run a bounded physics experiment in the world", expectedEvidence: ["experiment://receipt"] },
+    { commandId: "experiment.note", label: "Record the finding into the Dream dataset", expectedEvidence: ["experiment://finding"] },
+    { kind: "answer", label: "Interpret what the world showed" },
+  ];
   if (intent === "inspect") return [{ commandId: "repo-map", label: "Map the current repository", expectedEvidence: ["repo://current-worktree"] }, { commandId: "repo.inspect", label: "Inspect the bounded project surface", expectedEvidence: ["repo://inspection"] }];
   if (intent === "coding") {
     const artifactRequest = /\b(artifact|animation|animated|html|css|javascript|typescript|canvas|svg)\b/i.test(String(objective));
@@ -186,7 +282,7 @@ function fallbackAnimationSource(objective = "Eastern Hemlock night garden") {
 }
 
 class AgentOrchestrator {
-  constructor({ kernel, commandRegistry, getTask, setTask, emit, executeCommand, inferAction, repairCoding, createSuggestion }) {
+  constructor({ kernel, commandRegistry, getTask, setTask, emit, executeCommand, inferAction, scoreActions, repairCoding, createSuggestion, worldContext }) {
     this.kernel = kernel;
     this.commandRegistry = commandRegistry || {};
     this.getTask = getTask;
@@ -194,8 +290,10 @@ class AgentOrchestrator {
     this.emit = emit || (() => {});
     this.executeCommand = executeCommand;
     this.inferAction = inferAction || null;
+    this.scoreActions = scoreActions || null;
     this.repairCoding = repairCoding || null;
     this.createSuggestion = createSuggestion || null;
+    this.worldContext = worldContext || null;
   }
 
   task() {
@@ -269,12 +367,24 @@ class AgentOrchestrator {
     if (!task || task.id !== taskId) throw new Error("Hemlock cannot resume an unknown task.");
     if (TERMINAL_TASK_STATUSES.has(task.status)) throw new Error(`The task is already terminal: ${task.status}.`);
     const plan = this.kernel.getProjection().plans.find((item) => item.id === task.activePlanId && item.taskId === taskId);
+    if (task.status === "paused" && (!plan || plan.status !== "approved")) {
+      // Paused before approval — resume restores the parked status, not the
+      // execution loop (there is no approved plan to step into).
+      const restore = task.pausedFrom || "waiting_for_approval";
+      this.updateTask({ status: restore, phase: restore === "waiting_for_approval" ? "approval" : task.phase, foregroundStep: "Resumed — awaiting the next decision", pausedAt: null, pausedFrom: null, pausedAnnounced: false });
+      this.emit("task.resumed", restore, { taskId }, { reversible: true });
+      return { schema: "hemlock.agent.task.result.v1", status: restore, task: this.task() };
+    }
     if (!plan || plan.status !== "approved") throw new Error("Approve a plan before resuming execution.");
+    if (task.status === "paused") {
+      this.updateTask({ status: "running", phase: "work", foregroundStep: "Resuming the approved plan", pausedAt: null, pausedFrom: null, pausedAnnounced: false });
+      this.emit("task.resumed", "running", { taskId }, { reversible: true });
+    }
     return this.proposeNextAction(taskId, plan);
   }
 
   allowedNextCommands(task, plan, history) {
-    return allowedNextCommands(this.commandRegistry, plan, history);
+    return allowedNextCommands(this.commandRegistry, plan, history, autonomyLevel(task));
   }
 
   selectModelCommand(task, plan, history, requestedCommandId) {
@@ -284,7 +394,7 @@ class AgentOrchestrator {
     if (!requested || requested === "none") return { commandId: currentCommandId, mode: "planned", reason: "model omitted a command" };
     if (requested === currentCommandId) return { commandId: requested, mode: "planned", reason: null };
     const descriptor = this.commandRegistry[requested];
-    if (descriptor && modelMaySelectCommand(requested, descriptor, plan)) {
+    if (descriptor && modelMaySelectCommand(requested, descriptor, plan, autonomyLevel(task))) {
       return { commandId: requested, mode: "adaptive", reason: "Maple selected an allowlisted next action" };
     }
     if (currentCommandId) {
@@ -382,39 +492,116 @@ class AgentOrchestrator {
     };
     const nextPlannedStep = plan.steps[history.actions.length] || null;
     const allowedCommands = this.allowedNextCommands(task, plan, history);
+    // INPUT CONTRACTS stays registry-derived (not allowedCommands-derived) so
+    // the system prompt remains byte-static across steps and the Maple prompt
+    // cache still holds — it is a superset of whatever is currently allowed.
+    // Priority order is fixed (failure-prone commands first): registry order
+    // would push artifact.author/code.apply/experiment.run past the cap.
+    const INPUT_CONTRACT_PRIORITY = [
+      "artifact.author", "artifact.update", "artifact.create", "code.apply",
+      "experiment.run", "experiment.note", "improve.propose", "verify",
+      "file.read", "file.search", "context.search", "context.query",
+      "artifact.preview.open", "repo.inspect", "repo-map", "remember",
+    ];
+    const hintEntries = Object.entries(this.commandRegistry)
+      .map(([commandId, descriptor]) => [commandId, String(descriptor?.inputHint || "").trim()])
+      .filter(([, hint]) => hint);
+    const inputContracts = [
+      ...INPUT_CONTRACT_PRIORITY
+        .map((commandId) => hintEntries.find(([id]) => id === commandId))
+        .filter(Boolean),
+      ...hintEntries.filter(([commandId]) => !INPUT_CONTRACT_PRIORITY.includes(commandId)),
+    ].slice(0, 16);
     // T12 next-action clarity: Maple's failed-session reasoning showed genuine
     // confusion about what had already finished ("plan.approve is running but
     // not yet completed... suggests the plan has been approved"). Make the
     // completion state explicit and compact so stale commands stop looking live.
     const completedIds = completedTaskCommands(history);
-    const completedList = [...completedIds].join(", ");
     const totalSteps = plan.steps.filter((step) => step?.commandId).length;
     const doneSteps = plan.steps.filter((step) => step?.commandId && completedIds.has(step.commandId)).length;
+    // T13 compact-choice contract: the system prompt is fully static so the
+    // Maple prompt cache holds across steps (cacheHitRatio telemetry records
+    // the win), and the model only emits the fields it actually decides — the
+    // host assigns id/taskId/step/approval/status/expectedEvidence anyway, so
+    // asking for them was pure hallucination surface. Volatile progress moved
+    // into the request body.
     const actionPrompt = {
       system: [
         "You are Maple-Preview operating inside Hemlock.",
-        "Return exactly one compact JSON action envelope in the content channel and no prose or markdown.",
-        "The host owns id, taskId, step, commandId, kind, approval, expectedEvidence, status, and lifecycle. Do not spend output on those fields beyond the required envelope.",
-        "The approved plan is a user-approved capability boundary and a starting direction, not a rigid script. Choose the next best allowlisted command from allowedNextCommands when more inspection, verification, or artifact work is useful.",
-        "You may return kind ask_user when a real user decision is needed, kind blocked when the host boundary prevents progress, or kind answer when the task is genuinely answerable without another command. Do not claim completion without host evidence.",
+        "Return exactly one compact JSON choice in the content channel — no prose, no markdown, nothing else:",
+        '{"kind":"tool","commandId":"<one allowedNextCommands entry>","input":{},"shortRationale":"one-line reason"}',
+        "kind may instead be answer, ask_user, or blocked: terminal choices with no commandId.",
+        "The host assigns id, taskId, step, approval, expectedEvidence, and status. Never emit them.",
+        "The approved plan is a user-approved capability boundary and a starting direction, not a rigid script. Choose the next best command from request.allowedNextCommands when more inspection, verification, or artifact work is useful; the host validates and records the adaptation.",
+        "request.progress.completedCommands are finished — never re-propose them; a re-proposal is redirected to the plan.",
+        ...(inputContracts.length ? [
+          "INPUT CONTRACTS (commandId → input shape):",
+          ...inputContracts.map(([commandId, hint]) => `${commandId} → ${hint}`),
+          "Prefer a tool call over answer when evidence is missing; keep input minimal but complete — free text goes in the named field, not nested objects.",
+        ] : []),
         "Never put HTML, source code, or a large payload in artifact.create. Use the later artifact.author step for complete source.",
         "If evidence is insufficient, return kind ask_user or blocked. Do not claim completion without a host observation or receipt.",
-        '{"schema":"hemlock.agent.action.v1","id":"a","taskId":"t","step":1,"kind":"tool","commandId":"registered-command","input":{},"shortRationale":"Short reason","expectedEvidence":[],"approval":"none","status":"proposed"}',
-        `The current planned command is ${nextPlannedStep?.commandId || "none"}. You may choose another entry from allowedNextCommands if it better serves the objective; the host will validate and record that adaptation.`,
-        completedList ? `Completed already (do NOT repeat; a re-proposal is redirected to the plan): ${completedList}` : `Completed already (do NOT repeat): none`,
-        `Plan status: approved. Plan progress: step ${Math.min(doneSteps + 1, Math.max(totalSteps, 1))} of ${Math.max(totalSteps, 1)}${totalSteps ? "" : " (no planned tool steps)"}.`,
-        `allowedNextCommands: ${JSON.stringify(allowedCommands)}`,
-        `Input contract for the current planned command: ${actionInputContract(nextPlannedStep?.commandId)} Use the reasoning channel as needed, then finish with the action envelope.`,
       ].join("\n"),
       task,
       plan,
       nextPlannedStep,
       allowedNextCommands: allowedCommands,
       history: compactHistory,
+      progress: {
+        plannedCommand: nextPlannedStep?.commandId || null,
+        completedCommands: [...completedIds],
+        planProgress: `step ${Math.min(doneSteps + 1, Math.max(totalSteps, 1))} of ${Math.max(totalSteps, 1)}${totalSteps ? "" : " (no planned tool steps)"}`,
+        inputContract: actionInputContract(nextPlannedStep?.commandId),
+        // What Maple has already learned in the world — lets follow-up
+        // experiments build on prior findings instead of repeating blindly.
+        worldFindings: (() => { try { return this.worldContext?.() || null; } catch { return null; } })(),
+      },
     };
-    let response;
+    // Scored-choice fast path (parallel constrained decoding): enumerate the
+    // closed command set as minimal candidate continuations and let the model
+    // score them against the shared prefilled prompt instead of generating an
+    // envelope token-by-token. A `complete` winner is already a valid compact
+    // envelope — zero generated tokens, nothing to misparse. A prefix winner
+    // means a generative action was chosen; its decision is recorded into
+    // progress and the normal generative path fills in the free fields.
+    let response = null;
+    if (this.scoreActions) {
+      try {
+        const candidates = buildScoreCandidates(allowedCommands.map((entry) => entry.commandId));
+        const startedAt = Date.now();
+        const scored = await this.scoreActions(actionPrompt, candidates.map((candidate) => candidate.text));
+        const decision = pickScoredCandidate(candidates, scored);
+        if (decision) {
+          this.emit("action.scored", "passed", {
+            taskId: task.id,
+            winner: { kind: decision.winner.kind, commandId: decision.winner.commandId },
+            complete: decision.winner.complete,
+            avgLogprob: decision.winner.avgLogprob,
+            margin: decision.margin,
+            runnerUp: decision.runnerUp,
+            candidateCount: decision.candidateCount,
+            cachedTokens: decision.cachedTokens,
+            elapsedMs: Date.now() - startedAt,
+          }, { reversible: true });
+          if (decision.winner.complete) {
+            response = { content: decision.winner.text, channels: [], rawOutputRef: null };
+          } else {
+            actionPrompt.progress.scoredDecision = {
+              kind: decision.winner.kind,
+              commandId: decision.winner.commandId,
+              margin: decision.margin,
+            };
+          }
+        }
+      } catch (scoreError) {
+        this.emit("action.scored", "degraded", {
+          taskId: task.id,
+          error: scoreError.message,
+        }, { reversible: true });
+      }
+    }
     try {
-      response = await this.inferAction(actionPrompt);
+      if (!response) response = await this.inferAction(actionPrompt);
     } catch (firstInferenceError) {
       this.emit("action.inference.failed", "degraded", {
         error: firstInferenceError.message,
@@ -424,7 +611,7 @@ class AgentOrchestrator {
         repairAttempt: true,
       }, { reversible: true });
       try {
-        response = await this.inferAction({ ...actionPrompt, repair: `Maple did not return a usable action. Return exactly one JSON action envelope for the registered commands. Any model-emitted channels remain recorded separately. The prior error was: ${firstInferenceError.message}` });
+        response = await this.inferAction({ ...actionPrompt, repair: `Maple did not return a usable action. Return exactly one compact JSON choice {"kind","commandId","input","shortRationale"} for an allowedNextCommands entry. Any model-emitted channels remain recorded separately. The prior error was: ${firstInferenceError.message}` });
       } catch (secondInferenceError) {
         const error = new Error(`Maple failed to return a structured action after one repair: ${secondInferenceError.message}`);
         error.code = "INVALID_ACTION_OUTPUT";
@@ -451,7 +638,8 @@ class AgentOrchestrator {
     const normalizeHostFields = (action, modelResult = {}) => {
       const recoveredTruncated = action?.__recoveredTruncated === true;
       const coercedPayload = action?.__coercedPayload === true;
-      const { __recoveredTruncated: _recoveredTruncated, __coercedPayload: _coercedPayload, ...modelFields } = action || {};
+      const compactChoice = action?.__compactChoice === true;
+      const { __recoveredTruncated: _recoveredTruncated, __coercedPayload: _coercedPayload, __compactChoice: _compactChoice, ...modelFields } = action || {};
       const requestedId = String(action?.id || "").trim();
       // The model-facing example intentionally uses a readable placeholder,
       // but action identity belongs to the host. Reusing that placeholder (or
@@ -483,7 +671,7 @@ class AgentOrchestrator {
           status: "proposed",
           rawModelOutputRef: modelResult.rawOutputRef || null,
           modelChannels: Array.isArray(modelResult.channels) ? modelResult.channels : [],
-          parseStatus: recoveredTruncated ? "recovered-truncated" : coercedPayload ? "coerced-payload" : "valid",
+          parseStatus: recoveredTruncated ? "recovered-truncated" : coercedPayload ? "coerced-payload" : compactChoice ? "compact-choice" : "valid",
         }, this.commandRegistry);
       }
       const selectedStep = selection.step;
@@ -502,7 +690,7 @@ class AgentOrchestrator {
         hostSelection: { requestedCommandId, selectedCommandId: selection.commandId, mode: selection.decision.mode, reason: selection.decision.reason },
         rawModelOutputRef: modelResult.rawOutputRef || null,
         modelChannels: Array.isArray(modelResult.channels) ? modelResult.channels : [],
-        parseStatus: recoveredTruncated ? "recovered-truncated" : coercedPayload ? "coerced-payload" : "valid",
+        parseStatus: recoveredTruncated ? "recovered-truncated" : coercedPayload ? "coerced-payload" : compactChoice ? "compact-choice" : "valid",
       }, this.commandRegistry);
     };
     const parseModelResult = (value) => {
@@ -515,7 +703,7 @@ class AgentOrchestrator {
         throw error;
       }
       try {
-        const parsed = extractActionEnvelope(modelResult.content);
+        const parsed = normalizeCompactChoice(extractActionEnvelope(modelResult.content));
         try {
           return { modelResult, action: normalizeHostFields(parsed, modelResult) };
         } catch (validationError) {
@@ -524,6 +712,7 @@ class AgentOrchestrator {
             taskId: task.id,
             step: history.actions.length + 1,
             commandId: selection.commandId,
+            kind: selection.kind,
             expectedEvidence: selection.step?.expectedEvidence || [],
             approval: selection.step?.approval || "none",
           });
@@ -547,7 +736,7 @@ class AgentOrchestrator {
         repairAttempt: true,
       }, { reversible: true });
       try {
-        response = await this.inferAction({ ...actionPrompt, repair: `The prior output was invalid: ${firstError.message}. Return only one valid action envelope; preserve any model-emitted channels in the model output record.` });
+        response = await this.inferAction({ ...actionPrompt, repair: `The prior output was invalid: ${firstError.message}. Return only one compact JSON choice object; preserve any model-emitted channels in the model output record.` });
       } catch (repairInferenceError) {
         const error = new Error(`Maple failed during structured-action repair: ${repairInferenceError.message}`);
         error.code = "INVALID_ACTION_OUTPUT";
@@ -578,9 +767,28 @@ class AgentOrchestrator {
     return createAction({ taskId: task.id, step: nextIndex + 1, kind: step.kind || "tool", commandId: step.commandId, input: {}, shortRationale: step.label, expectedEvidence: step.expectedEvidence, approval: step.approval || "none" });
   }
 
+  pauseTask(taskId = this.task()?.id) {
+    const task = this.task();
+    if (!task || task.id !== taskId) return { schema: "hemlock.agent.task.result.v1", status: "not_found", task };
+    if (TERMINAL_TASK_STATUSES.has(task.status) || task.status === "paused") return { schema: "hemlock.agent.task.result.v1", status: task.status, task };
+    this.updateTask({ status: "paused", phase: "paused", foregroundStep: "Paused — resume to continue the plan", pausedAt: new Date().toISOString(), pausedFrom: task.status, pausedAnnounced: true });
+    this.emit("task.paused", "paused", { taskId, step: task.foregroundStep }, { reversible: true });
+    return { schema: "hemlock.agent.task.result.v1", status: "paused", task: this.task() };
+  }
+
   async proposeNextAction(taskId, plan) {
     const task = this.task();
     if (TERMINAL_TASK_STATUSES.has(task?.status)) return { schema: "hemlock.agent.task.result.v1", status: task.status, task };
+    // Park at the next step boundary while paused. An in-flight action is
+    // allowed to finish and record its observation; the loop resumes when
+    // task.resume flips the status back to running.
+    if (task?.status === "paused") {
+      if (!task.pausedAnnounced) {
+        this.updateTask({ pausedAnnounced: true });
+        this.emit("task.paused", "paused", { taskId, parkedAtStep: this.kernel.getTaskHistory(taskId).actions.length }, { reversible: true });
+      }
+      return { schema: "hemlock.agent.task.result.v1", status: "paused", task: this.task() };
+    }
     const budget = mergeBudget(task?.budget);
     const wallClockStartedAt = budget.wallClockStartedAt || Date.now();
     if (Date.now() - Number(wallClockStartedAt) > Number(budget.maxWallClockMs || DEFAULT_BUDGET.maxWallClockMs)) return this.blockTask(taskId, "Agent wall-clock budget exhausted before a terminal receipt was produced.");
@@ -616,7 +824,7 @@ class AgentOrchestrator {
         const completedIds = completedTaskCommands(history);
         const hasIncompletePlanStep = plan.steps.some((step) => step?.commandId && !completedIds.has(step.commandId));
         if (hasIncompletePlanStep) {
-          const redirect = resolveProgressCommand(action, completedIds, plan.steps);
+          const redirect = resolveProgressCommand(action, completedIds, completedWorkKeys(history), plan.steps);
           if (redirect.redirected) {
             this.emit("action.redirected", "degraded", {
               taskId,
@@ -664,7 +872,14 @@ class AgentOrchestrator {
     this.emit("action.validated", "passed", { action }, { evidenceRefs: action.expectedEvidence, reversible: true });
     if (action.kind === "ask_user") return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_user", action, task: this.task() };
     const planApproved = action.approval === "plan" && this.kernel.getProjection().plans.some((item) => item.id === task.activePlanId && item.status === "approved");
-    if (action.approval !== "none" && !planApproved) return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_approval", action, task: this.task() };
+    const autonomyAllows = action.approval === "explicit" && action.commandId && autonomyPermitsCommand(task, action.commandId, this.commandRegistry);
+    if (autonomyAllows) {
+      // Auditable autonomy: the explicit gate was bypassed by the task's
+      // autonomy level, recorded on the action and as an event.
+      action = { ...action, hostSelection: { ...(action.hostSelection || {}), autonomyBypass: autonomyLevel(task) } };
+      this.emit("action.autonomy.bypass", "observed", { taskId, actionId: action.id, commandId: action.commandId, autonomy: autonomyLevel(task) }, { evidenceRefs: action.expectedEvidence, reversible: true });
+    }
+    if (action.approval !== "none" && !planApproved && !autonomyAllows) return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_approval", action, task: this.task() };
     return this.executeAction(action.id);
   }
 
@@ -944,7 +1159,8 @@ class AgentOrchestrator {
       return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_user", action, task: this.task() };
     }
     const planApproved = action.approval === "plan" && this.kernel.getProjection().plans.some((item) => item.id === task.activePlanId && item.status === "approved");
-    if (action.approval !== "none" && !planApproved) return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_approval", action, task: this.task() };
+    const autonomyAllows = action.approval === "explicit" && action.commandId && autonomyPermitsCommand(task, action.commandId, this.commandRegistry);
+    if (action.approval !== "none" && !planApproved && !autonomyAllows) return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_approval", action, task: this.task() };
     const descriptor = this.commandRegistry[action.commandId] || {};
     if (descriptor.capability === "write") {
       const budget = mergeBudget(this.task().budget);
@@ -1113,7 +1329,8 @@ class AgentOrchestrator {
       return this.proposeNextAction(task.id, nextPlan);
     } catch (error) {
       const category = classifyFailure(error);
-      const observation = compactObservation({ status: "failed", error: error.message, summary: error.message }, { elapsedMs: Date.now() - startedAt });
+      const hint = ACTIONABLE_HINTS[action.commandId];
+      const observation = compactObservation({ status: "failed", error: error.message, summary: hint ? `${error.message} hint: ${hint}` : error.message }, { elapsedMs: Date.now() - startedAt });
       this.kernel.recordObservation(observation);
       this.kernel.transitionAction(action.id, category === "cancelled" ? "cancel" : "fail", { observationId: observation.id, failureCategory: category, error: error.message });
       const episode = this.kernel.appendEpisodeEvent(task.id, { action: this.kernel.getProjection().actions.find((item) => item.id === action.id), observation, outcome: category });
@@ -1188,4 +1405,4 @@ class AgentOrchestrator {
   }
 }
 
-module.exports = { AgentOrchestrator, defaultPlanSteps, completedTaskCommands, resolveProgressCommand };
+module.exports = { AgentOrchestrator, ACTIONABLE_HINTS, defaultPlanSteps, completedTaskCommands, resolveProgressCommand };

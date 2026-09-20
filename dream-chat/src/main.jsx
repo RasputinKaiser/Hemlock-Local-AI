@@ -2,6 +2,15 @@ import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "
 import { createRoot } from "react-dom/client";
 import { Icon } from "./components/Icons.jsx";
 import { WindowFrame } from "./components/WindowFrame.jsx";
+import { WorkspaceOverview } from "./components/WorkspaceOverview.jsx";
+import { WorkspaceHome } from "./components/WorkspaceHome.jsx";
+import { SettingsWorkspace } from "./components/SettingsWorkspace.jsx";
+import { WindowActionsMenu } from "./components/WindowActionsMenu.jsx";
+import { ShortcutGuide } from "./components/ShortcutGuide.jsx";
+import GroveSurface from "./components/GroveSurface.jsx";
+import { CopyMessageButton } from "./components/CopyMessageButton.jsx";
+import { centerWindow, minimizeWorkspace, restoreWorkspace } from "./windowActions.js";
+import { dockApps, shortcutApp } from "./workspaceNavigation.js";
 import {
   WINDOW_DEFINITIONS,
   clampBounds,
@@ -12,6 +21,7 @@ import {
   moveWindow,
   normalizeZOrder,
   openWindowBounds,
+  pointerSnapCommand,
   resizeWindow,
   setWindowState,
   toggleMaximize,
@@ -32,6 +42,9 @@ const WINDOWS_KEY = "hemlock-os-windows-v2";
 const ARTIFACT_LAYOUT_KEY = "hemlock-artifact-layout-v1";
 const PRIMER_KEY = "hemlock-primer-v1";
 const UNDERSTORY_KEY = "hemlock-understory-v1";
+const AUTONOMY_KEY = "hemlock-autonomy-v1";
+const CLOSE_WARNING_KEY = "hemlock-close-warning-v1";
+const DESKTOP_VISIBILITY_KEY = "hemlock-desktop-visibility-v1";
 
 function readUnderstoryPreference() {
   try {
@@ -46,6 +59,9 @@ function readUnderstoryPreference() {
 const DEFAULT_MAPLE_MAX_TOKENS = 16384;
 const DEFAULT_ARTIFACT_LAYOUT = { source: 0.68, diff: 0.88, preview: 1.48, evidence: 168 };
 const TERMINAL_STREAM_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "interrupted_by_steering", "restarting"]);
+// Mirrors electron/agent_queue.cjs ACTIVE_STATUSES — steer: only lands while one of these holds.
+const ACTIVE_TASK_STATUSES = new Set(["accepted", "planning", "running", "waiting_for_approval", "waiting_for_user", "verifying", "paused"]);
+const AUTONOMY_LABELS = { "bounded-local": "supervised", guided: "guided", autonomous: "autonomous", "bounded-campaign": "campaign" };
 
 const MODEL_LANES = {
   maple: { provider: "maple", label: "Local", shortLabel: "MAPLE", kind: "local", defaultModel: "default_model", defaultModelLabel: "Local MLX model", defaultReasoning: "on", reasoningLevels: ["on", "off"], modelOptions: [{ value: "default_model", label: "Maple-Preview" }, { value: "lfm25-8b", label: "LFM2.5-8B-A1B (LiquidAI)" }] },
@@ -77,6 +93,7 @@ const WINDOW_META = {
   activity: { label: "Activity", icon: "activity", tone: "green", status: "live" },
   receipts: { label: "Receipts", icon: "receipt", tone: "gold", status: "evidence" },
   map: { label: "Project Map", icon: "map", tone: "green", status: "read-only" },
+  grove: { label: "Understory Grove", icon: "grove", tone: "green", status: "ambient" },
   settings: { label: "Settings", icon: "settings", tone: "green", status: "local" },
 };
 
@@ -180,9 +197,10 @@ function detectIntent(text, interactionMode = null) {
 function parseInteractionMode(text) {
   const value = String(text || "").trim();
   const steering = value.match(/^(?:steer|steering)\s*[:\-]\s*(.+)$/i);
-  const content = steering ? steering[1].trim() : value;
+  const campaign = value.match(/^(?:campaign|auto|autonomous)\s*[:\-]\s*(.+)$/i);
+  const content = steering ? steering[1].trim() : campaign ? campaign[1].trim() : value;
   const buildHandoff = /\b(?:build\s+(?:(?:this|that|the|a|an|my)\s+)?(?:new\s+)?(?:[\w-]+\s+){0,4}(?:artifact|animation|app|webapp|website|site|page|draft|working\s+version|prototype|component|feature|code)|build\s+(?:this|that|the)|implement\s+(?:this|the|that)|fix\s+(?:this|the|that)\s+(?:bug|issue|error|code)|refactor\s+(?:this|the|that)|write\s+(?:the\s+)?code|make\s+(?:the\s+)?(?:artifact|draft|working\s+version|app|site|website|animation)|create\s+(?:the|an?|my)\s+(?:artifact|draft|working\s+version|app|site|website|animation)|open\s+(?:a\s+)?working\s+version|turn\s+this\s+into\s+(?:an\s+)?(?:artifact|animation|site|app|page)|ship\s+(?:the\s+)?(?:draft|artifact|app|site|website))\b/i.test(content);
-  return { mode: steering ? "steer" : "queue", interactionMode: buildHandoff ? "build" : "explore", text: content };
+  return { mode: steering ? "steer" : campaign ? "campaign" : "queue", interactionMode: buildHandoff ? "build" : "explore", text: content };
 }
 
 function isProjectCorrection(text) {
@@ -341,7 +359,7 @@ const TranscriptMessageRow = memo(function TranscriptMessageRow({
       return <details className={`maple-channel maple-channel-secondary ${isReasoning ? "maple-channel-reasoning" : ""}`} open={Boolean(target.streaming) && !target.stopped} key={`${channel.name}-${index}-${target.streaming ? "live" : "done"}`}><summary className="model-channel-label">{reasoningLabel}{isReasoning ? (target.streaming ? " · streaming…" : ` · ${Math.round((channel.text || "").length / 4)} tokens of thought`) : ` · model channel`}{isReasoning && !target.streaming && (channel.text || "").length > 0 ? <span className="reasoning-preview">{displayText(channel.text.replace(/\s+/g, " ").trim().slice(0, 110))}{channel.text.length > 110 ? "…" : ""}</span> : null}</summary><pre>{displayText(channel.text, "")}</pre></details>;
     });
   };
-  return <article className={`work-message ${message.role}${message.kind === "host-footnote" ? ` chat-host-footnote is-${message.status}` : ""}${message.partial ? " is-partial" : ""}${message.streaming ? " is-streaming" : ""}`}>{message.partial && <div className="partial-note">Interrupted — reply kept up to the cut ({String(message.stopReason || "cancelled")}).</div>}<div className="message-meta"><span>{displayText(message.role === "user" ? "YOU" : messageProviderName.toUpperCase())}{message.streaming ? " · LIVE" : ""}</span><time>{displayText(message.time)}</time><span className="message-actions"><button type="button" title="Copy message (Option-click to include provenance)" aria-label="Copy message (Option-click to include provenance)" onClick={(event) => { const text = message.content || (message.channels || []).find((channel) => channel.name === "content")?.text || ""; if (!text.trim()) return; if (event.altKey) { navigator.clipboard?.writeText(withProvenance(message, { providerLabel: MODEL_LANES[messageProvider]?.shortLabel || messageProviderName.toUpperCase(), threadTitle })); } else { navigator.clipboard?.writeText(text.trim()); } }}>copy</button><button type="button" title={`Ask again · resends this message${index < total - 1 ? " as the newest prompt" : ""}`} aria-label={`Ask again, resend this message`} onClick={() => onRetry(message)} disabled={isThinking}>retry</button></span></div>{message.role === "assistant" ? <section className="maple-output-card" aria-label={`${messageProviderName} emitted response`}><div className="card-kicker"><span>{messageProviderName.toUpperCase()} OUTPUT</span><GlossaryHint as="small" term="Verbatim" definition="this is the model’s exact output — Hemlock never paraphrases or edits what the model said.">{message.displayMode || "model-verbatim"}</GlossaryHint></div>{renderChannels(message)}</section> : <div className="message-content">{displayText(message.content)}</div>}{message.telemetry && <details className="host-telemetry" open={message.role === "assistant"}><summary>Host telemetry</summary><p>{message.telemetry.provider ? `${message.telemetry.provider} · ${message.telemetry.reasoning || "native"} · ` : ""}{message.telemetry.elapsedMs != null ? `${Math.round(message.telemetry.elapsedMs / 100) / 10}s` : "timing unavailable"}{message.telemetry.completionTokens != null ? ` · ${message.telemetry.completionTokens} output tokens` : ""} · {formatTokensPerSecond(message.telemetry, message.telemetry.elapsedMs)}{message.telemetry.finishReason ? ` · stop: ${message.telemetry.finishReason}` : ""}{message.telemetry.outputDigest ? ` · ${displayText(message.telemetry.outputDigest)}` : ""}{message.telemetry.streamId ? ` · stream ${displayText(message.telemetry.streamId)}` : ""}{message.telemetry.bufferedFallback ? " · buffered fallback" : message.telemetry.streaming ? " · SSE stream" : ""}{typeof message.telemetry.cacheHitRatio === "number" ? ` · cache ${Math.round(message.telemetry.cacheHitRatio * 100)}%` : ""}{message.rawOutputRef ? ` · raw ${displayText(message.rawOutputRef)}` : ""}</p></details>}</article>;
+  return <article className={`work-message ${message.role}${message.kind === "host-footnote" ? ` chat-host-footnote is-${message.status}` : ""}${message.partial ? " is-partial" : ""}${message.streaming ? " is-streaming" : ""}`}>{message.partial && <div className="partial-note">Interrupted — reply kept up to the cut ({String(message.stopReason || "cancelled")}).</div>}<div className="message-meta"><span>{displayText(message.role === "user" ? "YOU" : messageProviderName.toUpperCase())}{message.streaming ? " · LIVE" : ""}</span><time>{displayText(message.time)}</time><span className="message-actions"><CopyMessageButton text={message.content || (message.channels || []).find((channel) => channel.name === "content")?.text || ""} provenanceText={withProvenance(message, { providerLabel: MODEL_LANES[messageProvider]?.shortLabel || messageProviderName.toUpperCase(), threadTitle })} /><button type="button" title={`Ask again · resends this message${index < total - 1 ? " as the newest prompt" : ""}`} aria-label={`Ask again, resend this message`} onClick={() => onRetry(message)} disabled={isThinking}><Icon name="retry" size={13} /> Retry</button></span></div>{message.role === "assistant" ? <section className="maple-output-card" aria-label={`${messageProviderName} emitted response`}><div className="card-kicker"><span>{messageProviderName.toUpperCase()} OUTPUT</span><GlossaryHint as="small" term="Verbatim" definition="this is the model’s exact output — Hemlock never paraphrases or edits what the model said.">{message.displayMode || "model-verbatim"}</GlossaryHint></div>{renderChannels(message)}</section> : <div className="message-content">{displayText(message.content)}</div>}{message.telemetry && <details className="host-telemetry" open={message.role === "assistant"}><summary>Host telemetry</summary><p>{message.telemetry.provider ? `${message.telemetry.provider} · ${message.telemetry.reasoning || "native"} · ` : ""}{message.telemetry.elapsedMs != null ? `${Math.round(message.telemetry.elapsedMs / 100) / 10}s` : "timing unavailable"}{message.telemetry.completionTokens != null ? ` · ${message.telemetry.completionTokens} output tokens` : ""} · {formatTokensPerSecond(message.telemetry, message.telemetry.elapsedMs)}{message.telemetry.finishReason ? ` · stop: ${message.telemetry.finishReason}` : ""}{message.telemetry.outputDigest ? ` · ${displayText(message.telemetry.outputDigest)}` : ""}{message.telemetry.streamId ? ` · stream ${displayText(message.telemetry.streamId)}` : ""}{message.telemetry.bufferedFallback ? " · buffered fallback" : message.telemetry.streaming ? " · SSE stream" : ""}{typeof message.telemetry.cacheHitRatio === "number" ? ` · cache ${Math.round(message.telemetry.cacheHitRatio * 100)}%` : ""}{message.rawOutputRef ? ` · raw ${displayText(message.rawOutputRef)}` : ""}</p></details>}</article>;
 });
 
 function StatusLamp({ state = "idle", label }) {
@@ -419,9 +437,11 @@ function PrimerCard({ onDismiss }) {
   </section>;
 }
 
-function EventRow({ event, timeLabel }) {
+const EventRow = memo(function EventRow({ event, timeLabel }) {
   const eventLabel = displayText(event.type?.replaceAll?.(".", " · "), "local event");
-  const payloadText = displayText(event.payload?.stage || event.payload?.command || event.payload?.title || event.payload?.error || event.status, "local observation");
+  const payloadText = event.type === "action.scored" && event.status !== "degraded"
+    ? `scored: ${displayText(event.payload?.winner?.commandId, "picked")}${Number.isFinite(event.payload?.margin) ? ` · margin ${event.payload.margin.toFixed(1)}` : ""}`
+    : displayText(event.payload?.stage || event.payload?.command || event.payload?.title || event.payload?.error || event.status, "local observation");
   const payloadKeys = Object.entries(event.payload || {}).filter(([key, value]) => value != null && !["artifact", "repair", "conversation"].includes(key) && typeof value !== "object");
   return <details className={`event-row event-${event.status}`}>
     <summary>
@@ -431,7 +451,7 @@ function EventRow({ event, timeLabel }) {
     </summary>
     {payloadKeys.length ? <div className="event-payload">{payloadKeys.map(([key, value]) => <div key={key}><code>{key}</code><span>{String(value).slice(0, 220)}</span></div>)}</div> : null}
   </details>;
-}
+});
 
 function conciseAgentNote(event, task) {
   const payload = event.payload || {};
@@ -447,7 +467,22 @@ function conciseAgentNote(event, task) {
     case "plan.proposed": return `Bounded plan proposed: ${payload.plan?.steps?.length || 0} registered step${payload.plan?.steps?.length === 1 ? "" : "s"}.`;
     case "plan.approved": return "Plan approved; the selected provider may continue through the registered host loop.";
     case "plan.rejected": return `Plan rejected: ${String(payload.reason || "user decision").slice(0, 220)}`;
+    case "plan.auto_approved": return "Campaign mode: the bounded plan was auto-approved; every action still carries a receipt.";
+    case "task.paused": return "Task paused at a step boundary — resume to continue the plan.";
+    case "task.resumed": return "Task resumed from its pause point.";
+    case "task.cancelled": return "Task cancelled by request; queued intents stay held rather than auto-starting.";
+    case "task.queued": return `Intent queued behind the active task at position ${payload.position || "?"}: ${String(payload.entry?.payload?.objective || payload.entry?.payload?.text || "queued request").slice(0, 140)}`;
+    case "task.queue.cancelled": return "A queued intent was cancelled before it started.";
+    case "action.autonomy.bypass": return `${payload.commandId || "An action"} ran without an approval click under ${payload.autonomy || "elevated"} autonomy — receipted as an explicit bypass.`;
+    case "action.scored": return event.status === "degraded"
+      ? `Action scoring unavailable (${String(payload.error || "scorer offline").slice(0, 120)}); using normal generation.`
+      : `Scored ${payload.candidateCount ?? "?"} candidate actions in ${Math.round((payload.elapsedMs || 0) / 10) / 100}s — chose ${payload.winner?.commandId || "a step"}${payload.runnerUp?.commandId ? ` over ${payload.runnerUp.commandId}` : ""}${Number.isFinite(payload.margin) ? ` (margin ${payload.margin.toFixed(2)})` : ""}${payload.complete ? " without generating tokens" : ""}${payload.cachedTokens ? ` · ${payload.cachedTokens} cached prompt tokens` : ""}.`;
+    case "dream.adapter.grafted": return "Dream adapter grafted into the live server; detach in Dream Lab to return to base.";
+    case "dream.adapter.detached": return "Active graft detached — the server restarted on base Maple weights.";
+    case "dream.fuse.started": return "Fusing the grafted adapter into a new checkpoint…";
+    case "dream.fused": return "Graft fused into new served weights — detach returns to the base checkpoint.";
     case "task.steering.received": return `Steering accepted for the next bounded decision; an already-running inference is not rewritten: ${String(payload.steering?.content || "update received").slice(0, 180)}`;
+    case "task.steering.restarted": return `Inference restarted with ${payload.steeringCount || 1} steering update${payload.steeringCount === 1 ? "" : "s"} folded into the conversation.`;
     case "maple.recovery": return `Connection to ${providerLabel} dropped; the runtime restarted and your prompt is being re-run (attempt ${payload.attempt || 1}).`;
     case "inference.started": return payload.mode === "structured-action" ? `${providerLabel} is selecting one registered action from the current evidence.` : `${providerLabel} is composing a response.`;
     case "inference.failed": return `${providerLabel} inference needs attention: ${String(payload.error || "no usable output").slice(0, 220)}`;
@@ -481,8 +516,38 @@ function App() {
   const [activeAdapterPath, setActiveAdapterPath] = useState(() => localStorage.getItem(ADAPTER_KEY) || "");
   const [facts, setFacts] = useState(() => readJson(FACTS_KEY, []));
   const [messages, setMessages] = useState([]);
+  // Hooks belong to App, not the conditionally invoked window renderers.
+  // Closing/minimizing Chat must never change App's hook order.
+  const stableRetryRef = useRef(retryLastMessage);
+  stableRetryRef.current = retryLastMessage;
+  const stableRetryLast = useCallback((target) => stableRetryRef.current(target), []);
   const [draft, setDraft] = useState("");
   const [interactionMode, setInteractionMode] = useState("explore");
+  const [autonomyMode, setAutonomyMode] = useState(() => localStorage.getItem(AUTONOMY_KEY) || "guided");
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const inspectorOpenerRef = useRef(null);
+  useEffect(() => {
+    if (!inspectorOpen) return undefined;
+    const panel = document.getElementById("hemlock-chat-inspector");
+    if (!panel) return undefined;
+    inspectorOpenerRef.current = document.activeElement;
+    const compact = () => getComputedStyle(panel).position === "absolute";
+    if (compact()) panel.querySelector("button")?.focus();
+    const dismiss = (event) => {
+      if (event.type === "keydown" && document.querySelector(".palette-backdrop")) return;
+      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (event.type === "pointerdown" && (!compact() || event.target.closest("#hemlock-chat-inspector, .chat-inspector-toggle"))) return;
+      if (event.type === "keydown") { event.preventDefault(); event.stopPropagation(); inspectorOpenerRef.current?.focus?.(); }
+      setInspectorOpen(false);
+    };
+    document.addEventListener("keydown", dismiss);
+    document.addEventListener("pointerdown", dismiss);
+    return () => {
+      document.removeEventListener("keydown", dismiss);
+      document.removeEventListener("pointerdown", dismiss);
+      if (panel.contains(document.activeElement)) inspectorOpenerRef.current?.focus?.();
+    };
+  }, [inspectorOpen]);
   const [planCollapsed, setPlanCollapsed] = useState(true);
   // T7-S3: user-grantable plan budgets. Keyed by plan id so each new awaiting
   // plan starts from the host defaults instead of the last grant.
@@ -541,8 +606,12 @@ function App() {
   const [workspaceWindows, setWorkspaceWindows] = useState(initialWindows);
   const workspaceWindowsRef = useRef(initialWindows);
   useEffect(() => { workspaceWindowsRef.current = workspaceWindows; }, [workspaceWindows]);
-  const [activeWindowId, setActiveWindowId] = useState("center");
+  const [activeWindowId, setActiveWindowId] = useState(() => Object.values(workspaceWindows).filter(item => ["normal", "maximized"].includes(item.state)).sort((a, b) => b.zOrder - a.zOrder)[0]?.windowId || null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [overviewOpen, setOverviewOpen] = useState(false);
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [desktopSnapshot, setDesktopSnapshot] = useState(() => { const value = readJson(DESKTOP_VISIBILITY_KEY, null); return Array.isArray(value?.ids) ? value : null; });
+  useEffect(() => { if (desktopSnapshot) localStorage.setItem(DESKTOP_VISIBILITY_KEY, JSON.stringify(desktopSnapshot)); else localStorage.removeItem(DESKTOP_VISIBILITY_KEY); }, [desktopSnapshot]);
   const [dockMenu, setDockMenu] = useState(null); // { windowId, x, y }
   const [activityTypeFilter, setActivityTypeFilter] = useState(null);
   const [receiptsFilter, setReceiptsFilter] = useState("");
@@ -551,6 +620,7 @@ function App() {
   const [paletteContentMatches, setPaletteContentMatches] = useState([]);
   const threadSearchSupportRef = useRef({ available: null });
   const [confirmState, setConfirmState] = useState(null); // { title, body, confirmLabel, tone, resolve }
+  const [skipCloseWarning, setSkipCloseWarning] = useState(() => readJson(CLOSE_WARNING_KEY, {}).skip === true);
   const [primerDismissed, setPrimerDismissed] = useState(() => readJson(PRIMER_KEY, {}).dismissed === true);
   const [error, setError] = useState("");
   const [factDraft, setFactDraft] = useState("");
@@ -558,6 +628,7 @@ function App() {
   const [sipsVerifyProfile, setSipsVerifyProfile] = useState(() => readJson(SIPS_KEY, {}).verifyProfile || "app-build");
   const [sipsTrainingProfile, setSipsTrainingProfile] = useState(() => readJson(SIPS_KEY, {}).trainingProfile || "balanced");
   const [sipsStatus, setSipsStatus] = useState(null);
+  const [experimentDataset, setExperimentDataset] = useState(null);
   const [sipsRoutes, setSipsRoutes] = useState([]);
   const [sipsRecallQuery, setSipsRecallQuery] = useState("");
   const [sipsRecall, setSipsRecall] = useState(null);
@@ -586,6 +657,7 @@ function App() {
   const resizeRef = useRef(null);
   const [draggingWindowId, setDraggingWindowId] = useState(null);
   const [resizingWindowId, setResizingWindowId] = useState(null);
+  const [snapPreview, setSnapPreview] = useState(null);
   const artifactPanelResizeRef = useRef(null);
   const artifactLayoutRef = useRef(artifactLayout);
   const conversationResponseIds = useRef(new Set());
@@ -634,6 +706,7 @@ function App() {
       setAdapterVerified(snapshot.server.adapterPath ? snapshot.server.inferenceReady : null);
     }
     setEvents(snapshot.events || []);
+    if (snapshot.experimentDataset) setExperimentDataset(snapshot.experimentDataset);
     if (snapshot.providers) setProviderStatuses(snapshot.providers);
     if (snapshot.threads) setThreadRegistry(snapshot.threads);
     if (snapshot.suggestions) setSuggestions(snapshot.suggestions);
@@ -721,6 +794,7 @@ function App() {
   useEffect(() => { localStorage.setItem(MODEL_SELECTION_KEY, JSON.stringify(modelSelection)); }, [modelSelection]);
   useEffect(() => { activeAdapterPath ? localStorage.setItem(ADAPTER_KEY, activeAdapterPath) : localStorage.removeItem(ADAPTER_KEY); }, [activeAdapterPath]);
   useEffect(() => { localStorage.setItem(DREAM_PROFILE_KEY, dreamTrainingProfile); }, [dreamTrainingProfile]);
+  useEffect(() => { localStorage.setItem(AUTONOMY_KEY, autonomyMode); }, [autonomyMode]);
   useEffect(() => { localStorage.setItem(SIPS_KEY, JSON.stringify({ objective: sipsObjective, verifyProfile: sipsVerifyProfile, trainingProfile: sipsTrainingProfile })); }, [sipsObjective, sipsVerifyProfile, sipsTrainingProfile]);
   // Grounding popover closes on any pointer-down outside its wrap.
   useEffect(() => {
@@ -846,6 +920,7 @@ function App() {
 
   useEffect(() => {
     const onShortcut = (event) => {
+      if (document.querySelector('[aria-modal="true"], .window-actions-menu')) return;
       if (!(event.metaKey || event.ctrlKey) || !event.shiftKey || event.key.toLowerCase() !== "m") return;
       event.preventDefault();
       toggleModelPicker();
@@ -973,6 +1048,7 @@ function App() {
       if (event.type === "context.source.policy.updated" && event.payload?.source) setSourcePolicies((current) => current.map((item) => item.sourceId === event.payload.source.sourceId ? event.payload.source : item));
       if (event.type === "command.started") setCommandBusy(event.payload?.command || "working");
       if (event.type === "command.completed") setCommandBusy("");
+      if (event.type === "experiment.note.recorded") setExperimentDataset((current) => ({ schema: "hemlock.world.dataset.summary.v1", ...(current || {}), count: (current?.count || 0) + 1, latest: { id: event.payload?.findingId || null, experiment: event.payload?.experiment || null, recordedAt: event.createdAt || null } }));
       if (event.type === "context.quality.updated") {
         setContextSnapshot((current) => ({
           ...(current || {}),
@@ -1098,23 +1174,31 @@ function App() {
       // A modal confirm dialog owns the keyboard while it is open; OS-level
       // shortcuts must not fire underneath it.
       if (confirmStateRef.current) return;
+      if (overviewOpen || shortcutHelpOpen || dockMenu) return;
+      if (paletteOpen) { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); paletteRef.current?.focus(); } return; }
+      if (comparePickerOpen) { if (event.key === "Escape") setComparePickerOpen(false); return; }
+      const shortcutKey = event.code?.startsWith("Key") ? event.code.slice(3).toLowerCase() : event.key.toLowerCase();
+      if (event.key === "F1") { event.preventDefault(); showShortcuts(); return; }
+      if ((event.metaKey || event.ctrlKey) && event.altKey && shortcutKey === "d") { event.preventDefault(); toggleDesktop(); return; }
+      if ((event.metaKey || event.ctrlKey) && event.altKey && shortcutKey === "w") { event.preventDefault(); if (activeWindowId) void closeWindow(activeWindowId); return; }
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        setPaletteOpen(false);
+        setOverviewOpen(true);
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen(true);
       }
-      // Direct window focus: Cmd+1..9 targets the Nth open window in z-order,
-      // front-most first. The command palette intercepts digits for its own
-      // result jumps, so stand aside while it is open.
-      if ((event.metaKey || event.ctrlKey) && !event.altKey && /^[1-9]$/.test(event.key)) {
+      // Stable app shortcuts never change when window focus changes. The
+      // command palette intercepts digits for its own result jumps.
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && /^[0-9]$/.test(event.key)) {
         if (paletteOpen) return;
-        const openIds = Object.entries(workspaceWindowsRef.current)
-          .filter(([, item]) => item.state !== "closed")
-          .sort(([, a], [, b]) => (b.zOrder || 0) - (a.zOrder || 0))
-          .map(([id]) => id);
-        const targetId = openIds[Number(event.key) - 1];
+        const targetId = shortcutApp(event.key);
         if (targetId) {
           event.preventDefault();
-          focusWindow(targetId);
+          openWindow(targetId);
         }
         return;
       }
@@ -1132,10 +1216,12 @@ function App() {
         return;
       }
       if ((event.metaKey || event.ctrlKey) && event.altKey) {
-        const command = event.key === "ArrowLeft" ? "half-left" : event.key === "ArrowRight" ? "half-right" : event.key === "ArrowUp" ? "maximize" : event.key === "ArrowDown" ? "restore" : event.key.toLowerCase() === "m" ? "minimize" : null;
+        const command = event.key === "ArrowLeft" ? "half-left" : event.key === "ArrowRight" ? "half-right" : event.key === "ArrowUp" ? "maximize" : event.key === "ArrowDown" ? "restore" : shortcutKey === "m" ? "minimize" : null;
         if (command) {
           event.preventDefault();
-          setWorkspaceWindows((current) => ({ ...current, [activeWindowId]: keyboardPlacement(current[activeWindowId], command, canvasSize) }));
+          if (!activeWindowId) return;
+          if (command === "minimize") minimizeWindow(activeWindowId);
+          else setWorkspaceWindows((current) => ({ ...current, [activeWindowId]: keyboardPlacement(current[activeWindowId], command, canvasSize) }));
         }
       }
       if (event.key === "Escape") {
@@ -1149,15 +1235,16 @@ function App() {
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [activeWindowId, canvasSize, isDesktop, isDreaming, paletteOpen, comparePickerOpen]);
+  }, [activeWindowId, canvasSize, isDesktop, isDreaming, paletteOpen, comparePickerOpen, overviewOpen, shortcutHelpOpen, dockMenu, desktopSnapshot, skipCloseWarning]);
 
   useEffect(() => {
     if (!paletteOpen) return undefined;
-    paletteRef.current?.focus();
     // Focus trap: Tab must cycle inside the palette, not walk into the frozen
     // desktop behind the backdrop. Focus returns to the trigger on close.
     const paletteOpener = document.activeElement;
+    paletteRef.current?.focus();
     const onTrap = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setPaletteOpen(false); return; }
       if (event.key !== "Tab") return;
       const focusables = document.querySelectorAll(".command-palette input, .command-palette button:not([disabled])");
       if (!focusables.length) return;
@@ -1176,7 +1263,7 @@ function App() {
     // buttons; Escape/Enter are handled by the dialog's own key handling.
     const opener = document.activeElement;
     const dialog = document.querySelector(".confirm-dialog");
-    const firstButton = dialog?.querySelector("button");
+    const firstButton = dialog?.querySelector("button:not(.close-warning-opt-out)");
     firstButton?.focus();
     const onTrap = (event) => {
       if (event.key === "Escape") { event.stopPropagation(); settleConfirmDialog(false); return; }
@@ -1246,28 +1333,46 @@ function App() {
       const drag = dragRef.current;
       const resize = resizeRef.current;
       if (!drag && !resize) return;
+      if (drag) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const command = pointerSnapCommand(event.clientX - rect.left, event.clientY - rect.top, canvasSize, { altKey: event.altKey });
+        if (command !== drag.snapCommand) {
+          drag.snapCommand = command;
+          const item = workspaceWindowsRef.current[drag.id];
+          setSnapPreview(command ? { command, bounds: keyboardPlacement(item, command, canvasSize).bounds } : null);
+        }
+      }
       setWorkspaceWindows((current) => {
         const state = current[drag?.id || resize.id];
         if (!state || state.state === "maximized") return current;
         if (drag) {
           const origin = { ...state, bounds: drag.originBounds };
-          return { ...current, [drag.id]: moveWindow(origin, event.clientX - drag.startX, event.clientY - drag.startY, canvasSize, { altKey: event.altKey }) };
+          return { ...current, [drag.id]: moveWindow(origin, event.clientX - drag.startX, event.clientY - drag.startY, canvasSize, { enabled: false }) };
         }
         const origin = { ...state, bounds: resize.originBounds };
         return { ...current, [resize.id]: resizeWindow(origin, resize.edge, event.clientX - resize.startX, event.clientY - resize.startY, canvasSize, { altKey: event.altKey }) };
       });
     };
-    const up = () => {
+    const up = (event) => {
       const action = dragRef.current || resizeRef.current;
-      if (action?.id) setWorkspaceWindows((current) => ({ ...current, [action.id]: { ...current[action.id], bounds: clampBounds(current[action.id].bounds, canvasSize, current[action.id].minimumSize) } }));
+      if (action?.id) setWorkspaceWindows((current) => {
+        const item = current[action.id];
+        const placed = event.type === "pointerup" && action.snapCommand && !event.altKey
+          ? keyboardPlacement(item, action.snapCommand, canvasSize)
+          : { ...item, bounds: clampBounds(item.bounds, canvasSize, item.minimumSize) };
+        return { ...current, [action.id]: placed };
+      });
       dragRef.current = null;
       resizeRef.current = null;
+      setSnapPreview(null);
       setDraggingWindowId(null);
       setResizingWindowId(null);
     };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
-    return () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); };
+    document.addEventListener("pointercancel", up);
+    window.addEventListener("blur", up);
+    return () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); document.removeEventListener("pointercancel", up); window.removeEventListener("blur", up); };
   }, [canvasSize]);
 
   const chatMessages = useMemo(() => messages.map(({ role, content }) => ({ role, content })), [messages]);
@@ -1282,7 +1387,12 @@ function App() {
     return { role: "system", content: ["You are Hemlock, a private local assistant running through Maple-Preview.", ...lines, "Use these local context items when relevant. Do not invent facts or claim a receipt you do not have."].join("\n\n") };
   }, [activeLessons, bakedFacts]);
   const latestEvent = events.at(-1);
-  const latestReceiptEvent = [...events].reverse().find((event) => event.type.includes("completed") && event.evidenceRefs?.length) || latestEvent;
+  const latestReceiptEvent = useMemo(() => [...events].reverse().find((event) => event.type.includes("completed") && event.evidenceRefs?.length) || latestEvent, [events, latestEvent]);
+  const artifactForPreview = artifacts.find((item) => item.id === activeArtifactId) || artifacts.at(-1) || null;
+  // The preview srcDoc concatenates the whole artifact source map (potentially
+  // MBs) plus the interaction harness — rebuild only when the artifact itself
+  // changed, not on every event/stream render.
+  const previewSrc = useMemo(() => artifactForPreview?.status === "failed" && artifactForPreview?.lastKnownGoodSource ? previewDocument({ ...artifactForPreview, source: artifactForPreview.lastKnownGoodSource }) : previewDocument(artifactForPreview), [artifactForPreview]);
   const serverState = serverProcessReady === true ? "ready" : serverProcessReady === false ? "down" : "unknown";
   const liveStream = hasLiveStream(streamFrames);
   const taskProgress = isDreaming ? dreamProgress : sipsCycleState === "running" ? sipsProgress : liveStream || isThinking ? 42 : task.status === "completed" ? 100 : 0;
@@ -1319,6 +1429,7 @@ function App() {
   }
 
   function focusWindow(id) {
+    revealWindow(id);
     setActiveWindowId(id);
     // Focusing a window acknowledges its unread activity (dock gold dot).
     seenEventCountsRef.current.set(id, events.length);
@@ -1326,17 +1437,93 @@ function App() {
   }
 
   function openWindow(id) {
+    revealWindow(id);
     setActiveWindowId(id);
-    setWorkspaceWindows((current) => openWindowBounds(current, id, canvasSize, { collisionAware: true }));
+    seenEventCountsRef.current.set(id, events.length);
+    setWorkspaceWindows((current) => current[id]?.state !== "closed"
+      ? focusWindowState(current, id, undefined, canvasSize)
+      : openWindowBounds(current, id, canvasSize, { collisionAware: true }));
   }
 
-  function closeWindow(id) {
-    setWorkspaceWindows((current) => ({ ...current, [id]: setWindowState(current[id], "closed", canvasSize) }));
-    if (activeWindowId === id) setActiveWindowId("center");
+  function revealWindow(id) {
+    if (window.innerWidth < 760) requestAnimationFrame(() => document.querySelector(`.window-${id}`)?.scrollIntoView({ block: "start" }));
+  }
+
+  function placeWindow(id, command) {
+    setActiveWindowId(id);
+    setWorkspaceWindows((current) => normalizeZOrder({ ...current, [id]: keyboardPlacement(current[id], command, canvasSize) }, id));
+    setDockMenu(null);
+  }
+
+  function showWindowMenu(id, opener, placement = "below") {
+    if (!opener) return;
+    const rect = opener.getBoundingClientRect();
+    setDockMenu({ windowId: id, x: rect.left, y: placement === "above" ? rect.top : rect.bottom, placement, opener });
+  }
+
+  function runWindowAction(id, action) {
+    setDockMenu(null);
+    if (action === "close") { void closeWindow(id); return; }
+    if (action === "minimize") { minimizeWindow(id); return; }
+    if (action === "focus") { focusWindow(id); return; }
+    if (action === "center" || action === "default-size") {
+      setActiveWindowId(id);
+      setWorkspaceWindows(current => normalizeZOrder({ ...current, [id]: centerWindow(current[id], canvasSize, action === "default-size") }, id));
+      return;
+    }
+    placeWindow(id, action);
+  }
+
+  function toggleDesktop() {
+    setDockMenu(null);
+    setInspectorOpen(false);
+    if (desktopSnapshot) {
+      const restored = restoreWorkspace(workspaceWindowsRef.current, desktopSnapshot, canvasSize);
+      setWorkspaceWindows(restored.windows);
+      setActiveWindowId(restored.activeId);
+      setDesktopSnapshot(null);
+    } else {
+      const hidden = minimizeWorkspace(workspaceWindowsRef.current, activeWindowId, canvasSize);
+      if (!hidden.snapshot.ids.length) return;
+      setDesktopSnapshot(hidden.snapshot);
+      setWorkspaceWindows(hidden.windows);
+      setActiveWindowId(null);
+    }
+  }
+
+  function showShortcuts() {
+    setPaletteOpen(false);
+    setOverviewOpen(false);
+    setDockMenu(null);
+    setShortcutHelpOpen(true);
+  }
+
+  function dismissWindow(id, state) {
+    if (id === "chat") setInspectorOpen(false);
+    const nextId = Object.values(workspaceWindowsRef.current)
+      .filter((item) => item.windowId !== id && !["closed", "minimized"].includes(item.state))
+      .sort((a, b) => b.zOrder - a.zOrder)[0]?.windowId || null;
+    setWorkspaceWindows((current) => {
+      const next = { ...current, [id]: setWindowState(current[id], state, canvasSize) };
+      return activeWindowId === id && nextId ? focusWindowState(next, nextId, undefined, canvasSize) : next;
+    });
+    if (activeWindowId === id) setActiveWindowId(nextId);
+  }
+
+  async function closeWindow(id) {
+    if (skipCloseWarning) { dismissWindow(id, "closed"); return; }
+    const confirmed = await confirmDialog({ title: `Close ${WINDOW_META[id]?.label || "this window"}?`, body: "Its state is kept. Reopen it any time from the dock; running work is not cancelled.", confirmLabel: "Close window", allowSkipCloseWarning: true });
+    if (confirmed) dismissWindow(id, "closed");
+  }
+
+  function neverWarnOnWindowClose() {
+    localStorage.setItem(CLOSE_WARNING_KEY, JSON.stringify({ skip: true }));
+    setSkipCloseWarning(true);
+    settleConfirmDialog(true);
   }
 
   function minimizeWindow(id) {
-    setWorkspaceWindows((current) => ({ ...current, [id]: setWindowState(current[id], "minimized", canvasSize) }));
+    dismissWindow(id, "minimized");
   }
 
   function maximizeWindow(id) {
@@ -1345,7 +1532,7 @@ function App() {
   }
 
   function startDrag(event, id) {
-    if (event.target.closest("button") || window.innerWidth < 900) return;
+    if (event.button !== 0 || event.target.closest("button") || window.innerWidth < 760) return;
     const state = workspaceWindows[id];
     if (!state || state.state === "maximized" || state.state === "closed") return;
     focusWindow(id);
@@ -1356,12 +1543,17 @@ function App() {
 
   function startResize(event, id, edge = "bottom-right") {
     event.stopPropagation();
+    if (event.button !== 0) return;
     const state = workspaceWindows[id];
     if (!state || state.state === "maximized" || state.state === "closed") return;
     focusWindow(id);
     event.currentTarget.setPointerCapture?.(event.pointerId);
     setResizingWindowId(id);
     resizeRef.current = { id, edge, startX: event.clientX, startY: event.clientY, originBounds: state.bounds };
+  }
+
+  function resizeWithKeyboard(id, edge, dx, dy) {
+    setWorkspaceWindows((current) => ({ ...current, [id]: resizeWindow(current[id], edge, dx, dy, canvasSize) }));
   }
 
   async function runCommand(action, payload = {}) {
@@ -1415,6 +1607,14 @@ function App() {
     } finally {
       setCommandBusy("");
     }
+  }
+
+  // agent:queue-cancel returns the post-cancel snapshot; adopt it so the
+  // readouts don't wait for the next task.queue.updated broadcast.
+  async function cancelQueuedIntent(requestId) {
+    const result = await desktopAgent()?.cancelQueued?.(requestId);
+    if (result?.queue) setQueueState(result.queue);
+    return result;
   }
 
   async function refreshAgentState() {
@@ -1492,7 +1692,7 @@ function App() {
 
   async function createThread() {
     if (!isDesktop) {
-      setError("New threads require the Hemlock desktop control plane.");
+      setError("Open the Hemlock desktop app to create and save threads. This browser view is a preview.");
       return;
     }
     // Native directory picker (Electron's dialog.showOpenDialog). The old
@@ -1830,9 +2030,10 @@ function App() {
       });
       try {
         const agent = desktopAgent();
-        const dataset = await agent?.runCommand?.("training.prepare", { facts: facts.map(({ text }) => text), conversation: messages.map(({ role, content }) => ({ role, content })), examples: latestCodingExamples() });
+        const codingExamples = latestCodingExamples();
+        const dataset = await agent?.runCommand?.("training.prepare", { facts: facts.map(({ text }) => text), conversation: messages.map(({ role, content }) => ({ role, content })), examples: codingExamples });
         if (dataset) setTrainingDataset(dataset);
-        const result = await window.mapleDesktop.startDream({ facts: facts.map(({ text }) => text), conversation: messages.map(({ role, content }) => ({ role, content })), profile: dreamTrainingProfile, numLayers: 1 });
+        const result = await window.mapleDesktop.startDream({ facts: facts.map(({ text }) => text), conversation: messages.map(({ role, content }) => ({ role, content })), examples: codingExamples, profile: dreamTrainingProfile, numLayers: 1 });
         stop?.();
         setDreamReceipt(result.trainingReceipt || null);
         setActiveAdapterPath(result.adapterPath);
@@ -2012,7 +2213,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
           threadId: task.threadId || threadRegistry.activeThreadId || undefined,
           projectId: task.projectId || undefined,
           workspaceRoot: task.workspaceRoot || undefined,
-          autonomy: "bounded-local",
+          autonomy: autonomyMode,
           requestId,
           source: "command-center",
           apiBase,
@@ -2190,6 +2391,9 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
   const visiblePaletteItems = visiblePaletteGroups.flatMap((group) => group.items);
   const visiblePaletteIndexById = new Map(visiblePaletteItems.map((item, index) => [item.id, index]));
   const safePaletteIndex = visiblePaletteItems.length ? Math.min(Math.max(paletteActiveIndex, 0), visiblePaletteItems.length - 1) : 0;
+  useEffect(() => {
+    if (paletteOpen) document.getElementById(`palette-item-${safePaletteIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [paletteOpen, safePaletteIndex, paletteQuery]);
 
   function chooseCommand(item) {
     item.action();
@@ -2197,9 +2401,6 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     setPaletteQuery("");
   }
 
-  function renderProviderCapacityPanel() {
-    return <section className="scheduler-panel" aria-label="Provider scheduler capacity"><div className="settings-section-heading"><span><span className="cockpit-kicker">PROVIDER SCHEDULER</span><strong>Concurrency caps</strong></span><small>host-owned · no silent fallback</small></div><p>Maple-Preview remains serialized unless you deliberately change its lane cap. Codex and Claude lanes can run independently.</p><div className="provider-cap-grid">{["maple", "codex", "claude"].map((provider) => <label className="provider-cap-field" key={provider}><span>{MODEL_LANES[provider].shortLabel}</span><input type="number" min="1" max="8" defaultValue={threadRegistry.providerCaps?.[provider] || 1} key={`${provider}-${threadRegistry.providerCaps?.[provider] || 1}`} onBlur={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next >= 1 && next <= 8 && next !== (threadRegistry.providerCaps?.[provider] || 1)) void updateProviderCapacity(provider, String(next)); else event.target.value = String(threadRegistry.providerCaps?.[provider] || 1); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} disabled={!isDesktop} /><small>{provider === "maple" ? "local lane" : "subscription lane"}</small></label>)}</div></section>;
-  }
 
   function renderCenter() {
     const quality = contextSnapshot?.quality || {};
@@ -2252,12 +2453,31 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     };
     const phaseClass = (index) => task.status === "completed" ? "is-done" : task.status === "blocked" && index === phaseIndex ? "is-blocked" : index < phaseIndex ? "is-done" : index === phaseIndex ? "is-active" : "";
 
+    const genuinelyIdle = task.status === "ready" && ["ready", "conversation", "idle"].includes(task.phase)
+      && !messages.length && !liveStream && !isThinking && !isDreaming
+      && sipsCycleState !== "running" && !["active", "running"].includes(sipsStatus?.selfloop?.status)
+      && !queueState?.active && !queueState?.pending?.length && !commandBusy
+      && !artifactReviseBusy && !changesetApplyBusy && !task.blockedReason
+      && !task.activePlanId && !task.activeActionId && !activePlan && !activeAction
+      && !planNeedsApproval && !actionNeedsApproval && !ambientCandidate && !error && !recoveryNotice;
+    if (genuinelyIdle) return <WorkspaceHome
+      onOpenChat={() => openWindow("chat")} onConfigureModels={() => openWindow("settings")}
+      provider={selectedLane.provider} providerLabel={selectedLane.label}
+      modelLabel={selectedLane.modelOptions.find(option => option.value === modelSelection.model)?.label || selectedLane.defaultModelLabel}
+      providerStatus={selectedProviderStatus} isDesktop={isDesktop} serverProcessReady={serverProcessReady}
+      inferenceReady={inferenceReady} readinessCheck={readinessCheck}
+      threads={(threadRegistry.threads || []).map(thread => ({ ...thread, workspaceRoot: displayText(thread.workspaceRoot, "") }))} activeThreadId={task.threadId || threadRegistry.activeThreadId}
+      threadSwitching={Boolean(commandBusy)}
+      onSwitchThread={async (id) => { await switchThread(id); openWindow("chat"); }}
+      onBrowseThreads={() => { openWindow("chat"); setThreadPickerOpen(true); }}
+    />;
+
     return <div className="cockpit-shell">
 
       <aside className="workstream-rail" aria-label="Hemlock workstreams">
                       <div className="rail-heading"><span className="cockpit-kicker">WORKSTREAMS</span><button type="button" onClick={() => { setDraft("Start a new Hemlock workstream: "); openWindow("chat"); }} aria-label="Start a new workstream"><Icon name="plus" size={15} /></button></div>
                       <div className="workstream-list">{workstreams.map((stream, index) => { const streamStatus = displayText(stream.status, "ready"); const streamMeta = displayText(stream.meta); return <button type="button" key={stream.id} className={`workstream-item ${index === 0 ? "is-selected" : ""}`} title={`${displayText(stream.title)} · ${streamMeta} · ${streamStatus}`} aria-label={`${displayText(stream.title)}. ${streamMeta}. Status: ${streamStatus}.`} onClick={() => stream.id === "sips" ? openWindow("sips") : stream.id === "dream" ? openWindow("dream") : stream.id === "context" ? void runCommand("context.refresh", { reason: "workstream" }) : focusWindow("center")}><span className={`workstream-icon ${stream.id}`}><Icon name={stream.icon} size={17} /></span><span className="workstream-copy"><strong>{displayText(stream.title)}</strong><small>{streamMeta}</small></span><span className={`workstream-state state-${streamStatus.replaceAll(" ", "-")}`}>{streamStatus}</span></button>; })}</div>
-                      <div className="rail-footer"><span>LOCAL WORKSPACE</span><strong>{isDesktop ? "Electron control plane" : "Browser preview"}</strong><button type="button" onClick={() => openWindow("map")}><Icon name="map" size={13} /> Project map</button></div>
+                      <div className="rail-footer"><span>LOCAL WORKSPACE</span><strong>{isDesktop ? "Electron control plane" : "Browser preview"}</strong><button type="button" onClick={() => openWindow("map")}><Icon name="map" size={13} /> Project map</button><button type="button" onClick={() => openWindow("grove")}><Icon name="grove" size={13} /> Understory grove</button></div>
                     </aside>
       <section className="cockpit-workbench" aria-label="Active Hemlock workbench">
         <div className="workbench-topline"><div><span className="cockpit-kicker">ACTIVE WORKSTREAM / {task.intent || "conversation"}</span><span className="workbench-id">{task.id || "local-session"}</span></div><span className={`task-state task-state-${task.status}`}>{task.status || "ready"}</span></div>
@@ -2272,28 +2492,28 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
             <section className="objective-block" aria-label="Current objective"><div className="block-label"><span>CURRENT OBJECTIVE</span><time>updated {formatTime(task.updatedAt || latestEvent?.createdAt)}</time></div><h1>{task.objective || "A quiet place for ambitious work."}</h1><p>Local only. Preserve determinism and auditability. Base Maple weights remain immutable.</p></section>
             <section className="attention-ribbon" aria-label="Now next why"><div><span>NOW</span><strong>{displayText(task.status === "blocked" ? "Needs attention" : activeStep, "Choose the next bounded action")}</strong><small>{displayText(task.phase || "ready")}</small></div><div><span>NEXT</span><strong>{displayText(nextAction)}</strong><small>{ambientCandidate ? "candidate awaiting review" : ""}</small></div><div><span>WHY</span><strong>{displayText(contextSnapshot?.focusHypotheses?.[0]?.label || "Hemlock workspace")}</strong><small>{displayText(contextSnapshot?.focusHypotheses?.[0]?.evidenceRefs?.[0] || "local task and project evidence")}</small></div></section>
             
-            <section className="work-note-block" aria-label="Next bounded action"><div className="active-step-card is-primary"><div className="step-card-heading"><span className="step-index">{task.status === "blocked" ? "!" : "→"}</span><div><span className="cockpit-kicker">ACTIVE STEP</span><strong>{displayText(activeStep, "Choose the next bounded action")}</strong></div><span className="step-progress">{taskProgress ? `${Math.round(taskProgress)}%` : "ready"}</span></div><p>{displayText(task.status === "blocked" ? task.blockedReason || "A local operation needs inspection before the task can continue." : "Keep the next action bounded, receipt-backed, and visible to the agent.")}</p><div className="step-card-actions"><button type="button" className="next-action-button" onClick={runNextAction}><Icon name={task.status === "blocked" ? "warning" : "play"} size={14} /> {displayText(nextAction)}</button><button type="button" className="quiet-action" onClick={() => openWindow("activity")}>Activity <Icon name="chevron" size={13} /></button></div></div></section>
+            <section className="work-note-block" aria-label="Next bounded action"><div className="active-step-card is-primary"><div className="step-card-heading"><span className="step-index">{task.status === "blocked" ? "!" : "→"}</span><div><span className="cockpit-kicker">ACTIVE STEP</span><strong>{displayText(activeStep, "Choose the next bounded action")}</strong></div><span className="step-progress">{taskProgress ? `${Math.round(taskProgress)}%` : "ready"}</span></div><p>{displayText(task.status === "blocked" ? task.blockedReason || "A local operation needs inspection before the task can continue." : "Keep the next action bounded, receipt-backed, and visible to the agent.")}</p><div className="step-card-actions"><button type="button" className="next-action-button" onClick={runNextAction}><Icon name={task.status === "blocked" ? "warning" : "play"} size={14} /> {displayText(nextAction)}</button>{["running", "verifying"].includes(task.status) && <button type="button" className="quiet-action" onClick={() => void runCommand("task.pause", { taskId: task.id })} disabled={Boolean(commandBusy)}><Icon name="pause" size={13} /> Pause</button>}{task.status === "paused" && <button type="button" className="quiet-action" onClick={() => void runCommand("task.resume", { taskId: task.id })} disabled={Boolean(commandBusy)}><Icon name="play" size={13} /> Resume</button>}<button type="button" className="quiet-action" onClick={() => openWindow("activity")}>Activity <Icon name="chevronRight" size={13} /></button></div></div></section>
             <section className="live-task-panel" aria-label="Live Task"><div className="live-task-heading"><div><span className="cockpit-kicker">LIVE TASK</span><h2>{MODEL_LANES[modelSelection.provider].label} output and host evidence</h2></div><button type="button" className="quiet-action" onClick={() => openWindow("chat")}>Open Chat</button></div><div className="live-task-panel-grid"><section className="maple-output-card"><div className="block-label"><span>{MODEL_LANES[modelSelection.provider].shortLabel} OUTPUT</span><small>model-verbatim · visible by default</small></div>{messages.filter((message) => message.role === "assistant").slice(-1).map((message) => <div key={message.id}>{messageChannels(message).map((channel, index) => <div className={`maple-channel ${channel.name === "content" ? "maple-channel-content" : "maple-channel-secondary"}`} key={`${channel.name}-${index}`}><span className="model-channel-label">{MODEL_LANES[message.provider || channel.source || "maple"]?.label || "Maple-Preview"} · {displayText(channel.name, "content")}</span>{channel.name === "content" ? <p>{displayText(channel.text, "")}</p> : <pre>{displayText(channel.text, "")}</pre>}</div>)}</div>)}{!messages.some((message) => message.role === "assistant") && <p className="empty-copy">Casual conversation and completed responses appear in Chat.</p>}</section><section className="live-action-card"><div className="block-label"><span>LIVE ACTION</span><small>{displayText(activeAction?.status, "idle")}</small></div>{activeAction ? <><strong>{displayText(activeAction.commandId || activeAction.kind)}</strong><p>{displayText(activeAction.shortRationale)}</p><details><summary>Exact envelope and provider output reference</summary><pre>{displayText({ action: activeAction, rawModelOutputRef: activeAction.rawModelOutputRef, modelChannels: activeAction.modelChannels, parseStatus: activeAction.parseStatus, fallbackMode: activeAction.fallbackMode }, "No action envelope recorded.")}</pre></details></> : <p className="empty-copy">No action is active. The host does not turn conversation into a plan.</p>}</section><section className="live-evidence-card"><div className="block-label"><span>EVIDENCE</span><small>{displayText(latestObservation?.status || latestEvent?.status, "waiting")}</small></div><p>{displayText(latestObservation?.summary || latestEvent?.payload?.reason || "Receipts, observations, and stop reasons will appear here.")}</p>{latestObservation?.outputDigest && <code>{latestObservation.outputDigest}</code>}{receipts.slice(0, 3).map((event) => <div className="evidence-line" key={event.id}><strong>{displayText(event.type.replaceAll(".", " · "))}</strong><small>{displayText(event.evidenceRefs?.[0] || event.payload?.rawOutputRef || "event recorded")}</small></div>)}</section></div></section>
             <details className="full-trace" open={false}><summary>Full trace · lifecycle, command detail, and host interpretation</summary>
             
             
-            <section className="agent-loop-panel" aria-label="Maple host execution loop"><div className="block-label"><span>HOST EXECUTION LOOP</span><span className={`loop-badge ${displayText(task.status, "ready")}`}>{displayText(task.status, "ready")}</span></div><div className="agent-loop-grid"><div><small>PLAN</small><strong>{displayText(activePlan ? activePlan.status.replaceAll("_", " ") : "not proposed")}</strong><span>{activePlan?.steps?.length || 0} bounded steps</span></div><div><small>ACTION</small><strong>{displayText(activeAction?.commandId || activeAction?.kind || "waiting")}</strong><span>{displayText(activeAction?.status || "no action selected")}</span></div><div><small>OBSERVATION</small><strong>{displayText(latestObservation?.status || "pending")}</strong><span>{displayText(latestObservation ? "Summary captured — full text in Evidence above" : "No command receipt yet")}</span></div><div><small>BUDGET</small><strong>{task.budget?.agentStepsUsed || 0}/{task.budget?.maxAgentSteps || 8}</strong><span>{task.budget?.commandsUsed || 0}/{task.budget?.maxCommands || 12} commands</span></div></div>{(queueState?.count || 0) > 0 && <div className="agent-queue-readout"><span><Icon name="pulse" size={13} /> INTENT QUEUE</span><strong>{queueState.pending?.length || 0} waiting</strong><small>{queueState.active ? `active: ${displayText(queueState.active.payload?.text || "local task")}` : "ready to start"}</small></div>}{planNeedsApproval && activePlan && <div className="agent-loop-decision"><p>{displayText(activePlan.rationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })}>Approve plan</button><button type="button" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Command Center" })}>Reject</button></div></div>}{actionNeedsApproval && activeAction && <div className="agent-loop-decision"><p>{displayText(activeAction.shortRationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("action.accept", { taskId: task.id, actionId: activeAction.id })}>Accept action</button><button type="button" onClick={() => void runCommand("action.reject", { taskId: task.id, actionId: activeAction.id, reason: "Action rejected from Command Center" })}>Reject</button></div></div>}<div className="agent-loop-trace">{actions.slice(-4).reverse().map((action) => <span key={action.id}><i className={`trace-status trace-${action.status}`} /><strong>{displayText(action.commandId || action.kind)}</strong><small>{displayText(action.status)}</small></span>)}</div></section>
+            <section className="agent-loop-panel" aria-label="Maple host execution loop"><div className="block-label"><span>HOST EXECUTION LOOP</span><span className={`loop-badge ${displayText(task.status, "ready")}`}>{displayText(task.status, "ready")}</span></div><div className="agent-loop-grid"><div><small>PLAN</small><strong>{displayText(activePlan ? activePlan.status.replaceAll("_", " ") : "not proposed")}</strong><span>{activePlan?.steps?.length || 0} bounded steps</span></div><div><small>ACTION</small><strong>{displayText(activeAction?.commandId || activeAction?.kind || "waiting")}</strong><span>{displayText(activeAction?.status || "no action selected")}</span></div><div><small>OBSERVATION</small><strong>{displayText(latestObservation?.status || "pending")}</strong><span>{displayText(latestObservation ? "Summary captured — full text in Evidence above" : "No command receipt yet")}</span></div><div><small>BUDGET</small><strong>{task.budget?.agentStepsUsed || 0}/{task.budget?.maxAgentSteps || 8}</strong><span>{task.budget?.commandsUsed || 0}/{task.budget?.maxCommands || 12} commands</span></div><div><small>INFERENCE</small><strong>{task.metrics?.inferenceCalls || 0} calls</strong><span>{task.metrics?.inferenceLatencyMs ? `${Math.round(task.metrics.inferenceLatencyMs / 1000)}s total` : "no latency yet"}{task.metrics?.repairCalls ? ` · ${task.metrics.repairCalls} repairs` : ""}{task.autonomy === "bounded-campaign" ? " · campaign" : task.autonomy === "autonomous" ? " · autonomous" : task.autonomy === "guided" ? " · guided" : ""}</span></div></div>{(queueState?.count || 0) > 0 && <div className="agent-queue-readout"><span><Icon name="pulse" size={13} /> INTENT QUEUE</span><strong>{queueState.pending?.length || 0} waiting</strong><small>{queueState.active ? `active: ${displayText(queueState.active.payload?.text || "local task")}` : "ready to start"}</small>{(queueState.pending || []).slice(0, 4).map((entry) => <button key={entry.id} type="button" title="Cancel this queued request" aria-label={`Cancel queued request: ${displayText(entry.payload?.objective || entry.payload?.text)}`} onClick={() => void cancelQueuedIntent(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}{(queueState.pending?.length || 0) > 4 && <small>+{queueState.pending.length - 4} more queued</small>}</div>}{planNeedsApproval && activePlan && <div className="agent-loop-decision"><p>{displayText(activePlan.rationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id })}>Approve plan</button><button type="button" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Command Center" })}>Reject</button></div></div>}{actionNeedsApproval && activeAction && <div className="agent-loop-decision"><p>{displayText(activeAction.shortRationale)}</p><div className="candidate-actions"><button type="button" onClick={() => void runCommand("action.accept", { taskId: task.id, actionId: activeAction.id })}>Accept action</button><button type="button" onClick={() => void runCommand("action.reject", { taskId: task.id, actionId: activeAction.id, reason: "Action rejected from Command Center" })}>Reject</button></div></div>}<div className="agent-loop-trace">{actions.slice(-4).reverse().map((action) => <span key={action.id}><i className={`trace-status trace-${action.status}`} /><strong>{displayText(action.commandId || action.kind)}</strong><small>{displayText(action.status)}</small></span>)}</div></section>
             <section className="work-note-block"><div className="block-label"><span>WORK NOTE</span><time>{latestEvent ? formatTime(latestEvent.createdAt) : "session ready"}</time></div><p>{displayText(isThinking ? `${MODEL_LANES[modelSelection.provider].label} is composing a response.` : isDreaming ? dreamStage : sipsCycleState === "running" ? sipsStage : latestEvent?.payload?.stage || latestEvent?.payload?.command || "Hemlock is standing by.")}</p></section>
-            <section className="trace-block"><div className="trace-heading"><span>COMMAND TRACE <em>{trace.length}</em></span><button type="button" onClick={() => openWindow("activity")}>View stream <Icon name="chevron" size={12} /></button></div>{trace.length ? <div className="trace-list">{trace.map((event) => <div className="trace-row" key={event.id}><time>{formatTime(event.createdAt)}</time><span>{event.type.replaceAll(".", " · ")}</span><i className={`trace-status trace-${event.status}`}><Icon name={event.status === "failed" ? "warning" : event.status === "running" ? "pulse" : "check"} size={12} /></i><small>{displayText(event.payload?.stage || event.payload?.command || event.status)}</small></div>)}</div> : <p className="empty-copy">No command trace yet. The first request will appear here.</p>}</section>
+            <section className="trace-block"><div className="trace-heading"><span>COMMAND TRACE <em>{trace.length}</em></span><button type="button" onClick={() => openWindow("activity")}>View stream <Icon name="chevronRight" size={12} /></button></div>{trace.length ? <div className="trace-list">{trace.map((event) => <div className="trace-row" key={event.id}><time>{formatTime(event.createdAt)}</time><span>{event.type.replaceAll(".", " · ")}</span><i className={`trace-status trace-${event.status}`}><Icon name={event.status === "failed" ? "warning" : event.status === "running" ? "pulse" : "check"} size={12} /></i><small>{displayText(event.payload?.stage || event.payload?.command || event.status)}</small></div>)}</div> : <p className="empty-copy">No command trace yet. The first request will appear here.</p>}</section>
             </details>
           </div>
         </div>
       </section>
 
       <aside className="evidence-ledger" aria-label="Evidence and context ledger">
-        <section className="ledger-section context-ledger"><div className="ledger-heading"><span>CONTEXT QUALITY</span><button type="button" onClick={() => void runCommand("context.refresh", { reason: "ledger" })} aria-label="Refresh context quality"><Icon name="refresh" size={13} /></button></div><div className="quality-readout"><div className="quality-ring" style={{ "--quality": `${confidence}%` }}><strong>{confidence || "—"}</strong><span>{confidence ? "high" : contextStatus}</span></div><div className="quality-stats"><div><span>Freshness</span><strong>{freshness == null || freshness === "—" ? "measuring…" : freshness}</strong></div><div><span>Relevance</span><strong>{quality.relevance == null ? "measuring…" : `${Math.round(quality.relevance * 100)}%`}</strong></div><div><span>Coverage</span><strong>{quality.sourceCoverage == null ? "measuring…" : `${Math.round(quality.sourceCoverage * 100)}%`}</strong></div><div><span>Providers</span><strong>{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length}/{contextSnapshot?.providers?.length || 0}</strong></div></div></div><p className="ledger-note">{contextStatus === "fresh" ? "Fresh local context is available with redaction and provenance." : "Refresh awareness context before relying on day-to-day observations."}{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length === 0 ? " No providers connected yet — add sources in Settings." : ""}</p></section>
-        <section className="ledger-section"><div className="ledger-heading"><span>EVIDENCE LEDGER</span><button type="button" onClick={() => openWindow("receipts")}>View all <Icon name="chevron" size={12} /></button></div>{receipts.length ? <div className="ledger-list">{groupEvidence(receipts).map((group) => { const latest = group.latest; return <button type="button" className="ledger-row ledger-group" key={group.prefix} onClick={() => openWindow("receipts")} title={group.items.slice(0, 4).map((event) => `${event.type} · ${formatTime(event.createdAt)}`).join("\n")}><Icon name="receipt" size={13} /><span><strong>{group.prefix} · {group.count}</strong><small>{group.count === 1 ? displayText(latest.evidenceRefs?.[0] || latest.payload?.stage || "local receipt") : `${latest.type.replaceAll(".", " · ")} + ${group.count - 1} more`}</small></span><time>{formatRelativeTime(latest.createdAt) || formatTime(latest.createdAt)}</time></button>; })}</div> : <p className="empty-copy">Receipts will collect here as Hemlock works.</p>}</section>
+        <section className="ledger-section context-ledger"><div className="ledger-heading"><span>CONTEXT QUALITY</span><button type="button" onClick={() => void runCommand("context.refresh", { reason: "ledger" })} aria-label="Refresh context quality"><Icon name="refresh" size={13} /></button></div><div className="quality-readout"><div className="quality-ring" style={{ "--quality": `${confidence}%` }}><strong>{confidence || "—"}</strong><span>{confidence ? "high" : contextStatus}</span></div><div className="quality-stats"><div><span>Freshness</span><strong>{freshness == null || freshness === "—" ? "Not checked" : freshness}</strong></div><div><span>Relevance</span><strong>{quality.relevance == null ? "Not checked" : `${Math.round(quality.relevance * 100)}%`}</strong></div><div><span>Coverage</span><strong>{quality.sourceCoverage == null ? "Not checked" : `${Math.round(quality.sourceCoverage * 100)}%`}</strong></div><div><span>Providers</span><strong>{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length}/{contextSnapshot?.providers?.length || 0}</strong></div></div></div><p className="ledger-note">{contextStatus === "fresh" ? "Fresh local context is available with redaction and provenance." : "Refresh awareness context before relying on day-to-day observations."}{(contextSnapshot?.providers || []).filter((provider) => provider.status === "fresh" || provider.status === "available").length === 0 ? " No providers connected yet — add sources in Settings." : ""}</p></section>
+        <section className="ledger-section"><div className="ledger-heading"><span>EVIDENCE LEDGER</span><button type="button" onClick={() => openWindow("receipts")}>View all <Icon name="chevronRight" size={12} /></button></div>{receipts.length ? <div className="ledger-list">{groupEvidence(receipts).map((group) => { const latest = group.latest; return <button type="button" className="ledger-row ledger-group" key={group.prefix} onClick={() => openWindow("receipts")} title={group.items.slice(0, 4).map((event) => `${event.type} · ${formatTime(event.createdAt)}`).join("\n")}><Icon name="receipt" size={13} /><span><strong>{group.prefix} · {group.count}</strong><small>{group.count === 1 ? displayText(latest.evidenceRefs?.[0] || latest.payload?.stage || "local receipt") : `${latest.type.replaceAll(".", " · ")} + ${group.count - 1} more`}</small></span><time>{formatRelativeTime(latest.createdAt) || formatTime(latest.createdAt)}</time></button>; })}</div> : <p className="empty-copy">Receipts will collect here as Hemlock works.</p>}</section>
         <section className="ledger-section candidate-ledger"><div className="ledger-heading"><span>AMBIENT INBOX</span><span className="ledger-tag">{activeCandidates.length ? `${activeCandidates.length} REVIEW` : "QUIET"}</span></div>{ambientCandidate ? <><strong>{displayText(ambientCandidate.title)}</strong><p>{displayText(ambientCandidate.summary)}</p><small>{displayText(ambientCandidate.reason)} · {Math.round((ambientCandidate.confidence || 0) * 100)}% confidence</small><div className="candidate-actions"><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "accept")}>Accept task</button><button type="button" onClick={() => void transitionCandidate(ambientCandidate, "dismiss")}>Dismiss</button></div></> : candidate ? <><strong>{displayText(candidate.title || "Unreviewed project lesson")}</strong><p>{displayText(candidate.body || "Evidence attached to candidate.")}</p><small>verify before use · {displayText(candidate.event?.evidenceRefs?.[0] || "receipt linked")}</small><div className="candidate-actions"><button type="button" onClick={() => openWindow("memory")}>Review memory</button><button type="button" onClick={async () => { const confirmed = await confirmDialog({ title: "Demote this lesson?", body: "The lesson returns to candidate status and stops feeding recall until it is verified again.", confirmLabel: "Demote lesson", tone: "danger" }); if (confirmed) void transitionMemory(candidate, "demote"); }}>Demote</button></div></> : <p className="empty-copy">No candidate needs attention. Enabled sources remain quiet.</p>}</section>
         <section className={`ledger-section blocker-ledger ${blockers.length || task.status === "blocked" ? "has-blocker" : ""}`}><div className="ledger-heading"><span>BLOCKERS</span>{blockers.length || task.status === "blocked" ? <span className="ledger-tag alert">ATTENTION</span> : <span className="ledger-tag good">CLEAR</span>}</div>{task.status === "blocked" ? <p><Icon name="warning" size={14} /> {displayText(task.blockedReason || "The current task is blocked.")}</p> : blockers.length ? blockers.map((event) => <p key={event.id}><Icon name="warning" size={14} /> {displayText(event.payload?.error || event.payload?.stage || event.type)}</p>) : <p><Icon name="check" size={14} /> No active blockers in the current task.</p>}</section>
       </aside>
 
       <section className="cockpit-bottom" aria-label="Hemlock command and activity console">
-        <div className="cockpit-console command-console"><div className="console-heading"><span>COMMAND CONSOLE</span><kbd>⌘K</kbd></div><form onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Command Hemlock…" rows="2" aria-label="Hemlock command input" disabled={isDreaming} /><div className="console-actions"><div className="mode-actions"><button type="button" onClick={() => { setDraft("Inspect the current Hemlock project and report what matters next."); openWindow("chat"); }}><Icon name="map" size={13} /> Inspect</button><button type="button" onClick={() => { setDraft("Improve the next coding task with one verified SIPS cycle."); openWindow("sips"); }}><Icon name="dream" size={13} /> Improve</button><button type="button" onClick={() => openWindow("memory")}><Icon name="memory" size={13} /> Remember</button></div><button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={14} /> Run</button></div></form><div className="console-footer"><StatusLamp state={serverState} label={isDesktop ? "local runtime" : "browser preview"} /><span>{activeAdapterPath ? (adapterVerified ? "Dream adapter verified" : "adapter recorded") : "base Maple-Preview"}</span><span>Tab complete</span></div></div>
+        <div className="cockpit-console command-console"><div className="console-heading"><span>COMMAND CONSOLE</span><kbd>⌘K</kbd></div><form onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={ACTIVE_TASK_STATUSES.has(task.status) ? "steer: redirect the active task · campaign: start an autonomous intent…" : "Command Hemlock… campaign: starts an autonomous intent"} rows="2" aria-label="Hemlock command input" disabled={isDreaming} /><div className="console-actions"><div className="mode-actions"><button type="button" onClick={() => { setDraft("Inspect the current Hemlock project and report what matters next."); openWindow("chat"); }}><Icon name="map" size={13} /> Inspect</button><button type="button" onClick={() => { setDraft("Improve the next coding task with one verified SIPS cycle."); openWindow("sips"); }}><Icon name="dream" size={13} /> Improve</button><button type="button" onClick={() => openWindow("memory")}><Icon name="memory" size={13} /> Remember</button></div><button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={14} /> Run</button></div></form><div className="console-footer"><StatusLamp state={serverState} label={isDesktop ? "local runtime" : "browser preview"} /><span>{activeAdapterPath ? (adapterVerified ? "Dream adapter verified" : "adapter recorded") : "base Maple-Preview"}</span><span>Tab complete</span></div></div>
         <div className="event-spine"><div className="bottom-heading"><span>EVENT SPINE</span><button type="button" onClick={() => openWindow("activity")}>All activity <Icon name="chevron" size={12} /></button></div>{events.slice(-5).reverse().map((event) => <div className="spine-row" key={event.id}><i className={`spine-dot spine-${event.status}`} /><time>{formatTime(event.createdAt)}</time><span className={`spine-type spine-type-${event.status}`}>{displayText(event.status)}</span><strong>{displayText(event.payload?.stage || event.payload?.command || event.type.replaceAll(".", " · "))}</strong></div>)}{!events.length && <p className="empty-copy">Session events will appear here.</p>}</div>
         <div className="loop-panel"><div className="bottom-heading"><span>DREAM / SIPS ACTIVITY</span><button type="button" onClick={() => openWindow(sipsCycleState === "running" ? "sips" : "dream")}>{sipsCycleState === "running" ? "SIPS" : "DREAM"} <Icon name="chevron" size={12} /></button></div><div className="loop-panel-state"><span className={isDreaming || sipsCycleState === "running" ? "is-live" : ""}><Icon name={isDreaming ? "dream" : "sips"} size={15} /> {isDreaming ? dreamStage : sipsCycleState === "running" ? sipsStage : "No long-running work"}</span><strong>{isDreaming ? `${Math.round(dreamProgress)}%` : sipsCycleState === "running" ? `${Math.round(sipsProgress)}%` : "ready"}</strong></div><div className="loop-panel-actions"><button type="button" onClick={() => openWindow("dream")}><Icon name="dream" size={13} /> Dream Lab</button><button type="button" onClick={() => openWindow("sips")}><Icon name="sips" size={13} /> SIPS Control</button></div></div>
         <div className="pulse-panel"><div className="bottom-heading"><span>HEARTBEAT</span><StatusLamp state={serverState} label={serverState} /></div><div className="pulse-visual"><Icon name="pulse" size={130} /><span className="pulse-ring ring-a" /><span className="pulse-ring ring-b" /></div><strong>{events.length ? `${events.length} events` : "quiet"}</strong><small>{latestEvent ? `last ${formatTime(latestEvent.createdAt)}` : "waiting for local activity"}</small></div>
@@ -2340,7 +2560,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
         )}
       </div>
     );
-    return <section className="thread-bar" aria-label="Hemlock threads"><div className="thread-bar-main"><button type="button" className="thread-switcher" onClick={() => setThreadPickerOpen((value) => !value)} aria-expanded={threadPickerOpen}><Icon name="chat" size={14} /><span className="thread-context-label">{interactionMode === "build" ? "Build context" : "Conversation context"}</span><span className="thread-context-copy"><strong>{displayText(task.objective || activeThread?.title || "Hemlock thread")}</strong><small>{displayText(activeThread?.workspaceRoot || task.workspaceRoot || "No project directory")}</small></span><StatusLamp state={task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={displayText(task.status, "ready")} /><Icon name="chevron" size={12} /></button><button type="button" className="quiet-action" onClick={() => void createThread()}><Icon name="plus" size={13} /> New thread</button></div>{threadPickerOpen && <div className="thread-popover" role="dialog" aria-label="Thread list"><div className="thread-popover-heading"><span>THREADS</span><button type="button" onClick={() => void refreshThreadRegistry()}><Icon name="refresh" size={12} /> Refresh</button></div>{openThreads.map(renderThreadRow)}{!openThreads.length && <p className="empty-copy">No open threads. Create one to start a fresh conversation.</p>}{archivedThreads.length > 0 && <details className="thread-archived"><summary>Archived ({archivedThreads.length})</summary>{archivedThreads.map((thread) => <div className="thread-row-wrap is-archived" key={thread.id}><button type="button" className="thread-row" onClick={() => void restoreThread(thread.id)}><span><strong>{displayText(thread.title)}</strong><small>archived {formatRelativeTime(thread.archivedAt)} · select to restore</small></span></button><span className="thread-row-actions"><button type="button" title="Restore thread" aria-label={`Restore ${displayText(thread.title)}`} onClick={() => void restoreThread(thread.id)}><Icon name="refresh" size={12} /></button></span></div>)}</details>}</div>}</section>;
+    return <section className="thread-bar" aria-label="Hemlock threads"><div className="thread-bar-main"><button type="button" className="thread-switcher" onClick={() => setThreadPickerOpen((value) => !value)} aria-expanded={threadPickerOpen}><Icon name="chat" size={14} /><span className="thread-context-label">{interactionMode === "build" ? "Build context" : "Conversation context"}</span><span className="thread-context-copy"><strong>{displayText(task.objective || activeThread?.title || "Hemlock thread")}</strong><small>{displayText(activeThread?.workspaceRoot || task.workspaceRoot || "No project directory")}</small></span><StatusLamp state={task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={displayText(task.status, "ready")} /><Icon name="chevron" size={12} /></button><button type="button" className="quiet-action" disabled={!isDesktop} title={!isDesktop ? "Open the Hemlock desktop app to create and save threads" : "Create a new thread"} onClick={() => void createThread()}><Icon name="plus" size={13} /> {isDesktop ? "New thread" : "Desktop threads"}</button></div>{threadPickerOpen && <div className="thread-popover" role="dialog" aria-label="Thread list"><div className="thread-popover-heading"><span>THREADS</span><button type="button" onClick={() => void refreshThreadRegistry()}><Icon name="refresh" size={12} /> Refresh</button></div>{openThreads.map(renderThreadRow)}{!openThreads.length && <p className="empty-copy">{isDesktop ? "No open threads. Create one to start a fresh conversation." : "Saved threads are available in the Hemlock desktop app."}</p>}{archivedThreads.length > 0 && <details className="thread-archived"><summary>Archived ({archivedThreads.length})</summary>{archivedThreads.map((thread) => <div className="thread-row-wrap is-archived" key={thread.id}><button type="button" className="thread-row" onClick={() => void restoreThread(thread.id)}><span><strong>{displayText(thread.title)}</strong><small>archived {formatRelativeTime(thread.archivedAt)} · select to restore</small></span></button><span className="thread-row-actions"><button type="button" title="Restore thread" aria-label={`Restore ${displayText(thread.title)}`} onClick={() => void restoreThread(thread.id)}><Icon name="refresh" size={12} /></button></span></div>)}</details>}</div>}</section>;
   }
 
   function renderSuggestionCards() {
@@ -2387,16 +2607,14 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
         ? "The task requires approval, but its durable plan is not loaded in this window. Refresh task state before acting."
         : latestObservation?.summary || latestActionEvent?.payload?.reason || "Authoritative observations and receipts will collect here.";
     const modelActivity = liveStreams.length ? "streaming" : task.status === "waiting_for_approval" && !planIsApproved ? "idle · approval required" : task.status === "running" ? "working" : task.status || "idle";
+    const taskActive = ACTIVE_TASK_STATUSES.has(task.status);
+    const autonomyLabel = AUTONOMY_LABELS[task.autonomy] || null;
     const objective = displayText(task.objective, "Untitled Hemlock task");
     const objectiveIsLong = objective.length >= 120;
     const objectiveSummary = objectiveIsLong ? compactPreview(objective) : objective;
     const liveStream = liveStreams.at(-1) || null;
     const liveStreamRate = formatTokensPerSecond(liveStream?.usage, liveStream?.startedAt ? Date.now() - new Date(liveStream.startedAt).getTime() : null);
-    const stableRetryRef = useRef(retryLastMessage);
-    stableRetryRef.current = retryLastMessage;
-    // Stable identity so memoized TranscriptMessageRow props stay equal across
-    // renders (retryLastMessage itself is re-created per render).
-    const stableRetryLast = useCallback((target) => stableRetryRef.current(target), []);
+
     // Electron IPC wraps handler errors as `Error invoking remote method 'X': Error: <real message>`.
     // Strip the wrapper so users see the actual cause, not transport jargon.
     const cleanErrorText = (text) => String(text || "").replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, "").trim();
@@ -2425,19 +2643,24 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     // normal user message via task.answer and the card disappears on resume.
     const questionPrompt = task.phase === "waiting_for_user" ? displayText(task.question?.prompt || task.foregroundStep || "", "Maple needs your answer to continue.") : "";
     const questionCard = questionPrompt && <section className="chat-question-card is-awaiting" aria-label="Maple asks you a question"><div className="card-kicker"><span>MAPLE ASKS</span><StatusLamp state="working" label="ASKS YOU" /></div><strong className="chat-question-prompt">{questionPrompt}</strong><textarea value={answerDraft} onChange={(event) => setAnswerDraft(event.target.value)} placeholder="Answer in place — Maple resumes with your reply…" rows="3" aria-label="Answer Maple's question" disabled={Boolean(commandBusy)} /><div className="chat-question-actions"><small>Your answer joins the thread history verbatim.</small><button type="button" className="primary-action" disabled={!answerDraft.trim() || Boolean(commandBusy)} onClick={() => { const answer = answerDraft.trim(); setAnswerDraft(""); void runCommand("task.answer", { taskId: task.id, answer }); }}>{commandBusy === "task.answer" ? "Sending…" : "Send answer"}</button></div></section>;
-    const planCard = (activePlan || planStateMissing || task.status === "waiting_for_approval") && <section className={`chat-plan-card ${planNeedsApproval || planStateMissing ? "is-awaiting" : "is-approved"} ${planCollapsed ? "is-collapsed" : ""}`} aria-label="Plan and approval"><div className="chat-plan-heading"><div><span className="card-kicker">PLAN / APPROVAL</span><GlossaryHint as="strong" term="Bounded" definition="the agent may only run the limited steps listed here — each step is approved by you before anything executes.">{planNeedsApproval ? "Review before Maple starts" : planStateMissing ? "Plan state needs refresh" : "Bounded plan"}</GlossaryHint></div><div className="chat-plan-heading-actions"><StatusLamp state={planNeedsApproval || planStateMissing ? "working" : "ready"} label={planNeedsApproval ? "waiting for approval" : planStateMissing ? "not loaded" : activePlan?.status || "ready"} />{activePlan && <button type="button" className={`plan-collapse-toggle ${planCollapsed ? "is-collapsed" : ""}`} onClick={() => setPlanCollapsed((value) => !value)} aria-expanded={!planCollapsed} aria-controls="hemlock-plan-body"><Icon name="chevron" size={14} /> <span>{planCollapsed ? "Expand plan" : "Collapse plan"}</span></button>}</div></div>{activePlan ? <><div id="hemlock-plan-body" className="chat-plan-scroll" hidden={planCollapsed}><div className="chat-plan-meta"><GlossaryHint term="Bounded" definition="only these allowlisted, host-prepared steps can run — no source mutation outside them.">HOST-PREPARED CAPABILITY BOUNDARY</GlossaryHint><small>{activePlan.steps?.length || 0} steps · no source mutation has run</small></div><p className="chat-plan-rationale">{displayText(activePlan.rationale, "Hemlock prepared this bounded plan from the request.")}</p><ol className="chat-plan-steps">{(activePlan.steps || []).map((step) => <li key={`${activePlan.id}-${step.step}`} className={step.status === "ready" ? "is-ready" : ""}><span>{step.step}</span><div><strong>{displayText(step.label || step.commandId || step.kind)}</strong><small>{displayText(step.expectedEvidence?.join?.(" · ") || "Host receipt after this step")}</small></div></li>)}</ol>{budgetUsage && <p className="budget-usage" aria-label="Budget usage">{budgetUsage}</p>}<p className="chat-plan-boundary"><strong>{planNeedsApproval ? "Maple has not run yet." : planIsApproved ? "Maple is free to choose the next useful action inside this approved boundary." : "The host has not claimed work outside this plan."}</strong> Safeguards still own scope, approvals, verification, and completion.</p></div>{planNeedsApproval && <div className="chat-plan-actions"><div className="budget-stepper" role="group" aria-label="Grantable budgets"><small>steps</small><button type="button" aria-label="Fewer steps" onClick={() => setGrantSteps(grantSteps - 1)} disabled={grantSteps <= 1}>−</button><strong>{grantSteps}</strong><button type="button" aria-label="More steps" onClick={() => setGrantSteps(grantSteps + 1)} disabled={grantSteps >= 24}>+</button><small>commands</small><button type="button" aria-label="Fewer commands" onClick={() => setGrantCommands(grantCommands - 1)} disabled={grantCommands <= 1}>−</button><strong>{grantCommands}</strong><button type="button" aria-label="More commands" onClick={() => setGrantCommands(grantCommands + 1)} disabled={grantCommands >= 40}>+</button></div><button type="button" className="primary-action" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id, ...(grantOverrides ? { budgetOverrides: grantOverrides } : {}) })} disabled={commandBusy === "plan.approve"}><Icon name="check" size={14} /> {commandBusy === "plan.approve" ? "Approving…" : "Approve plan"}</button><button type="button" className="quiet-action" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Chat" })} disabled={Boolean(commandBusy)}>Reject</button></div>}</> : <><p className="chat-plan-rationale">{evidenceSummary}</p><div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void refreshAgentState()} disabled={commandBusy === "agent.state"}><Icon name="refresh" size={14} /> {commandBusy === "agent.state" ? "Refreshing…" : "Refresh task state"}</button></div></>}</section>;
+    const planCard = (activePlan || planStateMissing || task.status === "waiting_for_approval") && <section className={`chat-plan-card ${planNeedsApproval || planStateMissing ? "is-awaiting" : "is-approved"} ${planCollapsed ? "is-collapsed" : ""}`} aria-label="Plan and approval"><div className="chat-plan-heading"><div><span className="card-kicker">PLAN / APPROVAL</span><GlossaryHint as="strong" term="Bounded" definition="the agent may only run the limited steps listed here — each step is approved by you before anything executes.">{planNeedsApproval ? "Review before Maple starts" : planStateMissing ? "Plan state needs refresh" : "Bounded plan"}</GlossaryHint></div><div className="chat-plan-heading-actions">{autonomyLabel && <span className={`autonomy-badge${task.autonomy === "bounded-campaign" ? " is-campaign" : ""}`} title="Host-recorded autonomy for this task">{autonomyLabel}</span>}<StatusLamp state={planNeedsApproval || planStateMissing ? "working" : "ready"} label={planNeedsApproval ? "waiting for approval" : planStateMissing ? "not loaded" : activePlan?.status || "ready"} />{activePlan && <button type="button" className={`plan-collapse-toggle ${planCollapsed ? "is-collapsed" : ""}`} onClick={() => setPlanCollapsed((value) => !value)} aria-expanded={!planCollapsed} aria-controls="hemlock-plan-body"><Icon name="chevron" size={14} /> <span>{planCollapsed ? "Expand plan" : "Collapse plan"}</span></button>}</div></div>{activePlan ? <><div id="hemlock-plan-body" className="chat-plan-scroll" hidden={planCollapsed}><div className="chat-plan-meta"><GlossaryHint term="Bounded" definition="only these allowlisted, host-prepared steps can run — no source mutation outside them.">HOST-PREPARED CAPABILITY BOUNDARY</GlossaryHint><small>{activePlan.steps?.length || 0} steps · no source mutation has run</small></div><p className="chat-plan-rationale">{displayText(activePlan.rationale, "Hemlock prepared this bounded plan from the request.")}</p><ol className="chat-plan-steps">{(activePlan.steps || []).map((step) => <li key={`${activePlan.id}-${step.step}`} className={step.status === "ready" ? "is-ready" : ""}><span>{step.step}</span><div><strong>{displayText(step.label || step.commandId || step.kind)}</strong><small>{displayText(step.expectedEvidence?.join?.(" · ") || "Host receipt after this step")}</small></div></li>)}</ol>{budgetUsage && <p className="budget-usage" aria-label="Budget usage">{budgetUsage}</p>}<p className="chat-plan-boundary"><strong>{planNeedsApproval ? "Maple has not run yet." : planIsApproved ? "Maple is free to choose the next useful action inside this approved boundary." : "The host has not claimed work outside this plan."}</strong> Safeguards still own scope, approvals, verification, and completion.</p></div>{planNeedsApproval && <div className="chat-plan-actions"><div className="budget-stepper" role="group" aria-label="Grantable budgets"><small>steps</small><button type="button" aria-label="Fewer steps" onClick={() => setGrantSteps(grantSteps - 1)} disabled={grantSteps <= 1}>−</button><strong>{grantSteps}</strong><button type="button" aria-label="More steps" onClick={() => setGrantSteps(grantSteps + 1)} disabled={grantSteps >= 24}>+</button><small>commands</small><button type="button" aria-label="Fewer commands" onClick={() => setGrantCommands(grantCommands - 1)} disabled={grantCommands <= 1}>−</button><strong>{grantCommands}</strong><button type="button" aria-label="More commands" onClick={() => setGrantCommands(grantCommands + 1)} disabled={grantCommands >= 40}>+</button></div><button type="button" className="primary-action" onClick={() => void runCommand("plan.approve", { taskId: task.id, planId: activePlan.id, ...(grantOverrides ? { budgetOverrides: grantOverrides } : {}) })} disabled={commandBusy === "plan.approve"}><Icon name="check" size={14} /> {commandBusy === "plan.approve" ? "Approving…" : "Approve plan"}</button><button type="button" className="quiet-action" onClick={() => void runCommand("plan.reject", { taskId: task.id, planId: activePlan.id, reason: "Plan rejected from Chat" })} disabled={Boolean(commandBusy)}>Reject</button></div>}</> : <><p className="chat-plan-rationale">{evidenceSummary}</p><div className="chat-plan-actions"><button type="button" className="primary-action" onClick={() => void refreshAgentState()} disabled={commandBusy === "agent.state"}><Icon name="refresh" size={14} /> {commandBusy === "agent.state" ? "Refreshing…" : "Refresh task state"}</button></div></>}</section>;
     const groundingCount = groundingRecords.length;
     const groundingChip = groundingCount > 0 && <span className="grounding-wrap"><button type="button" className="grounding-chip" aria-expanded={groundingPopoverOpen} onClick={() => setGroundingPopoverOpen((open) => !open)} title="Promoted memories injected into this reply's context — rate them useful or not relevant">grounding · {groundingCount}</button>{groundingPopoverOpen && <div className="grounding-popover" role="group" aria-label="Injected memory usefulness feedback"><span className="grounding-popover-heading">INJECTED MEMORIES</span>{groundingRecords.map((record) => <div className="grounding-record" key={record.id}><span className="grounding-record-title" title={displayText(record.title, record.id)}>{displayText(record.title, record.id)}</span><span className="grounding-record-actions"><button type="button" disabled={groundingBusyId === record.id} onClick={() => void sendGroundingFeedback(record, "useful")} aria-label={`Mark ${displayText(record.title, record.id)} useful`}>useful</button><button type="button" disabled={groundingBusyId === record.id} onClick={() => void sendGroundingFeedback(record, "irrelevant")} aria-label={`Mark ${displayText(record.title, record.id)} not relevant`}>not relevant</button></span></div>)}<button type="button" className="grounding-garden-link" onClick={() => { setGroundingPopoverOpen(false); openWindow("memory"); }}>Open Memory Garden</button></div>}</span>;
-    const chatStatusBar = <div className="chat-status-bar" aria-label="Chat status"><StatusLamp state={task.status === "running" || task.phase === "waiting_for_user" || liveStreams.length ? "working" : task.status === "blocked" ? "down" : "ready"} label={task.status === "running" ? "WORKING" : task.phase === "waiting_for_user" ? "ASKS YOU" : displayText(task.status, "READY")} /><span>{messages.length ? `${messages.at(-1)?.role === "user" ? "You" : MODEL_LANES[messages.at(-1)?.provider || modelSelection.provider]?.shortLabel || "MODEL"} ${displayText(messages.at(-1)?.time, formatTime())}` : "Ready"}</span><span>{liveStreams.length ? `${selectedLane.label} (live) · ${liveStreamRate}` : (() => { const lastAssistant = [...messages].reverse().find((item) => item.role === "assistant" && item.telemetry?.completionTokens != null); return lastAssistant ? `${selectedLane.label} · ${lastAssistant.telemetry.completionTokens} tokens last reply` : selectedLane.label; })()}</span>{groundingChip}<span>Hemlock Local · Electron Runtime</span></div>;
+    const chatStatusBar = <div className="chat-status-bar" aria-label="Chat status"><StatusLamp state={task.status === "running" || task.phase === "waiting_for_user" || liveStreams.length ? "working" : task.status === "blocked" ? "down" : "ready"} label={task.status === "running" ? "WORKING" : task.phase === "waiting_for_user" ? "ASKS YOU" : displayText(task.status, "READY")} /><span>{messages.length ? `${messages.at(-1)?.role === "user" ? "You" : MODEL_LANES[messages.at(-1)?.provider || modelSelection.provider]?.shortLabel || "MODEL"} ${displayText(messages.at(-1)?.time, formatTime())}` : "Ready"}</span><span>{liveStreams.length ? `${selectedLane.label} (live) · ${liveStreamRate}` : (() => { const lastAssistant = [...messages].reverse().find((item) => item.role === "assistant" && item.telemetry?.completionTokens != null); return lastAssistant ? `${selectedLane.label} · ${lastAssistant.telemetry.completionTokens} tokens last reply` : selectedLane.label; })()}</span>{groundingChip}{autonomyLabel && <span>autonomy · {autonomyLabel}</span>}<span>{isDesktop ? "Electron runtime" : "Browser preview"}</span></div>;
     const lastAssistantReply = [...messages].reverse().find((message) => message.role === "assistant") || null;
     const laneComparison = task.comparison?.schema === "hemlock.agent.comparison.v1" ? task.comparison : null;
     const showLaneCompare = Boolean(laneComparison && compareDismissedAt !== laneComparison.ranAt);
-    return <div className={`chat-surface${task.phase === "waiting_for_user" && questionPrompt ? " is-asking" : ""}`}>{renderThreadBar()}{error && <div className="runtime-alert chat-error" role="alert"><Icon name="activity" size={15} /><span>{cleanErrorText(error)}</span><button type="button" className="error-dismiss" onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}<div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary className="chat-context-summary"><span className="chat-context-label">{interactionMode === "build" ? "BUILD CONTEXT" : "CONVERSATION CONTEXT"}</span><span>{objectiveSummary}</span></summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={modelActivity} /></div>{renderSuggestionCards()}{(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" onClick={() => void desktopAgent()?.cancelQueued?.(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}</div>}
+    return <div className={`chat-surface${interactionMode === "build" ? " is-build" : ""}${!inspectorOpen ? " is-inspector-hidden" : ""}${task.phase === "waiting_for_user" && questionPrompt ? " is-asking" : ""}`}>
+      {renderThreadBar()}
+      {error && <div className="runtime-alert chat-error" role="alert"><Icon name="warning" size={15} /><span>{cleanErrorText(error)}</span><button type="button" className="error-dismiss" onClick={() => setError("")} aria-label="Dismiss error"><Icon name="close" size={16} /></button></div>}
+      <div className="surface-intro chat-task-header"><div><span className="eyebrow">TASK STREAM <span className="browser-boundary">{isDesktop ? "ELECTRON RUNTIME" : "BROWSER VISUAL PREVIEW"}</span></span><details className="objective-collapse" open={!objectiveIsLong}><summary className="chat-context-summary"><span className="chat-context-label">{interactionMode === "build" ? "BUILD CONTEXT" : "CONVERSATION CONTEXT"}</span><span>{objectiveSummary}</span></summary>{objectiveIsLong && <p className="objective-full">{objective}</p>}<p>{MODEL_LANES[modelSelection.provider].label} output stays verbatim; host actions and evidence stay beside it.</p></details></div><StatusLamp state={hasLiveStream(liveStreams) || task.status === "running" ? "working" : task.status === "blocked" ? "down" : "ready"} label={modelActivity} /></div>
+      {renderSuggestionCards()}
+      {(queueState?.pending?.length || liveStreams.length) > 0 && <div className="chat-activity-strip"><span>{liveStreams.length ? "LIVE RESPONSE" : "QUEUE"}</span><strong>{liveStreams.length ? `${Math.round((liveStreams.at(-1)?.text || "").length)} chars received` : `${queueState?.pending?.length || 0} waiting`}</strong>{queueState?.pending?.slice(0, 2).map((entry) => <button key={entry.id} type="button" aria-label={`Cancel queued request: ${displayText(entry.payload?.objective || entry.payload?.text)}`} title="Cancel this queued request" onClick={() => void cancelQueuedIntent(entry.requestId)}>{entry.position}. {displayText(entry.payload?.objective || entry.payload?.text)}</button>)}</div>}
       {showLaneCompare && (() => { const comparisonLane = MODEL_LANES[laneComparison.targetProvider] || MODEL_LANES.maple; const currentTelemetry = lastAssistantReply?.telemetry || null; const currentReplyText = lastAssistantReply?.content || (lastAssistantReply?.channels || []).find((channel) => channel.name === "content")?.text || ""; const pinnedPrompt = String(laneComparison.promptText || "").replace(/\s+/g, " ").trim(); const latestUserPrompt = ([...messages].reverse().find((message) => message.role === "user")?.content || "").replace(/\s+/g, " ").trim(); const promptSuperseded = Boolean(pinnedPrompt) && latestUserPrompt !== pinnedPrompt; return <section className="chat-compare" aria-label="Model lane comparison"><div className="chat-compare-heading"><span className="card-kicker">LANE COMPARE</span><small>same prompt · both replies verbatim</small><button type="button" className="quiet-action" onClick={() => setCompareDismissedAt(laneComparison.ranAt)}>Dismiss</button></div>{pinnedPrompt && <div className="chat-compare-prompt" title={pinnedPrompt}><small>PROMPT PINNED</small><code>{compactPreview(pinnedPrompt, 120)}</code>{promptSuperseded && <small className="chat-compare-stale">prompt since superseded</small>}</div>}<div className="chat-compare-grid"><div className="chat-compare-column"><span className="chat-compare-label">{selectedLane.shortLabel} · CURRENT LANE</span>{currentTelemetry && <small>{formatTokensPerSecond(currentTelemetry, currentTelemetry.elapsedMs)}</small>}<pre>{displayText(currentReplyText, "No assistant reply in this thread yet.")}</pre></div><div className="chat-compare-column"><span className="chat-compare-label">{comparisonLane.shortLabel} · COMPARISON</span>{laneComparison.telemetry && <small>{formatTokensPerSecond(laneComparison.telemetry, laneComparison.telemetry.elapsedMs)}</small>}<pre>{displayText(laneComparison.answer, "(empty response)")}</pre></div></div></section>; })()}
       {questionCard}
       {planCard}
       <div className="chat-scroll">
-      {!primerDismissed && <PrimerCard onDismiss={dismissPrimer} />}
+      {!primerDismissed && <details className="chat-help-disclosure"><summary>How Hemlock keeps your work and evidence separate</summary><PrimerCard onDismiss={dismissPrimer} /></details>}
 
       {!messages.length && !workNotes.length && <div className="empty-work"><span className="empty-symbol"><Icon name="leaf" size={26} /></span><h3>Start with {MODEL_LANES[modelSelection.provider].label}</h3><p>Conversation comes first. Exact model channels, live actions, and evidence will appear here as the task develops.</p></div>}
       {messages.map((message, messageIndex) => <TranscriptMessageRow key={message.id} message={message} index={messageIndex} total={messages.length} isThinking={isThinking} reasoningOff={modelSelection.reasoning === "off"} threadId={task.threadId || threadRegistry.activeThreadId} threadTitle={(threadRegistry.threads || []).find((item) => item.id === (task.threadId || threadRegistry.activeThreadId))?.title || ""} onRetry={stableRetryLast} />)}
@@ -2445,7 +2668,32 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
       {!chatPinned && (isThinking || liveStreams.length > 0) && <button type="button" className="chat-jump-latest" onClick={jumpToLatest}><Icon name="chevron" size={12} /> New activity</button>}
       {serverDownWhileWaiting ? <div className="live-note is-stalled"><span className="pulse" /> The local model server is not responding. Open Settings → Check local readiness, or restart Hemlock.</div> : isThinking && (() => { const liveFrame = liveStreams.at(-1) || null; const reasoningText = liveFrame?.channels?.reasoning || liveFrame?.channels?.reasoning_content || ""; const contentText = liveFrame?.channels?.content || ""; const reasoningTokens = reasoningText ? Math.round(reasoningText.length / 4) : 0; const phase = contentText ? "writing the answer" : reasoningTokens > 0 ? "thinking" : serverHealthProbe === null ? "loading model weights" : "warming up"; return <div className="live-note live-note-thinking"><span className="pulse" /> {selectedLane.label} is {phase}{serverHealthProbe === null && phase === "loading model weights" ? " — first load can take a moment" : ""}{thinkingElapsed != null ? <span className="thinking-timer">{thinkingElapsed < 60 ? `${thinkingElapsed}s` : `${Math.floor(thinkingElapsed / 60)}m ${thinkingElapsed % 60}s`}</span> : null}{reasoningTokens > 0 && !contentText ? <span className="thinking-reasoning-chars">{reasoningTokens} tokens reasoned</span> : null}<span className="thinking-dots" aria-hidden="true"><i /><i /><i /></span></div>; })()}
       <div ref={endRef} />
-      </div><aside className="chat-work-rail" aria-label="Hemlock work rail">{hostActivity}{verificationCard}{evidenceRail}<div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode"><span className="interaction-mode-label">WORK MODE</span><button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button><button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")}><Icon name="artifact" size={13} /> Build</button><small>{interactionMode === "build" ? "Build mode: one plan approval, then scratch-artifact autopilot." : "Explore mode: conversation stays conversational until you hand off to Build."}</small></div><div className="composer-model-line">{composerModelLine}{contextMeterState && <span className={`context-meter${contextMeterState.warn ? " is-warn" : ""}`} role="meter" aria-valuenow={contextMeterState.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Prompt context budget used" title="Share of the bounded prompt budget the last reply used"><i style={{ "--meter-fill": `${contextMeterState.percent}%` }} /><span>{contextMeterState.label}</span></span>}</div><form className="chat-compose" onSubmit={sendMessage}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : "Continue the conversation or task…"} rows="2" aria-label="Continue Hemlock task" disabled={isDreaming} />{(isThinking || liveStreams.length > 0) && <button type="button" className="stop-action" onClick={() => void stopGeneration()} disabled={cancelBusy}><Icon name="stop" size={14} /> {cancelBusy ? "Stopping…" : "Stop"}</button>}<button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button></form></aside>{chatStatusBar}</div>;
+      </div>
+      <aside id="hemlock-chat-inspector" className="chat-work-rail" aria-label="Hemlock work rail" hidden={!inspectorOpen}>
+        <div className="chat-inspector-heading"><strong>Activity & evidence</strong><button type="button" onClick={() => { inspectorOpenerRef.current?.focus?.(); setInspectorOpen(false); }} aria-label="Close activity and evidence"><Icon name="close" size={15} /></button></div>
+        {hostActivity}{verificationCard}{evidenceRail}
+      </aside>
+      <div className="chat-composer-area">
+        <div className="interaction-mode-bar" role="group" aria-label="Hemlock interaction mode">
+
+          <button type="button" className={interactionMode === "explore" ? "is-selected" : ""} aria-pressed={interactionMode === "explore"} onClick={() => setInteractionMode("explore")}><Icon name="chat" size={13} /> Explore</button>
+          <button type="button" className={interactionMode === "build" ? "is-selected" : ""} aria-pressed={interactionMode === "build"} onClick={() => setInteractionMode("build")} title="Review a plan before a build starts"><Icon name="artifact" size={13} /> Build</button>
+          <span className="autonomy-divider" aria-hidden="true" />
+          <button type="button" className={autonomyMode === "bounded-local" ? "is-selected" : ""} aria-pressed={autonomyMode === "bounded-local"} onClick={() => setAutonomyMode("bounded-local")} title="Every plan and explicit action waits for your approval">Supervised</button>
+          <button type="button" className={autonomyMode === "guided" ? "is-selected" : ""} aria-pressed={autonomyMode === "guided"} onClick={() => setAutonomyMode("guided")} title="Plans auto-approve; sandboxed artifact and preview actions run without clicks">Guided</button>
+          <button type="button" className={autonomyMode === "autonomous" ? "is-selected" : ""} aria-pressed={autonomyMode === "autonomous"} onClick={() => setAutonomyMode("autonomous")} title="Plans and all actions except training run autonomously; budgets still bind">Autonomous</button>
+          <button type="button" className="chat-inspector-toggle" aria-expanded={inspectorOpen} aria-controls="hemlock-chat-inspector" onClick={() => setInspectorOpen((open) => !open)}><Icon name="receipt" size={13} /> {inspectorOpen ? "Hide activity" : "Activity & evidence"}</button>
+        </div>
+        <details className="composer-details"><summary>Model & context</summary><div className="composer-model-line">{composerModelLine}{contextMeterState && <span className={`context-meter${contextMeterState.warn ? " is-warn" : ""}`} role="meter" aria-valuenow={contextMeterState.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Prompt context budget used" title="Share of the bounded prompt budget the last reply used"><i style={{ "--meter-fill": `${contextMeterState.percent}%` }} /><span>{contextMeterState.label}</span></span>}</div></details>
+        <form className="chat-compose" onSubmit={sendMessage}>
+          <textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.target.style.height = "auto"; event.target.style.height = `${Math.min(event.target.scrollHeight, 112)}px`; }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); void sendMessage(event); } }} placeholder={interactionMode === "build" ? "Describe the artifact to build…" : taskActive ? "steer: redirect the active task, or send a new message…" : "Message your model…"} rows="1" aria-label="Continue Hemlock task" aria-describedby="chat-compose-hint" disabled={isDreaming} />
+          {(isThinking || liveStreams.length > 0) && <button type="button" className="stop-action" onClick={() => void stopGeneration()} disabled={cancelBusy}><Icon name="stop" size={14} /> {cancelBusy ? "Stopping…" : "Stop"}</button>}
+          <button className="primary-action" type="submit" disabled={!draft.trim() || isDreaming || (!isDesktop && isThinking)}><Icon name="send" size={15} /> Send</button>
+        </form>
+        <div className="compose-hint" id="chat-compose-hint"><span>Enter to send · Shift+Enter for a new line</span><span>{taskActive ? "steer: redirects this task · campaign: starts an autonomous intent" : "campaign: starts an autonomous intent"}</span></div>
+      </div>
+      {chatStatusBar}
+    </div>;
   }
 
   function renderSips() {
@@ -2461,7 +2709,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     const stepCount = { smoke: 1, balanced: 4, quality: 8 }[dreamTrainingProfile] || 8;
     const mapleRuntimeState = mapleLaunchState === "launching" ? "working" : serverProcessReady === true ? "ready" : serverProcessReady === false || mapleLaunchState === "failed" ? "down" : "idle";
     const mapleRuntimeLabel = mapleLaunchState === "launching" ? "starting" : serverProcessReady === true ? "running" : isDesktop ? "not running" : "desktop only";
-    return <div className="dream-surface"><div className="dream-hero"><div className="dream-moon-large"><Icon name="dream" size={36} /></div><div><span className="eyebrow">LOCAL TRAINING WINDOW</span><h2>Dream Lab</h2><p>{isDreaming ? dreamStage : dreamReceipt ? "Candidate adapter receipt is available." : "Prepare an isolated LoRA adapter without touching the base Maple weights."}</p></div><StatusLamp state={isDreaming ? "working" : dreamReceipt ? "ready" : "idle"} label={isDreaming ? `${dreamProgress}%` : "idle"} /></div><div className="dream-progress"><div className="progress-bar"><span style={{ transform: `scaleX(${dreamProgress / 100})` }} /></div><div><span>{dreamLog || "The live heartbeat appears here during MLX work."}</span><strong>{formatElapsed(dreamElapsed)}</strong></div></div><div className="dream-runtime-launch"><div><span className="eyebrow">LOCAL RUNTIME</span><strong>Maple / Dream</strong><small>Starts the MLX server and checks HTTP health. It does not run inference or training.</small></div><StatusLamp state={mapleRuntimeState} label={mapleRuntimeLabel} /><button className="wide-action" onClick={() => void launchMapleDream()} disabled={!isDesktop || mapleLaunchState === "launching"} title={!isDesktop ? "Open the Electron desktop app to launch Maple/Dream" : "Start Maple and verify process health only"}><Icon name="play" size={15} />{mapleLaunchState === "launching" ? "Starting Maple…" : serverProcessReady === true ? "Check Maple / Dream" : "Launch Maple / Dream"}</button></div>{mapleLaunchError && <div className="runtime-alert">Maple launch failed: {mapleLaunchError}</div>}<div className="dream-chart"><div className="chart-lines"><i /><i /><i /><i /></div><svg viewBox="0 0 620 150" preserveAspectRatio="none" aria-label="Dream loss preview"><polyline points="0,110 40,88 78,102 116,66 154,82 192,54 230,75 268,61 306,72 344,47 382,63 420,50 458,58 496,42 534,52 572,44 620,50" /><polyline className="faint" points="0,126 40,113 78,124 116,92 154,103 192,84 230,98 268,87 306,95 344,76 382,90 420,80 458,87 496,72 534,82 572,75 620,80" /></svg><div className="chart-labels"><span>step 1</span><span>step {Math.max(1, Math.ceil((dreamProgress / 100) * stepCount))}</span></div></div><div className="dream-metrics"><Metric value={`${Math.round((dreamProgress / 100) * stepCount)}/${stepCount}`} label="steps" tone="gold" /><Metric value={trainingDataset?.sourceRows ?? facts.length + messages.length} label="dataset rows" /><Metric value={dreamReceipt?.baseWeightsUnchanged === true ? "safe" : "—"} label="base weights" tone="violet" /><Metric value={dreamReceipt?.inferenceReady === true ? "ready" : "—"} label="adapter" /></div><div className="dream-controls"><label>Profile<select value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)} disabled={isDreaming}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void startDream()} disabled={isDreaming || (!facts.length && !messages.length)}><Icon name="dream" size={15} />{isDreaming ? "Dreaming locally…" : "Prepare dataset + start Dream"}</button>{isDreaming && <button className="quiet-action" onClick={() => void window.mapleDesktop?.cancelAgentTask?.()}><Icon name="stop" size={13} /> Stop</button>}</div>{trainingDataset && <div className="proof-callout"><SectionTitle icon="database" right="ready">Dataset holdout</SectionTitle><span>{trainingDataset.trainingRows} train · {trainingDataset.validationRows} validation · {trainingDataset.sourceRows} source rows</span><small>The dataset is prepared before the explicit training operation; no weights changed during preparation.</small></div>}{dreamReceipt && <div className="proof-callout"><SectionTitle icon="receipt" right={dreamReceipt.baseWeightsUnchanged === true ? "verified" : "unproven"}>Latest training proof</SectionTitle><span>Profile: {dreamReceipt.profile || "—"} · rows: {dreamReceipt.dataset?.sourceRows ?? dreamReceipt.dataset?.examples ?? "—"} · holdout: {dreamReceipt.dataset?.validationHoldout === true ? "yes" : "no"}</span><small>The integrity receipt proves isolation; it does not claim a general model-quality gain.</small></div>}{recoveryNotice && <div className="runtime-alert">{recoveryNotice}</div>}</div>;
+    return <div className="dream-surface"><div className="dream-hero"><div className="dream-moon-large"><Icon name="dream" size={36} /></div><div><span className="eyebrow">LOCAL TRAINING WINDOW</span><h2>Dream Lab</h2><p>{isDreaming ? dreamStage : dreamReceipt ? "Candidate adapter receipt is available." : "Prepare an isolated LoRA adapter without touching the base Maple weights."}</p></div><StatusLamp state={isDreaming ? "working" : dreamReceipt ? "ready" : "idle"} label={isDreaming ? `${dreamProgress}%` : "idle"} /></div><div className="dream-progress"><div className="progress-bar"><span style={{ transform: `scaleX(${dreamProgress / 100})` }} /></div><div><span>{dreamLog || "The live heartbeat appears here during MLX work."}</span><strong>{formatElapsed(dreamElapsed)}</strong></div></div><div className="dream-runtime-launch"><div><span className="eyebrow">LOCAL RUNTIME</span><strong>Maple / Dream</strong><small>Starts the MLX server and checks HTTP health. It does not run inference or training.</small></div><StatusLamp state={mapleRuntimeState} label={mapleRuntimeLabel} /><button className="wide-action" onClick={() => void launchMapleDream()} disabled={!isDesktop || mapleLaunchState === "launching"} title={!isDesktop ? "Open the Electron desktop app to launch Maple/Dream" : "Start Maple and verify process health only"}><Icon name="play" size={15} />{mapleLaunchState === "launching" ? "Starting Maple…" : serverProcessReady === true ? "Check Maple / Dream" : "Launch Maple / Dream"}</button></div>{mapleLaunchError && <div className="runtime-alert">Maple launch failed: {mapleLaunchError}</div>}<section className="dream-observation-empty" aria-label="Training observations"><Icon name="activity" size={24} /><div><strong>{isDreaming ? "Training is in progress" : dreamReceipt ? "Training receipt available" : "No training observations yet"}</strong><p>{isDreaming ? "Progress is reported above. A loss curve is not shown without recorded loss samples." : dreamReceipt ? "Inspect the recorded receipt below for measured results. No illustrative loss curve is presented as data." : "Training results appear only when backed by a recorded observation or receipt."}</p></div></section><div className="dream-metrics"><Metric value={`${Math.round((dreamProgress / 100) * stepCount)}/${stepCount}`} label="steps" tone="gold" /><Metric value={trainingDataset?.sourceRows ?? facts.length + messages.length} label="dataset rows" /><Metric value={dreamReceipt?.baseWeightsUnchanged === true ? "safe" : "—"} label="base weights" tone="violet" /><Metric value={dreamReceipt?.inferenceReady === true ? "ready" : "—"} label="adapter" /></div><div className="dream-controls"><label>Profile<select value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)} disabled={isDreaming}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void startDream()} disabled={isDreaming || (!facts.length && !messages.length)}><Icon name="dream" size={15} />{isDreaming ? "Dreaming locally…" : "Prepare dataset + start Dream"}</button>{isDreaming && <button className="quiet-action" onClick={async () => { if (await confirmDialog({ title: "Stop training?", body: "This stops the running training operation. Saved receipts remain available.", confirmLabel: "Stop training", tone: "danger" })) await window.mapleDesktop?.cancelAgentTask?.(); }}><Icon name="stop" size={13} /> Stop</button>}</div>{trainingDataset && <div className="proof-callout"><SectionTitle icon="database" right="ready">Dataset holdout</SectionTitle><span>{trainingDataset.trainingRows} train · {trainingDataset.validationRows} validation · {trainingDataset.sourceRows} source rows</span><small>The dataset is prepared before the explicit training operation; no weights changed during preparation.</small></div>}{dreamReceipt && <div className="proof-callout"><SectionTitle icon="receipt" right={dreamReceipt.baseWeightsUnchanged === true ? "verified" : "unproven"}>Latest training proof</SectionTitle><span>Profile: {dreamReceipt.profile || "—"} · rows: {dreamReceipt.dataset?.sourceRows ?? dreamReceipt.dataset?.examples ?? "—"} · holdout: {dreamReceipt.dataset?.validationHoldout === true ? "yes" : "no"}</span><small>The integrity receipt proves isolation; it does not claim a general model-quality gain.</small></div>}{(activeAdapterPath || dreamReceipt) && <div className="proof-callout"><SectionTitle icon="dream" right={activeAdapterPath ? "grafted" : "base"}>Active graft</SectionTitle><span>{activeAdapterPath ? displayText(activeAdapterPath.split("/").slice(-2).join("/")) : "base Maple-Preview"}</span><small>{activeAdapterPath ? "This adapter is grafted into the running server. Detaching restarts on base weights; the adapter file is kept." : "No adapter is grafted — requests run on base weights."}</small>{activeAdapterPath && <div className="candidate-actions"><button type="button" className="quiet-action" onClick={async () => { if (await confirmDialog({ title: "Fuse graft into weights?", body: "The adapter is merged into a NEW checkpoint and the server restarts on it. The base checkpoint stays on disk — Detach returns to it.", confirmLabel: "Fuse into weights" })) { const fused = await runCommand("dream.fuse"); if (fused?.status === "fused") { setActiveAdapterPath(null); setAdapterVerified(null); } } }}><Icon name="dream" size={13} /> Fuse into weights</button><button type="button" className="quiet-action" onClick={async () => { if (await confirmDialog({ title: "Detach graft?", body: "The Maple server restarts on base weights. The adapter file stays on disk and can be grafted again.", confirmLabel: "Detach graft", tone: "danger" })) { await runCommand("dream.detach"); setActiveAdapterPath(null); setAdapterVerified(false); } }}><Icon name="stop" size={13} /> Detach graft</button></div>}</div>}{recoveryNotice && <div className="runtime-alert">{recoveryNotice}</div>}<section className="surface-section" aria-label="World experiment dataset"><SectionTitle icon="grove" right={`${experimentDataset?.count ?? 0} rows`}>World findings → Dream dataset</SectionTitle><p className="surface-copy">Maple can run bounded physics experiments in the understory world; each recorded finding joins this dataset and feeds the next Dream run. Measured values are simulated by the host, never asserted by the model.</p><div className="quick-command-grid">{(experimentDataset?.experiments || ["projectile", "pendulum", "spring", "orbit", "collision", "terminal"]).map((name) => <button key={name} onClick={() => void runCommand("experiment.run", { experiment: name })} disabled={!isDesktop || Boolean(commandBusy)} title={isDesktop ? `Run a deterministic ${name} simulation` : "Open the Electron desktop to run experiments"}>{name}</button>)}</div>{experimentDataset?.latest && <small className="surface-copy">Latest finding: {experimentDataset.latest.experiment}{experimentDataset.latest.recordedAt ? ` · ${formatTime(experimentDataset.latest.recordedAt)}` : ""}</small>}{(experimentDataset?.count ?? 0) >= 6 && <small className="surface-copy"><strong>Ready for a Dream run</strong> — {experimentDataset.count} world findings will train into the next adapter alongside your facts.</small>}</section></div>;
   }
 
   function beginArtifactPanelResize(event, axis) {
@@ -2537,7 +2785,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
     const artifact = artifacts.find((item) => item.id === activeArtifactId) || artifacts.at(-1) || null;
     const sourceText = artifact ? Object.entries(artifact.source || {}).map(([name, value]) => `// ${name}\n${value}`).join("\n\n") : "No task-scoped artifact yet. Create one from the command palette or the authoring action.";
     const revisionOptions = artifact?.revisions?.length ? artifact.revisions : [];
-    const previewSrc = artifact?.status === "failed" && artifact?.lastKnownGoodSource ? previewDocument({ ...artifact, source: artifact.lastKnownGoodSource }) : previewDocument(artifact);
+
     const previewCommand = (action, input = {}) => {
       if (!previewSession) return setPreviewNotice("Open a preview session before sending a registered preview command.");
       if (action === "inspect" || action === "accessibility") {
@@ -2576,7 +2824,7 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
             return <div className="inspection-report">
               {dom && <>
                 <div className="inspection-block"><strong>Document</strong><span>{dom.title || "untitled"} · {dom.elements?.length || 0} elements · {(dom.bodyText || "").length} chars of text</span></div>
-                {dom.elements?.length ? <div className="inspection-list">{dom.elements.filter((el) => el.text || el.previewId || el.id).slice(0, 40).map((el, index) => <div className="inspection-row" key={index}><span className="inspection-tag">{el.tag}</span>{el.previewId && <code>#{el.previewId}</code>}{el.id && !el.previewId && <code>#{el.id}</code>}{el.role && <em role="badge">{el.role}</em>}<small>{(el.text || "").slice(0, 90) || "—"}</small></div>)}</div> : null}
+                {dom.elements?.length ? <div className="inspection-list">{dom.elements.filter((el) => el.text || el.previewId || el.id).slice(0, 40).map((el, index) => <div className="inspection-row" key={index}><span className="inspection-tag">{el.tag}</span>{el.previewId && <code>#{el.previewId}</code>}{el.id && !el.previewId && <code>#{el.id}</code>}{el.role && <em>{el.role}</em>}<small>{(el.text || "").slice(0, 90) || "—"}</small></div>)}</div> : null}
               </>}
               {a11y?.landmarks && <>
                 <div className="inspection-block"><strong>Landmarks</strong><span>{a11y.landmarks.length} regions</span></div>
@@ -2647,24 +2895,52 @@ setMessages((current) => [...current, { id: `stopped-${Date.now()}`, role: "syst
   }
 
   function renderSettings() {
-    const inventory = agentSnapshot?.storageInventory;
-    const formatBytes = (bytes) => bytes == null ? "—" : bytes > 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GiB` : bytes > 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MiB` : `${Math.round(bytes / 1024)} KiB`;
-    const providerStatusById = Object.fromEntries(providerStatuses.map((status) => [status.provider, status]));
-    return <div className="settings-surface"><div className="surface-intro"><div><span className="eyebrow"><Icon name="settings" size={13} /> LOCAL CONFIGURATION</span><h2>Settings</h2></div></div><label>Maple-Preview server URL<input className="setting-control" value={apiBase} onChange={(event) => { setApiBase(event.target.value); setReadinessCheck("idle"); setServerProcessReady(null); setInferenceReady(null); }} /></label><p className="surface-copy">Hemlock sends requests through the Electron control plane. A healthy process is not the same as a completed inference response.</p>
-{renderProviderCapacityPanel()}<div className="readiness-box"><StatusLamp state={serverState} label={`process: ${serverState}`} /><StatusLamp state={inferenceReady ? "ready" : inferenceReady === false ? "down" : "idle"} label={`inference: ${inferenceReady ? "verified" : inferenceReady === false ? "not verified" : "not checked"}`} /></div><label>Regular Dream profile<select className="setting-control" value={dreamTrainingProfile} onChange={(event) => setDreamTrainingProfile(event.target.value)}><option value="smoke">Smoke · 1 step</option><option value="balanced">Balanced · 4 steps</option><option value="quality">Quality · 8 steps</option></select></label><button className="wide-action" onClick={() => void checkReadiness()} disabled={readinessCheck === "checking"}>{readinessCheck === "checking" ? "Checking local inference…" : "Check local readiness"}</button><button type="button" className="wide-action" onClick={reopenPrimer}>Reopen getting-started tips</button><section className="settings-providers"><div className="settings-section-heading"><SectionTitle icon="command" right={isDesktop ? "CLI account status" : "desktop only"}>Subscription providers</SectionTitle><button type="button" className="quiet-action" onClick={() => void refreshProviderStatuses()} disabled={!isDesktop}>Refresh</button></div><p className="surface-copy">Log in through each provider's own CLI. Hemlock never asks for or stores API keys, OAuth tokens, or subscription credentials.</p>{["codex", "claude"].map((provider) => { const lane = MODEL_LANES[provider]; const status = providerStatusById[provider]; const authenticated = status?.authenticated === true; return <div className="provider-account-row" key={provider}><div className="provider-account-copy"><div><strong>{lane.label}</strong><StatusLamp state={authenticated ? "ready" : status?.installed === false ? "down" : "unknown"} label={authenticated ? "login detected" : status?.installed === false ? "not installed" : "login required"} /></div><small>{authenticated ? status.accountLabel : `${lane.label} subscription via ${provider === "codex" ? "ChatGPT" : "Claude Code"}`}</small></div><div className="provider-account-actions"><button type="button" onClick={() => void providerAuthAction(provider, "login")} disabled={!isDesktop || status?.installed === false}>{authenticated ? "Re-authenticate" : "Log in"}</button>{authenticated && <button type="button" className="quiet-action" onClick={() => void providerAuthAction(provider, "logout")}>Log out</button>}</div></div>; })}</section><section className="settings-sources"><SectionTitle icon="activity" right="explicit opt-in">Context sources</SectionTitle><p className="surface-copy">Hemlock only uses enabled sources. Every surfaced observation retains its source and freshness.</p>{sourcePolicies.length ? sourcePolicies.map((source) => <label className="source-policy" key={source.sourceId}><span><strong>{displayText(source.displayName)}</strong><small>{displayText(source.sourceId)} · {displayText(source.retention)} · {displayText(source.permissionState)}</small></span><input type="checkbox" checked={source.enabled !== false} onChange={(event) => void setSourceEnabled(source, event.target.checked)} disabled={!isDesktop || source.sourceId === "local-project"} /></label>) : <p className="empty-copy">Source policies will appear after the desktop runtime resumes.</p>}</section><section className="settings-runtime"><SectionTitle icon="database" right="application data">Runtime storage</SectionTitle><p>{displayText(inventory?.root || agentProjection?.storage?.root || agentSnapshot?.runtime?.root, "Hemlock application data")}</p><div className="storage-metrics"><span>Model<strong>{formatBytes(inventory?.modelBytes)}</strong></span><span>Runtime<strong>{formatBytes(inventory?.totalRuntimeBytes)}</strong></span><span>Free<strong>{formatBytes(inventory?.freeBytes)}</strong></span></div><small>Models, adapters, datasets, receipts, and event projections stay outside the Git worktree. Inventory is informational; cleanup remains an explicit future operation.</small></section></div>;
+    return <SettingsWorkspace model={{
+      apiBase, setApiBase, serverState, inferenceReady, readinessCheck, setReadinessCheck,
+      setServerProcessReady, setInferenceReady, checkReadiness, isDesktop, modelLanes: MODEL_LANES,
+      providerStatuses, refreshProviderStatuses, providerAuthAction, skipCloseWarning,
+      onSkipCloseWarningChange: (skip) => { localStorage.setItem(CLOSE_WARNING_KEY, JSON.stringify({ skip })); setSkipCloseWarning(skip); },
+      reopenPrimer, sourcePolicies, setSourceEnabled, displayText,
+      providerCaps: threadRegistry.providerCaps, updateProviderCapacity,
+      dreamTrainingProfile, setDreamTrainingProfile, inventory: agentSnapshot?.storageInventory,
+      storageRoot: agentProjection?.storage?.root || agentSnapshot?.runtime?.root,
+    }} />;
   }
 
-  const windowContent = { center: renderCenter, chat: renderChat, artifact: renderArtifactStudio, sips: renderSips, memory: renderMemory, dream: renderDream, activity: renderActivity, receipts: renderReceipts, map: renderMap, settings: renderSettings };
+  function renderGrove() {
+    return <GroveSurface events={events} isDesktop={isDesktop} />;
+  }
+
+  const windowContent = { center: renderCenter, chat: renderChat, artifact: renderArtifactStudio, sips: renderSips, memory: renderMemory, dream: renderDream, activity: renderActivity, receipts: renderReceipts, map: renderMap, grove: renderGrove, settings: renderSettings };
 
   return <main className="hemlock-os">
+    {shortcutHelpOpen && <ShortcutGuide metadata={WINDOW_META} onDismiss={() => setShortcutHelpOpen(false)} onOpenApp={(id) => { setShortcutHelpOpen(false); openWindow(id); }} />}
+    {overviewOpen && <WorkspaceOverview windows={workspaceWindows} metadata={WINDOW_META} activeId={activeWindowId} onShowShortcuts={showShortcuts} onDismiss={() => setOverviewOpen(false)} onActivate={(id) => { setOverviewOpen(false); openWindow(id); }} />}
     <div className="ambient-branch branch-a" /><div className="ambient-branch branch-b" />
-    <header className="system-bar"><div className="system-brand" onClick={() => openWindow("center")} role="button" tabIndex="0"><span className="brand-mark"><Icon name="tree" size={28} /></span><strong>Hemlock</strong><span>OS</span></div><div className="system-context"><span className="system-path">active task / <strong>{task.intent || "conversation"}</strong></span><span className="system-task">{task.objective}</span></div><div className="system-health">{renderModelPicker()}<div className="system-health-chip"><StatusLamp state={sipsStatus?.selfloop?.status === "active" ? "working" : "ready"} label={sipsStatus?.selfloop?.status === "active" ? "active" : "idle"} /><span>SIPS</span></div><button className="system-understory" onClick={() => setUnderstory((current) => !current)} aria-label="Toggle understory mode" aria-pressed={understory} title="Understory mode · dim panels for night work"><Icon name="dream" size={15} /></button><div className="system-health-chip system-activity-chip"><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : `${events.length} events`} /><span>ACTIVITY</span></div><button className="system-palette" onClick={() => setPaletteOpen(true)} aria-label="Open command palette"><Icon name="command" size={15} /><kbd>⌘K</kbd></button><button className="system-settings" onClick={() => openWindow("settings")} aria-label="Open settings"><Icon name="settings" size={16} /></button></div></header>
-    <div className="desktop-strip"><span className="strip-label">UNDERSTORY / {task.status}</span><span className="strip-line" /><span className="strip-event">{latestEvent ? latestEvent.type.replaceAll(".", " · ") : "session ready"}</span><span className="strip-time">{formatTime(clockNow)}</span></div>
-    <section ref={canvasRef} className="desktop-canvas" aria-label="Hemlock desktop workspace">{Object.keys(WINDOW_META).map((id) => { const windowState = workspaceWindows[id]; if (!windowState || windowState.state === "closed") return null; const content = windowState.state === "minimized" ? null : windowContent[id](); return <WindowFrame key={id} windowState={windowState} meta={WINDOW_META[id]} active={activeWindowId === id} dragging={draggingWindowId === id} resizing={resizingWindowId === id} onFocus={focusWindow} onDragStart={startDrag} onResizeStart={startResize} onMinimize={minimizeWindow} onMaximize={maximizeWindow} onClose={closeWindow}>{content}</WindowFrame>; })}</section>
-    <nav className="understory-dock" aria-label="Hemlock surfaces">{Object.entries(WINDOW_META).map(([id, meta]) => { const state = workspaceWindows[id]; const open = state?.state !== "closed"; const minimized = state?.state === "minimized"; const active = activeWindowId === id; // Unread truth: an event arrived since this window was last focused while it could not be seen.
-const lastSeenEvents = seenEventCountsRef.current.get(id); const hasUnread = events.length > (lastSeenEvents ?? events.length) && (!state || state.state === "closed" || !active); return <button type="button" key={id} aria-pressed={active} className={`dock-item ${open ? "open" : ""} ${active ? "active" : ""}`} onClick={() => open && !minimized ? focusWindow(id) : openWindow(id)} onContextMenu={(event) => { if (!open) return; event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); setDockMenu({ windowId: id, x: rect.left, y: rect.top - 8 }); }} aria-label={`${meta.label}, ${active ? "focused" : minimized ? "minimized" : open ? "open, inactive" : "closed"}${hasUnread ? ", unread activity" : ""}`}><span className={`dock-icon glyph-${meta.tone}`}><Icon name={meta.icon} size={17} /></span><span>{meta.label}</span>{hasUnread ? <i className="dock-unread" title="New activity since last focus" /> : null}</button>; })}<button className="dock-item dock-command" onClick={() => setPaletteOpen(true)} aria-label="Open command palette" title="⌘K palette · ⌘1-9 windows · ⌘` cycle"><span className="dock-icon"><Icon name="command" size={17} /></span><span>Command palette</span></button></nav>
-    {dockMenu && <div className="dock-menu-backdrop" onClick={() => setDockMenu(null)} onContextMenu={(event) => { event.preventDefault(); setDockMenu(null); }}><div className="dock-menu" style={{ left: dockMenu.x, top: dockMenu.y }} role="menu" aria-label={`${WINDOW_META[dockMenu.windowId]?.label || "Window"} actions`}><strong>{WINDOW_META[dockMenu.windowId]?.label}</strong><button type="button" role="menuitem" onClick={() => { focusWindow(dockMenu.windowId); setDockMenu(null); }}>Focus</button><button type="button" role="menuitem" onClick={() => { setWorkspaceWindows((current) => ({ ...current, [dockMenu.windowId]: keyboardPlacement(current[dockMenu.windowId], "minimize", canvasSize) })); setDockMenu(null); }}>Minimize</button><button type="button" role="menuitem" className="is-destructive" onClick={async () => { const id = dockMenu.windowId; setDockMenu(null); if (id === "center") { setWorkspaceWindows((current) => ({ ...current, [id]: { ...current[id], state: "closed", focus: false } })); return; } const confirmed = await confirmDialog({ title: `Close ${WINDOW_META[id]?.label || "this window"}?`, body: "The window closes. Its state is kept — reopen it any time from the dock.", confirmLabel: "Close window" }); if (confirmed) setWorkspaceWindows((current) => ({ ...current, [id]: { ...current[id], state: "closed", focus: false } })); }}>Close</button></div></div>}
-    {paletteOpen && <div className="palette-backdrop" onClick={() => setPaletteOpen(false)}><section className="command-palette" role="dialog" aria-label="Command palette" onClick={(event) => event.stopPropagation()}><div className="palette-top"><Icon name="command" size={16} /><input ref={paletteRef} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
+    <header className="system-bar"><button type="button" className="system-brand" onClick={() => openWindow("center")} aria-label="Open Command Center"><span className="brand-mark"><Icon name="tree" size={28} /></span><strong>Hemlock</strong><span>OS</span></button><div className="system-context"><span className="system-path">active task / <strong>{task.intent || "conversation"}</strong></span><span className="system-task">{task.objective}</span></div><div className="system-health">{renderModelPicker()}<div className="system-health-chip"><StatusLamp state={sipsStatus?.selfloop?.status === "active" ? "working" : "ready"} label={sipsStatus?.selfloop?.status === "active" ? "active" : "idle"} /><span>SIPS</span></div><button className="system-understory" onClick={() => setUnderstory((current) => !current)} aria-label="Toggle understory mode" aria-pressed={understory} title={understory ? "Switch to paper theme" : "Switch to understory theme"}><Icon name={understory ? "sun" : "moon"} size={17} /></button><div className="system-health-chip system-activity-chip"><StatusLamp state={commandBusy || isThinking || isDreaming || liveStream ? "working" : "ready"} label={commandBusy || isThinking || isDreaming || liveStream ? "working" : `${events.length} events`} /><span>ACTIVITY</span></div><button className="system-palette" onClick={() => setPaletteOpen(true)} aria-label="Open command palette"><Icon name="command" size={15} /><kbd>⌘K</kbd></button><button className="system-settings" onClick={() => openWindow("settings")} aria-label="Open settings"><Icon name="settings" size={16} /></button></div></header>
+    <div className="desktop-strip">
+      <button type="button" className="workspace-overview-trigger" onClick={() => setOverviewOpen(true)} aria-label="Open window overview" aria-haspopup="dialog" aria-expanded={overviewOpen} title="Window overview · ⌘⇧O"><Icon name="windows" size={16} /><span>Windows</span><span className="workspace-window-count">{Object.values(workspaceWindows).filter(item => item.state !== "closed").length}</span><Icon name="chevron" size={11} /></button>
+      <span className="strip-active-window">{WINDOW_META[activeWindowId]?.label || "Desktop"}</span><span className="strip-line" /><div className="workspace-strip-actions"><button type="button" onClick={toggleDesktop} aria-label={desktopSnapshot ? "Restore workspace windows" : "Show desktop"} aria-pressed={Boolean(desktopSnapshot)} title="Show desktop / restore windows · ⌘⌥D"><Icon name={desktopSnapshot ? "windows" : "desktop"} size={16} /><span>{desktopSnapshot ? "Restore windows" : "Desktop"}</span></button><button type="button" onClick={showShortcuts} aria-label="Open shortcut guide" aria-haspopup="dialog" title="Keyboard shortcuts · F1"><Icon name="keyboard" size={18} /></button></div><span className="strip-event">{latestEvent ? latestEvent.type.replaceAll(".", " · ") : "session ready"}</span><span className="strip-time">{formatTime(clockNow)}</span>
+    </div>
+    <section ref={canvasRef} className="desktop-canvas" aria-label="Hemlock desktop workspace">
+      {snapPreview && <div className="window-snap-preview" aria-hidden="true" style={{ left: snapPreview.bounds.x, top: snapPreview.bounds.y, width: snapPreview.bounds.width, height: snapPreview.bounds.height }}><span>{snapPreview.command === "maximize" ? "Fill workspace" : snapPreview.command === "half-left" ? "Tile left" : "Tile right"} · release to place · Option to cancel</span></div>}
+      {Object.keys(WINDOW_META).map((id) => { const windowState = workspaceWindows[id]; if (!windowState || windowState.state === "closed") return null; const content = windowState.state === "minimized" ? null : windowContent[id](); return <WindowFrame key={id} windowState={windowState} meta={WINDOW_META[id]} active={activeWindowId === id} dragging={draggingWindowId === id} resizing={resizingWindowId === id} onFocus={focusWindow} onDragStart={startDrag} onResizeStart={startResize} onResize={resizeWithKeyboard} onActions={showWindowMenu} onMinimize={minimizeWindow} onMaximize={maximizeWindow} onClose={closeWindow}>{content}</WindowFrame>; })}
+    </section>
+    <nav className="understory-dock" aria-label="Hemlock surfaces" onKeyDown={(event) => {
+      if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+        const button = event.target.closest('[data-window-id]');
+        if (button && workspaceWindows[button.dataset.windowId]?.state !== "closed") { event.preventDefault(); showWindowMenu(button.dataset.windowId, button, "above"); }
+        return;
+      }
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const buttons = [...event.currentTarget.querySelectorAll("button")];
+      const index = buttons.indexOf(document.activeElement);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+      event.preventDefault(); buttons[next]?.focus();
+    }}>{dockApps(WINDOW_META, workspaceWindows).map(([id, meta]) => { const state = workspaceWindows[id]; const open = state?.state !== "closed"; const minimized = state?.state === "minimized"; const active = activeWindowId === id; // Unread truth: an event arrived since this window was last focused while it could not be seen.
+const lastSeenEvents = seenEventCountsRef.current.get(id); const hasUnread = events.length > (lastSeenEvents ?? events.length) && (!state || state.state === "closed" || !active); return <button type="button" key={id} data-window-id={id} aria-pressed={active} className={`dock-item ${open ? "open" : ""} ${active ? "active" : ""}`} onClick={() => open && !minimized ? focusWindow(id) : openWindow(id)} onContextMenu={(event) => { if (!open) return; event.preventDefault(); showWindowMenu(id, event.currentTarget, "above"); }} aria-label={`${meta.label}, ${active ? "focused" : minimized ? "minimized" : open ? "open, inactive" : "closed"}${hasUnread ? ", unread activity" : ""}`}><span className={`dock-icon glyph-${meta.tone}`}><Icon name={meta.icon} size={17} /></span><span>{meta.label}{minimized && <small className="dock-state-label">Minimized</small>}</span>{hasUnread ? <i className="dock-unread" title="New activity since last focus" /> : null}</button>; })}<button className="dock-item dock-command" onClick={() => setOverviewOpen(true)} aria-label="Open all apps" title="All apps · ⌘⇧O"><span className="dock-icon"><Icon name="apps" size={22} /></span><span>All apps</span></button></nav>
+    {dockMenu && <WindowActionsMenu key={dockMenu.windowId} label={WINDOW_META[dockMenu.windowId]?.label || "Window"} state={workspaceWindows[dockMenu.windowId]?.state} anchor={dockMenu} opener={dockMenu.opener} onAction={(action) => runWindowAction(dockMenu.windowId, action)} onDismiss={() => setDockMenu(null)} />}
+    {paletteOpen && <div className="palette-backdrop" onClick={() => setPaletteOpen(false)}><section className="command-palette" role="dialog" aria-modal="true" aria-label="Command palette" onClick={(event) => event.stopPropagation()}><div className="palette-top"><Icon name="command" size={16} /><input ref={paletteRef} value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
         onKeyDown={(event) => {
           if (!visiblePaletteItems.length) return;
           if (event.key === "ArrowDown") { event.preventDefault(); setPaletteActiveIndex((safePaletteIndex + 1) % visiblePaletteItems.length); }
@@ -2673,7 +2949,9 @@ const lastSeenEvents = seenEventCountsRef.current.get(id); const hasUnread = eve
           else if ((event.metaKey || event.ctrlKey) && /^[1-9]$/.test(event.key)) { event.preventDefault(); const pick = visiblePaletteItems[Number(event.key) - 1]; if (pick) chooseCommand(pick); }
         }}
         placeholder="Search the Hemlock operating environment…" aria-label="Search Hemlock commands" aria-activedescendant={visiblePaletteItems[safePaletteIndex] ? `palette-item-${safePaletteIndex}` : undefined} /><kbd>ESC</kbd></div><div className="palette-list" role="listbox">{visiblePaletteGroups.map((group) => <React.Fragment key={group.id}><div className="palette-section-label">{group.label}</div>{group.items.map((item) => { const flatIndex = visiblePaletteIndexById.get(item.id); return <button key={item.id} id={`palette-item-${flatIndex}`} role="option" aria-selected={flatIndex === safePaletteIndex} className={flatIndex === safePaletteIndex ? "is-active" : ""} onClick={() => chooseCommand(item)}><span className="palette-icon"><Icon name={item.icon} size={16} /></span><span><strong>{item.label}</strong><small>{item.hint}</small></span><span className="palette-arrow">↵</span></button>; })}</React.Fragment>)}{!visiblePaletteItems.length && <p className="empty-copy">No local command matches that search.</p>}</div><div className="palette-foot"><span>Only allowlisted local actions appear here.</span><span>Hemlock OS</span></div></section></div>}
-    {confirmState && <div className="palette-backdrop confirm-backdrop" onClick={() => settleConfirmDialog(false)}><section className="command-palette confirm-dialog" role="alertdialog" aria-modal="true" aria-label={confirmState.title} onClick={(event) => event.stopPropagation()}><div className="confirm-dialog-body"><strong>{confirmState.title}</strong>{confirmState.body && <p>{confirmState.body}</p>}</div><div className="confirm-dialog-actions"><button type="button" className="quiet-action" autoFocus={confirmState.tone === "danger"} onClick={() => settleConfirmDialog(false)}>Cancel</button><button type="button" className={confirmState.tone === "danger" ? "danger-action" : "primary-action"} autoFocus={confirmState.tone !== "danger"} onClick={() => settleConfirmDialog(true)}>{confirmState.confirmLabel}</button></div></section></div>}
+    {confirmState && <div className="palette-backdrop confirm-backdrop" onClick={() => settleConfirmDialog(false)}><section className="command-palette confirm-dialog" role="alertdialog" aria-modal="true" aria-label={confirmState.title} onClick={(event) => event.stopPropagation()}><div className="confirm-dialog-body"><strong>{confirmState.title}</strong>{confirmState.body && <p>{confirmState.body}</p>}</div><div className="confirm-dialog-actions">
+      {confirmState.allowSkipCloseWarning && <button type="button" className="quiet-action close-warning-opt-out" onClick={neverWarnOnWindowClose} title="Close this window and skip future window-close warnings">Never show this again</button>}
+      <button type="button" className="quiet-action" autoFocus={confirmState.tone === "danger"} onClick={() => settleConfirmDialog(false)}>Cancel</button><button type="button" className={confirmState.tone === "danger" ? "danger-action" : "primary-action"} autoFocus={confirmState.tone !== "danger"} onClick={() => settleConfirmDialog(true)}>{confirmState.confirmLabel}</button></div></section></div>}
     {comparePickerOpen && <div className="palette-backdrop compare-picker-backdrop" onClick={() => setComparePickerOpen(false)}><section className="compare-picker" role="dialog" aria-modal="true" aria-label="Choose a comparison lane" onClick={(event) => event.stopPropagation()}><strong>Compare last reply</strong><p>Your last prompt is re-sent verbatim to one other lane. Read-only inference — no tools run and nothing else changes.</p><div className="compare-picker-options">{Object.values(MODEL_LANES).filter((lane) => lane.provider !== modelSelection.provider).map((lane) => <button type="button" key={lane.provider} disabled={Boolean(commandBusy)} onClick={() => { setComparePickerOpen(false); void runCommand("comparison.run", { targetProvider: lane.provider }); }}><strong>{lane.label}</strong><small>{lane.kind === "subscription" ? "subscription lane" : "local MLX lane"}</small></button>)}</div></section></div>}
   </main>;
 }

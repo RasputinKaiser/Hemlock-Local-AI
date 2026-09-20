@@ -447,6 +447,8 @@ def group_expert_select(gates, top_k):
     # selection and renormalization, computed in float32.
     scores = mx.softmax(gates.astype(mx.float32), axis=-1)
     inds = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
+    # Routing choices are discrete: indices must not carry gradient.
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(scores, inds, axis=-1)
     scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
     return inds, scores
@@ -714,6 +716,8 @@ class MapleSwitchGLU(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
 
         x_up, x_gate = mx.split(
             self.up_gate_proj(x, idx, sorted_indices=do_sort), 2, axis=-1

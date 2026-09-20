@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { EXPERIMENTS } = require("./physics_sandbox.cjs");
 
 const ACTION_SCHEMA = "hemlock.agent.action.v1";
 const OBSERVATION_SCHEMA = "hemlock.agent.observation.v1";
@@ -244,25 +245,61 @@ function boundedActionInput(commandId, payload) {
     case "code.apply":
       if (directSourceMap) return { source: directSourceMap };
       return pick(["source", "patches", "baseDigests", "reason", "verificationProfile"]);
+    case "experiment.run":
+      return pick(["experiment", "input", "seed", "hypothesis"]);
+    case "experiment.note":
+      return pick(["experimentId", "claim", "finding", "hypothesis", "tags"]);
+    case "experiment.dataset":
+      return pick(["limit"]);
     default:
       return plainObject(payload?.input) ? payload.input : {};
   }
 }
 
-function coerceActionPayload(payload, { taskId = "model-task", step = 1, commandId = null, expectedEvidence = [], approval = "none" } = {}) {
-  if (!plainObject(payload) || !String(commandId || "").trim()) return null;
+// T13 compact choice: the model only needs to emit kind/commandId/input/
+// shortRationale — the host assigns every other envelope field. Anything that
+// already looks like a choice gets the schema pinned on before validation so a
+// compliant compact answer never falls into the repair loop.
+function normalizeCompactChoice(payload) {
+  if (!plainObject(payload) || payload.schema === ACTION_SCHEMA) return payload;
+  // Models occasionally answer with {"choices":[{...}]} — take the first
+  // well-formed choice instead of letting the whole batch degrade silently.
+  if (Array.isArray(payload.choices) && payload.choices.length) {
+    const first = payload.choices.find((choice) => plainObject(choice) && (ACTION_KINDS.has(choice.kind) || typeof choice.commandId === "string"));
+    if (first) return normalizeCompactChoice({ ...first, __choiceCount: payload.choices.length });
+  }
+  if (!ACTION_KINDS.has(payload.kind) && typeof payload.commandId !== "string") return payload;
+  // A compliant compact choice may omit shortRationale/input — the host owns
+  // narration anyway, so synthesize them rather than burn a repair inference
+  // (each failed parse costs a full local-model round-trip).
+  const rationale = String(payload.shortRationale || payload.reason || payload.title || (payload.commandId ? `Run ${payload.commandId}.` : "Model returned a terminal choice.")).trim();
+  return {
+    ...payload,
+    schema: ACTION_SCHEMA,
+    input: plainObject(payload.input) ? payload.input : {},
+    shortRationale: rationale || "Continue the registered step.",
+    __compactChoice: true,
+  };
+}
+
+function coerceActionPayload(payload, { taskId = "model-task", step = 1, commandId = null, expectedEvidence = [], approval = "none", kind = "tool" } = {}) {
+  if (!plainObject(payload)) return null;
   if (payload.schema === ACTION_SCHEMA) return payload;
-  const input = boundedActionInput(commandId, payload);
-  const rationale = String(payload.shortRationale || payload.reason || payload.title || `Continue the registered ${commandId} step.`).trim();
+  const resolvedKind = ACTION_KINDS.has(payload.kind) ? payload.kind : kind;
+  if (resolvedKind === "tool" && !String(commandId || "").trim()) return null;
+  const input = resolvedKind === "tool"
+    ? boundedActionInput(commandId, payload)
+    : plainObject(payload.input) ? payload.input : {};
+  const rationale = String(payload.shortRationale || payload.reason || payload.title || (resolvedKind === "tool" ? `Continue the registered ${commandId} step.` : "Model returned a terminal choice.")).trim();
   return {
     schema: ACTION_SCHEMA,
     id: String(payload.id || "action-coerced"),
     taskId: String(payload.taskId || taskId),
     step: Number.isInteger(payload.step) && payload.step > 0 ? payload.step : step,
-    kind: "tool",
-    commandId,
+    kind: resolvedKind,
+    commandId: resolvedKind === "tool" ? commandId : null,
     input,
-    shortRationale: rationale || `Continue the registered ${commandId} step.`,
+    shortRationale: rationale || "Continue the registered step.",
     expectedEvidence: normalizeExpectedEvidence(payload.expectedEvidence, expectedEvidence),
     approval,
     status: "proposed",
@@ -274,6 +311,118 @@ function parseActionEnvelope(text, registry = {}) {
   const action = extractActionEnvelope(text);
   validateAction(action, registry);
   return action;
+}
+
+// Scored-choice action selection (parallel constrained decoding): rather
+// than asking Maple to autoregressively generate a whole action envelope,
+// the host enumerates the closed command set as minimal candidate
+// continuations and scores each against the shared prefilled prompt
+// (POST /v1/score). Candidates flagged `complete` are valid compact
+// envelopes executable as-is — zero generated tokens. Prefix candidates end
+// where free content begins; a prefix winner means the model chose a
+// generative action and the host falls back to generation for the fill-in.
+const SCORE_VERIFY_PROFILES = ["app-build", "diff-check", "python-tests"];
+
+// Commands whose required input is free text: scoring can pick the command,
+// but the input itself still needs a generative step.
+const SCORE_GENERATIVE_COMMANDS = new Set([
+  "artifact.author",
+  "artifact.update",
+  "code.apply",
+  "file.search",
+  "file.read",
+  "context.search",
+  "context.query",
+  "receipt.inspect",
+  "experiment.note",
+]);
+
+function scoreCandidateText(kind, commandId, input) {
+  if (kind === "tool") {
+    return `{"kind":"tool","commandId":${JSON.stringify(commandId)},"input":${JSON.stringify(input)},"shortRationale":${JSON.stringify(`Run ${commandId}.`)}}`;
+  }
+  const field = kind === "blocked" ? "reason" : "content";
+  return `{"kind":${JSON.stringify(kind)},"${field}":"`;
+}
+
+function buildScoreCandidates(commandIds, { terminalKinds = ["answer", "ask_user", "blocked"], maxCandidates = 48 } = {}) {
+  const candidates = [];
+  for (const kind of terminalKinds) {
+    candidates.push({ text: scoreCandidateText(kind, null, null), kind, commandId: null, complete: false });
+  }
+  for (const commandId of commandIds || []) {
+    if (commandId === "experiment.run") {
+      for (const experiment of EXPERIMENTS) {
+        candidates.push({
+          text: scoreCandidateText("tool", commandId, { experiment }),
+          kind: "tool",
+          commandId,
+          input: { experiment },
+          complete: true,
+        });
+      }
+      continue;
+    }
+    if (commandId === "verify") {
+      for (const profile of SCORE_VERIFY_PROFILES) {
+        candidates.push({
+          text: scoreCandidateText("tool", commandId, { profile }),
+          kind: "tool",
+          commandId,
+          input: { profile },
+          complete: true,
+        });
+      }
+      continue;
+    }
+    if (SCORE_GENERATIVE_COMMANDS.has(commandId)) {
+      candidates.push({
+        text: `{"kind":"tool","commandId":${JSON.stringify(commandId)},"input":`,
+        kind: "tool",
+        commandId,
+        complete: false,
+      });
+      continue;
+    }
+    candidates.push({
+      text: scoreCandidateText("tool", commandId, {}),
+      kind: "tool",
+      commandId,
+      input: {},
+      complete: true,
+    });
+  }
+  return candidates.slice(0, maxCandidates);
+}
+
+// Winner selection over /v1/score results. Candidates differ in length and
+// completeness, so compare per-token average logprob; the raw sum is kept
+// for telemetry. Returns null when the result is unusable.
+function pickScoredCandidate(candidates, result) {
+  const scores = Array.isArray(result?.candidates) ? result.candidates : [];
+  let best = null;
+  let runnerUp = null;
+  for (const scored of scores) {
+    if (!scored || !Number.isFinite(scored.avgLogprob)) continue;
+    const candidate = candidates[scored.index];
+    if (!candidate) continue;
+    const entry = { ...candidate, logprob: scored.logprob, avgLogprob: scored.avgLogprob, tokens: scored.tokens };
+    if (!best || entry.avgLogprob > best.avgLogprob) {
+      runnerUp = best;
+      best = entry;
+    } else if (!runnerUp || entry.avgLogprob > runnerUp.avgLogprob) {
+      runnerUp = entry;
+    }
+  }
+  if (!best) return null;
+  return {
+    winner: best,
+    margin: runnerUp ? best.avgLogprob - runnerUp.avgLogprob : null,
+    runnerUp: runnerUp ? { kind: runnerUp.kind, commandId: runnerUp.commandId, avgLogprob: runnerUp.avgLogprob } : null,
+    candidateCount: scores.length,
+    promptTokens: result.promptTokens ?? null,
+    cachedTokens: result.cachedTokens ?? null,
+  };
 }
 
 function createPlan({ task, objective, intent, steps = [], rationale = "Bounded local work with evidence at each step." }) {
@@ -392,8 +541,11 @@ module.exports = {
   extractActionEnvelope,
   recoverTruncatedAction,
   boundedActionInput,
+  normalizeCompactChoice,
   coerceActionPayload,
   parseActionEnvelope,
+  buildScoreCandidates,
+  pickScoredCandidate,
   createPlan,
   createAction,
   createObservation,

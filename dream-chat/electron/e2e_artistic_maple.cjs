@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { Utf8SseParser, parseSsePayload, extractModelDelta, extractModelChannels, digest } = require("./stream_protocol.cjs");
-const { coerceActionPayload, extractActionEnvelope } = require("./agent_contracts.cjs");
+const { coerceActionPayload, extractActionEnvelope, normalizeCompactChoice } = require("./agent_contracts.cjs");
 
 const base = String(process.env.HEMLOCK_MAPLE_BASE || "http://127.0.0.1:8080").replace(/\/$/, "");
 const maxMs = Number(process.env.HEMLOCK_MAPLE_MAX_MS || 600000);
@@ -79,16 +79,16 @@ async function main() {
     const conversationBody = { model: "default_model", messages: [{ role: "user", content: "Hey Maple, how are you? I want to make something beautiful together." }], temperature: 0.7, top_p: 0.95, top_k: 20, max_tokens: mapleMaxTokens, stream: true, chat_template_kwargs: { enable_thinking: true } };
     const conversation = await requestCompletion(conversationBody);
     receipt.requests.push({ kind: "conversation", status: "completed", max_tokens: conversationBody.max_tokens, streaming: conversation.streaming, channels: Object.keys(conversation.channels), contentDigest: digest(conversation.channels.content || ""), outputDigest: digest(JSON.stringify(conversation.channels)), rawPayloads: conversation.rawPayloads });
-    const actionBody = { model: "default_model", messages: [{ role: "system", content: "You are Maple operating inside Hemlock. Return exactly one compact hemlock.agent.action.v1 JSON envelope in the content channel and no prose or markdown. The host owns id, taskId, step, kind, commandId, approval, expectedEvidence, and status. Use kind=tool, commandId=artifact.create, approval=plan, status=proposed. For artifact.create, input may contain only title, artifact kind html, entrypoint index.html, and mime; never include HTML, source, data, patches, or the animation itself. Authoring happens in a later artifact.author step." }, { role: "user", content: "Create the task-local HTML artifact metadata for an Eastern Hemlock night-garden animation with moon, tree sway, mist, and fireflies. Return the registered action envelope only; keep input small." }], temperature: 0, top_p: 1, top_k: 0, max_tokens: mapleMaxTokens, stream: true, response_format: { type: "json_object" }, chat_template_kwargs: { enable_thinking: true } };
+    const actionBody = { model: "default_model", messages: [{ role: "system", content: "You are Maple operating inside Hemlock. Return exactly one compact JSON choice in the content channel — no prose, no markdown: {\"kind\":\"tool\",\"commandId\":\"artifact.create\",\"input\":{},\"shortRationale\":\"one-line reason\"}. The host assigns id, taskId, step, approval, expectedEvidence, and status; never emit them. For artifact.create, input may contain only title, artifact kind html, entrypoint index.html, and mime; never include HTML, source, data, patches, or the animation itself. Authoring happens in a later artifact.author step." }, { role: "user", content: "Create the task-local HTML artifact metadata for an Eastern Hemlock night-garden animation with moon, tree sway, mist, and fireflies. Return the compact choice only; keep input small." }], temperature: 0, top_p: 1, top_k: 0, max_tokens: mapleMaxTokens, stream: true, response_format: { type: "json_object" }, chat_template_kwargs: { enable_thinking: true } };
     const action = await requestCompletion(actionBody);
     const rawContent = action.channels.content || "";
     let parseStatus = "empty";
     let parsedAction = null;
     if (rawContent.trim()) {
       try {
-        const parsed = extractActionEnvelope(rawContent);
+        const parsed = normalizeCompactChoice(extractActionEnvelope(rawContent));
         parsedAction = coerceActionPayload(parsed, { taskId: "live-maple-task", step: 1, commandId: "artifact.create", expectedEvidence: ["artifact://manifest"], approval: "plan" }) || parsed;
-        parseStatus = parsed.__coercedPayload ? "coerced-payload" : parsed.__recoveredTruncated ? "recovered-truncated" : "parsed";
+        parseStatus = parsed.__coercedPayload ? "coerced-payload" : parsed.__recoveredTruncated ? "recovered-truncated" : parsed.__compactChoice ? "compact-choice" : "parsed";
       } catch (error) { parseStatus = `invalid:${error.message}`; }
     }
     receipt.requests.push({ kind: "structured-action", status: parsedAction ? "parsed" : "failed", max_tokens: actionBody.max_tokens, streaming: action.streaming, channels: Object.keys(action.channels), outputDigest: digest(JSON.stringify(action.channels)), parseStatus, parsedAction, rawPayloads: action.rawPayloads });

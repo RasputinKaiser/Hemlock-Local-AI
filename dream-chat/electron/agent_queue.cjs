@@ -7,6 +7,7 @@ const ACTIVE_STATUSES = new Set([
   "waiting_for_approval",
   "waiting_for_user",
   "verifying",
+  "paused",
 ]);
 
 function id(prefix = "queue") {
@@ -155,10 +156,20 @@ class AgentIntentQueue {
   }
 
   async drain() {
-    if (this.active || !this.pending.length) return;
+    // Hold the queue while the previous task is still alive — awaiting
+    // approval, paused, or running. execute() returns as soon as a plan is
+    // proposed, so without this guard the next intent would overwrite
+    // agentTask while the prior plan still waits. The queue is nudged by
+    // notifyTaskSettled() when the orchestrator emits a terminal event.
+    if (this.active || !this.pending.length || isActiveTask(this.activeTask())) return;
     const next = this.pending.shift();
     this.sync();
     await this.start(next.payload, next);
+  }
+
+  async notifyTaskSettled() {
+    if (this.active) return;
+    await this.drain();
   }
 
   cancelQueued(requestId) {

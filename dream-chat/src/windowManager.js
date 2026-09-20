@@ -6,7 +6,7 @@ export const CASCADE_STEP = 24;
 
 export const WINDOW_DEFINITIONS = {
   center: { label: "Command Center", preferred: { width: 1180, height: 650 }, minimum: { width: 720, height: 500 } },
-  chat: { label: "Chat / Code", preferred: { width: 760, height: 620 }, minimum: { width: 520, height: 380 } },
+  chat: { label: "Chat / Code", preferred: { width: 880, height: 640 }, minimum: { width: 520, height: 480 } },
   artifact: { label: "Artifact Studio", preferred: { width: 860, height: 600 }, minimum: { width: 560, height: 400 } },
   activity: { label: "Activity", preferred: { width: 640, height: 440 }, minimum: { width: 460, height: 280 } },
   receipts: { label: "Receipts", preferred: { width: 640, height: 440 }, minimum: { width: 460, height: 280 } },
@@ -14,7 +14,8 @@ export const WINDOW_DEFINITIONS = {
   memory: { label: "Memory Garden", preferred: { width: 520, height: 420 }, minimum: { width: 360, height: 320 } },
   dream: { label: "Dream Lab", preferred: { width: 620, height: 520 }, minimum: { width: 360, height: 320 } },
   map: { label: "Project Map", preferred: { width: 610, height: 420 }, minimum: { width: 360, height: 320 } },
-  settings: { label: "Settings", preferred: { width: 470, height: 420 }, minimum: { width: 360, height: 320 } },
+  grove: { label: "Understory Grove", preferred: { width: 820, height: 560 }, minimum: { width: 460, height: 340 } },
+  settings: { label: "Settings", preferred: { width: 780, height: 600 }, minimum: { width: 440, height: 400 } },
 };
 
 const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -67,6 +68,7 @@ export function createWindowState(windowId, options = {}) {
     workspaceId: String(options.workspaceId || "workspace-local"),
     windowId,
     state: options.state || "closed",
+    minimizedFrom: options.state === "minimized" ? (options.minimizedFrom === "maximized" ? "maximized" : "normal") : null,
     bounds,
     restoreBounds: clampBounds(options.restoreBounds || bounds, options.canvas || definition.preferred, definition.minimum),
     minimumSize: normalizeMinimumSize(definition.minimum),
@@ -83,7 +85,11 @@ export function normalizeState(windowId, value, options = {}) {
   const definition = WINDOW_DEFINITIONS[windowId] || WINDOW_DEFINITIONS.settings;
   const fallback = createWindowState(windowId, options);
   if (!value || typeof value !== "object") return fallback;
-  const legacyState = value.state === "minimized" || value.minimized ? "minimized" : value.state === "maximized" || value.maximized ? "maximized" : value.open === false ? "closed" : value.state || "normal";
+  // Once migrated, the canonical state wins over stale v1 booleans retained in
+  // the record; otherwise a restored window can minimize itself on next launch.
+  const legacyState = value.schema === WINDOW_SCHEMA && ["closed", "normal", "minimized", "maximized"].includes(value.state)
+    ? value.state
+    : value.state === "minimized" || value.minimized ? "minimized" : value.state === "maximized" || value.maximized ? "maximized" : value.open === false ? "closed" : value.state || "normal";
   const boundsInput = value.bounds || { x: value.x, y: value.y, width: value.width, height: value.height };
   const restoreInput = value.restoreBounds || value.restore || boundsInput;
   const normalized = {
@@ -93,9 +99,14 @@ export function normalizeState(windowId, value, options = {}) {
     workspaceId: String(value.workspaceId || options.workspaceId || fallback.workspaceId),
     windowId,
     state: ["closed", "normal", "minimized", "maximized"].includes(legacyState) ? legacyState : "closed",
-    bounds: clampBounds(boundsInput, options.canvas || definition.preferred, value.minimumSize || definition.minimum),
-    restoreBounds: clampBounds(restoreInput, options.canvas || definition.preferred, value.minimumSize || definition.minimum),
-    minimumSize: normalizeMinimumSize(value.minimumSize || definition.minimum),
+    minimizedFrom: legacyState === "minimized"
+      ? (["normal", "maximized"].includes(value.minimizedFrom) ? value.minimizedFrom : value.maximized === true || value.state === "maximized" ? "maximized" : "normal")
+      : null,
+    bounds: clampBounds(boundsInput, options.canvas || definition.preferred, definition.minimum),
+    restoreBounds: clampBounds(restoreInput, options.canvas || definition.preferred, definition.minimum),
+    // Minimum dimensions are UI constraints, not user preferences. Refresh them
+    // when restoring an older session so new controls cannot be resized away.
+    minimumSize: normalizeMinimumSize(definition.minimum),
     zOrder: Math.max(0, Math.floor(finite(value.zOrder ?? value.zIndex, 0))),
     focus: value.focus === true || value.active === true,
     pin: value.pin === true || value.pinned === true,
@@ -138,7 +149,13 @@ export function focusWindow(windows, windowId, now = new Date().toISOString(), c
   // outside the visible surface) must come back on-screen when the user summons it.
   // Without this, clicking the dock item only re-orders z and nothing visibly changes.
   const bounds = canvas ? clampBounds(item.bounds, canvas, item.minimumSize) : item.bounds;
-  return normalizeZOrder({ ...windows, [windowId]: { ...item, state: item.state === "minimized" ? "normal" : item.state, bounds, lastFocusedAt: now } }, windowId);
+  const state = item.state === "minimized" ? (item.minimizedFrom === "maximized" ? "maximized" : "normal") : item.state;
+  // Capture-phase pointer/focus events can both request activation. Avoid a new
+  // state tree on every click, but never skip re-clamping or repairing z-order.
+  if (item.focus && state === item.state
+    && ["x", "y", "width", "height"].every((key) => bounds[key] === item.bounds[key])
+    && Object.entries(windows).every(([id, other]) => id === windowId || (!other.focus && other.zOrder < item.zOrder))) return windows;
+  return normalizeZOrder({ ...windows, [windowId]: { ...item, state, minimizedFrom: null, bounds, lastFocusedAt: now } }, windowId);
 }
 
 function overlaps(a, b) {
@@ -148,6 +165,8 @@ function overlaps(a, b) {
 export function openWindowBounds(windows, windowId, canvas, options = {}) {
   const item = windows?.[windowId];
   if (!item) return windows;
+  // Reopening a minimized window is restoration, not a new cascading placement.
+  if (item.state === "minimized") return focusWindow(windows, windowId, options.now, canvas);
   const surface = normalizeCanvas(canvas);
   let bounds = clampBounds(item.bounds, surface, item.minimumSize);
   const occupied = Object.values(windows).filter((other) => other.windowId !== windowId && !["closed", "minimized"].includes(other.state));
@@ -170,16 +189,27 @@ export function moveWindow(item, dx, dy, canvas, options = {}) {
 
 export function resizeWindow(item, edge, dx, dy, canvas, options = {}) {
   if (!item || item.state === "maximized") return item;
-  const start = item.bounds;
-  let next = { ...start };
-  if (edge.includes("left")) { next.x = start.x + dx; next.width = start.width - dx; }
-  if (edge.includes("right")) next.width = start.width + dx;
-  if (edge.includes("top")) { next.y = start.y + dy; next.height = start.height - dy; }
-  if (edge.includes("bottom")) next.height = start.height + dy;
-  const min = normalizeMinimumSize(item.minimumSize);
-  if (next.width < min.width) { if (edge.includes("left")) next.x = start.x + start.width - min.width; next.width = min.width; }
-  if (next.height < min.height) { if (edge.includes("top")) next.y = start.y + start.height - min.height; next.height = min.height; }
-  return { ...item, bounds: clampBounds(next, canvas, min), snapTarget: null };
+  const surface = normalizeCanvas(canvas);
+  const start = clampBounds(item.bounds, surface, item.minimumSize);
+  const min = fitSize(item.minimumSize, item.minimumSize, surface);
+  let left = start.x, top = start.y;
+  let right = start.x + start.width, bottom = start.y + start.height;
+  // Clamp the moving edge, not the entire rectangle: the opposite edge must
+  // stay anchored when resizing against the desktop boundary or minimum size.
+  if (edge.includes("left")) left = Math.max(0, Math.min(right - min.width, left + finite(dx, 0)));
+  if (edge.includes("right")) right = Math.min(surface.width, Math.max(left + min.width, right + finite(dx, 0)));
+  if (edge.includes("top")) top = Math.max(0, Math.min(bottom - min.height, top + finite(dy, 0)));
+  if (edge.includes("bottom")) bottom = Math.min(surface.height, Math.max(top + min.height, bottom + finite(dy, 0)));
+  return { ...item, bounds: { x: left, y: top, width: right - left, height: bottom - top }, snapTarget: null };
+}
+
+export function pointerSnapCommand(x, y, canvas, options = {}) {
+  if (options.altKey) return null;
+  const surface = normalizeCanvas(canvas);
+  if (y <= 12) return "maximize";
+  if (x <= 18) return "half-left";
+  if (x >= surface.width - 18) return "half-right";
+  return null;
 }
 
 export function snapBounds(bounds, canvas, options = {}) {
@@ -209,8 +239,9 @@ export function toggleMaximize(item, canvas) {
 
 export function setWindowState(item, state, canvas) {
   if (!item) return item;
-  if (state === "minimized") return { ...item, state: "minimized" };
+  if (state === "minimized") return { ...item, state: "minimized", minimizedFrom: item.state === "maximized" || (item.state === "minimized" && item.minimizedFrom === "maximized") ? "maximized" : "normal", focus: false };
   if (state === "closed") return { ...item, state: "closed", focus: false };
+  if (state === "normal" && item.state === "minimized") return { ...item, state: item.minimizedFrom === "maximized" ? "maximized" : "normal", minimizedFrom: null, bounds: clampBounds(item.bounds, canvas, item.minimumSize) };
   if (state === "normal" && item.state === "maximized") return toggleMaximize(item, canvas);
   return { ...item, state };
 }
@@ -221,8 +252,8 @@ export function keyboardPlacement(item, command, canvas) {
   if (command === "half-left") return { ...item, state: "normal", restoreBounds: item.bounds, bounds: clampBounds({ x: 0, y: 0, width: Math.floor(surface.width / 2), height: surface.height }, surface, item.minimumSize), snapTarget: "left" };
   if (command === "half-right") return { ...item, state: "normal", restoreBounds: item.bounds, bounds: clampBounds({ x: Math.ceil(surface.width / 2), y: 0, width: Math.floor(surface.width / 2), height: surface.height }, surface, item.minimumSize), snapTarget: "right" };
   if (command === "maximize") return item.state === "maximized" ? item : toggleMaximize(item, surface);
-  if (command === "restore") return item.state === "maximized" ? toggleMaximize(item, surface) : { ...item, state: "normal", bounds: clampBounds(item.restoreBounds, surface, item.minimumSize) };
-  if (command === "minimize") return { ...item, state: "minimized", focus: false };
+  if (command === "restore") return item.state === "minimized" ? setWindowState(item, "normal", surface) : item.state === "maximized" ? toggleMaximize(item, surface) : { ...item, state: "normal", bounds: clampBounds(item.restoreBounds, surface, item.minimumSize) };
+  if (command === "minimize") return setWindowState(item, "minimized", surface);
   return item;
 }
 

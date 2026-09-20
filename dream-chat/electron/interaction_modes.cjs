@@ -13,6 +13,7 @@ function classifyIntent(text, interactionMode = null) {
   const value = String(text || "").toLowerCase();
   if (interactionMode === "build") return "coding";
   if (/\b(verify|test|check|lint|prove|run (?:the )?build)\b/.test(value)) return "verify";
+  if (/\b(experiment|physics|simulate|simulation|projectile|pendulum|orbit|gravity|spring|collision|terminal velocity|understory world)\b/.test(value)) return "experiment";
   if (/\b(improve|self.?improve|sips|train|dream|learn|optimize|faster|speed.?up|performance|efficient|agentic|autonomous|proactive)\b/.test(value)) return "improve";
   if (/\b(inspect|map|repo|files|codebase|status)\b/.test(value)) return "inspect";
   if (/\b(remember|memory|recall|lesson)\b/.test(value)) return "memory";

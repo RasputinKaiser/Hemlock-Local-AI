@@ -29,6 +29,13 @@ test("does not treat visual ideation without a build handoff as a task", () => {
   assert.equal(resolveInteraction({ text: "Could you create a visual concept for an animation?" }).interactionMode, "explore");
 });
 
+test("recognizes world physics requests as experiment intent", () => {
+  assert.equal(resolveInteraction({ text: "Run a projectile experiment with a 45 degree launch" }).intent, "experiment");
+  assert.equal(resolveInteraction({ text: "Simulate a pendulum and compare the period" }).intent, "experiment");
+  assert.equal(resolveInteraction({ text: "Drop something in the understory world" }).intent, "experiment");
+  assert.equal(resolveInteraction({ text: "Tell me about hemlock trees" }).intent, "conversation");
+});
+
 test("recognizes performance and agenticness requests as improve intent", () => {
   assert.equal(resolveInteraction({ text: "Make Maple-Preview run faster on HemlockOS" }).intent, "improve");
   assert.equal(resolveInteraction({ text: "Optimize the inference speed" }).intent, "improve");

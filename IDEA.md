@@ -1,0 +1,1 @@
+This is an OS that can run Maple-Preview locally, it is also effective at running any subscription you have (codex, claude etc), it has windows and tabs like an OS, the chat should be fully readable, the model should have access to the viewable artifact.

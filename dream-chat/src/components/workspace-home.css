@@ -1,0 +1,209 @@
+/* Paper workspace: task first, model observation second, detail on demand.
+   All selectors are scoped. The window, not the desktop, owns the breakpoint. */
+.workspace-home {
+  container: workspace-home / inline-size;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.workspace-home-content {
+  width: 100%;
+  max-width: 760px;
+  margin-inline: auto;
+  padding: 28px 28px 20px;
+  overflow-wrap: anywhere;
+}
+
+.workspace-home-intro h1 {
+  max-width: 26ch;
+  margin: 0;
+  color: var(--ink);
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1.12;
+  text-wrap: balance;
+}
+
+.workspace-home-intro p {
+  max-width: 64ch;
+  margin: 10px 0 0;
+  color: var(--muted-ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.workspace-home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.workspace-home-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 9px 14px;
+  border: 1px solid var(--surface-border);
+  border-radius: 7px;
+  font: inherit;
+  font-weight: 600;
+  line-height: 1.4;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.workspace-home-actions .workspace-home-primary {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.workspace-home-actions .workspace-home-primary:hover:not(:disabled) {
+  background: var(--evergreen, var(--ink));
+  border-color: var(--evergreen, var(--ink));
+}
+
+.workspace-home-actions .workspace-home-secondary {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.workspace-home-actions .workspace-home-secondary:hover:not(:disabled) {
+  background: var(--surface-soft);
+  border-color: var(--muted-ink);
+}
+
+.workspace-home-provider {
+  margin-top: 24px;
+  padding: 14px 0;
+  border-block: 1px solid var(--surface-border);
+}
+
+.workspace-home-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted-ink);
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.workspace-home-provider > strong { font-size: 13px; font-weight: 600; }
+.workspace-home-readiness { margin-top: 8px; }
+.workspace-home-readiness > span { color: var(--ink); font-size: 12px; font-weight: 600; }
+.workspace-home-readiness p { max-width: 68ch; margin: 3px 0 0; color: var(--muted-ink); font-size: 12px; }
+.workspace-home-recent { margin-top: 20px; }
+
+.workspace-home-section-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-bottom: 6px;
+}
+
+.workspace-home-section-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 21px;
+  font-weight: 500;
+  line-height: 1.25;
+}
+
+.workspace-home-link {
+  min-height: 32px;
+  padding: 4px 0;
+  background: transparent;
+  color: var(--muted-ink);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.workspace-home-link:hover { color: var(--ink); }
+.workspace-home-thread-list { margin: 0; padding: 0; list-style: none; }
+.workspace-home-thread-list li + li { border-top: 1px solid var(--surface-border); }
+
+.workspace-home-thread {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 54px;
+  padding: 9px 8px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+}
+
+.workspace-home-thread:hover:not(:disabled),
+.workspace-home-thread:focus-visible { background: var(--surface-soft); }
+.workspace-home-thread-copy { flex: 1; min-width: 0; }
+.workspace-home-thread-copy > strong { display: block; font-size: 13px; font-weight: 600; line-height: 1.4; }
+.workspace-home-thread-meta { display: flex; gap: 8px; min-width: 0; margin-top: 3px; color: var(--muted-ink); font-size: 11px; }
+.workspace-home-thread-meta > span:first-child { flex-shrink: 0; }
+.workspace-home-thread-meta .workspace-home-thread-path { flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-home-current { color: var(--muted-ink); font-size: 11px; }
+.workspace-home svg { flex-shrink: 0; }
+.workspace-home-details { margin-top: 20px; border-top: 1px solid var(--surface-border); }
+.workspace-home-details details + details { border-top: 1px solid var(--surface-border); }
+
+.workspace-home-details summary {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 38px;
+  padding-block: 10px;
+  color: var(--muted-ink);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.workspace-home-details summary:hover,
+.workspace-home-details details[open] summary { color: var(--ink); }
+.workspace-home-details p { max-width: 68ch; margin: 0 0 14px; color: var(--muted-ink); font-size: 12px; }
+.workspace-home-counts { max-width: 340px; margin: 0 0 10px; }
+.workspace-home-counts > div { display: flex; justify-content: space-between; gap: 16px; padding-block: 3px; }
+.workspace-home-counts dt { color: var(--muted-ink); font-size: 12px; }
+.workspace-home-counts dd { margin: 0; color: var(--ink); font-size: 12px; font-variant-numeric: tabular-nums; }
+.workspace-home button:disabled { cursor: not-allowed; }
+.workspace-home :is(button, summary):focus-visible { outline: 2px solid var(--focus-ink, var(--ink)); outline-offset: 3px; }
+
+@container workspace-home (max-width: 440px) {
+  .workspace-home-content { padding: 20px 16px 16px; }
+  .workspace-home-intro h1 { font-size: 26px; }
+  .workspace-home-intro p { font-size: 13px; }
+  .workspace-home-provider { margin-top: 20px; }
+  .workspace-home-actions button { flex: 1 1 auto; }
+  .workspace-home-thread { padding-inline: 4px; }
+}
+
+@container workspace-home (max-width: 320px) {
+  .workspace-home-actions { align-items: stretch; flex-direction: column; }
+  .workspace-home-current { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-home-actions button { transition: none; }
+}

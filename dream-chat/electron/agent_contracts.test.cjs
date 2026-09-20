@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { ACTION_SCHEMA, DEFAULT_BUDGET, clampBudgetOverrides, coerceActionPayload, createObservation, extractActionEnvelope, extractJsonObject, mergeBudget, normalizeExpectedEvidence, validateAction, classifyFailure } = require("./agent_contracts.cjs");
+const { ACTION_SCHEMA, DEFAULT_BUDGET, buildScoreCandidates, clampBudgetOverrides, coerceActionPayload, createObservation, extractActionEnvelope, extractJsonObject, mergeBudget, normalizeCompactChoice, normalizeExpectedEvidence, validateAction, classifyFailure } = require("./agent_contracts.cjs");
 
 test("clamps grantable budget overrides into the allowed step and command range", () => {
   assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 16, maxCommands: 24 }), { maxAgentSteps: 16, maxCommands: 24 });

@@ -1,17 +1,41 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import postcss from "postcss";
 
 const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 const mainSource = readFileSync(new URL("./main.jsx", import.meta.url), "utf8");
+const css = postcss.parse(styles);
+
+// Inspect declarations, not an obsolete matching substring anywhere in the
+// file. Scope responsive rules explicitly so dead overrides cannot pass.
+function declarations(selector, condition = null) {
+  const result = {};
+  css.walkRules((rule) => {
+    if (!rule.selectors.includes(selector)) return;
+    const parentCondition = rule.parent.type === "atrule" ? `${rule.parent.name} ${rule.parent.params}` : null;
+    if (parentCondition !== condition) return;
+    rule.walkDecls((decl) => { result[decl.prop] = decl.value; });
+  });
+  return result;
+}
+
+const chatRows = [...declarations(".chat-surface")["grid-template-rows"].matchAll(/\[([a-z]+)\]/g)].map((match) => match[1]);
 
 test("Chat keeps the window frame fixed and the message history scrollable", () => {
-  assert.match(styles, /\.window-body\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s);
-  assert.match(styles, /\.chat-surface\s*\{[^}]*min-height:\s*0;[^}]*height:\s*100%;[^}]*overflow:\s*hidden\s*!important;/s);
-  assert.match(styles, /\.chat-scroll\s*\{[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow-x:\s*hidden;[^}]*overflow-y:\s*auto;/s);
-  assert.match(styles, /\.chat-compose\s*\{[^}]*flex:\s*0 0 auto;/s);
-  assert.match(styles, /\.objective-collapse summary\s*\{[^}]*-webkit-line-clamp:\s*3;/s);
-  assert.match(styles, /\.objective-collapse \.objective-full\s*\{[^}]*white-space:\s*pre-wrap;/s);
+  assert.equal(declarations(".window-body").container, "window / inline-size");
+  assert.equal(declarations(".window-body").display, "flex");
+  const surface = declarations(".chat-surface");
+  assert.equal(surface.display, "grid");
+  assert.equal(surface["min-height"], "0");
+  assert.equal(surface.height, "100%");
+  assert.equal(surface.overflow, "auto", "oversized text and optional panels remain reachable by scrolling");
+  assert.match(surface["grid-template-rows"], /\[transcript\] minmax\(180px, 1fr\)/);
+  const scroll = declarations(".chat-surface > .chat-scroll");
+  assert.equal(scroll["min-height"], "0");
+  assert.equal(scroll["overflow-x"], "hidden");
+  assert.equal(scroll["overflow-y"], "auto");
+  assert.equal(scroll["grid-row"], "transcript");
 });
 
 test("Chat exposes the durable plan and approval boundary", () => {
@@ -27,42 +51,65 @@ test("Chat keeps the transcript above a collapsible plan dock", () => {
   assert.match(mainSource, /plan-collapse-toggle/);
   assert.match(mainSource, /aria-controls="hemlock-plan-body"/);
   assert.match(mainSource, /hidden=\{planCollapsed\}/);
-  assert.match(styles, /\.chat-surface > \.chat-scroll\s*\{[^}]*order:\s*5;/s);
-  assert.match(styles, /\.chat-surface > \.chat-host-rail\s*\{[^}]*order:\s*6;[^}]*flex:\s*0 0 auto;/s);
-  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*order:\s*7;[^}]*flex:\s*0 0 auto;/s);
+  assert.equal(declarations(".chat-surface > .chat-plan-card")["grid-row"], "plan");
+  assert.equal(declarations(".chat-surface > .chat-plan-card")["grid-column"], "1");
+  assert.ok(chatRows.indexOf("plan") > chatRows.indexOf("transcript"));
+  assert.ok(chatRows.indexOf("composer") > chatRows.indexOf("plan"));
   assert.match(styles, /\.plan-collapse-toggle\.is-collapsed svg/);
 });
 
-test("Chat keeps host activity out of the transcript and collapsed by default", () => {
+test("Chat inspector is secondary, explicitly hideable, and owns its scroll", () => {
   assert.match(mainSource, /const hostActivity = <section className="chat-host-rail"/);
   assert.match(mainSource, /<details className="chat-host-details" open={hostActivityOpen}/);
   assert.match(mainSource, /className="chat-work-rail"/);
-  assert.match(styles, /\.chat-host-rail\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
-  assert.match(styles, /\.chat-host-details\s*\{[^}]*background:\s*#f4f8ef;/s);
-  assert.match(styles, /\.chat-host-details\[open\]\s*\{[^}]*max-height:\s*min\(15vh, 150px\);/s);
-  assert.match(styles, /\.chat-host-details > \.live-task-surface\s*\{[^}]*overflow:\s*auto;[^}]*border-top:/s);
-  assert.match(styles, /\.chat-host-rail \.live-evidence-card\s*\{[^}]*display:\s*none;/s);
+  assert.match(mainSource, /hidden=\{!inspectorOpen\}/);
+  assert.equal(declarations(".chat-surface.is-inspector-hidden > .chat-work-rail").display, "none");
+  assert.equal(declarations("[hidden]").display, "none");
+  const hiddenRule = css.nodes.find((node) => node.selector === "[hidden]");
+  assert.ok(hiddenRule.nodes.find((node) => node.prop === "display").important);
+  const rail = declarations(".chat-surface > .chat-work-rail");
+  assert.equal(rail["overflow-y"], "auto");
+  assert.equal(rail["grid-row"], "transcript", "compact evidence never overlays composer or thread controls");
+  assert.equal(rail["max-height"], "none");
+  assert.equal(rail.position, "absolute", "compact inspector is a dismissible drawer, not stolen transcript space");
+  assert.ok(chatRows.indexOf("inspector") > chatRows.indexOf("composer"));
 });
 
-test("Chat keeps the task hero compact so the transcript gets the viewport", () => {
-  assert.match(styles, /\.chat-surface > \.chat-task-header\s*\{[^}]*max-height:\s*min\(8vh, 70px\);/s);
-  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*-webkit-line-clamp:\s*1;/s);
-  assert.match(styles, /\.chat-task-header \.objective-collapse summary\s*\{[^}]*max-width:\s*min\(980px, 78vw\);/s);
-  assert.match(mainSource, /className="chat-context-summary"/);
-  assert.match(styles, /\.chat-context-summary > span:last-child\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
-  assert.match(styles, /\.work-message\.assistant \.maple-output-card\s*\{[^}]*border:\s*0;[^}]*box-shadow:\s*none;/s);
+test("Chat gives every optional direct child a distinct named row", () => {
+  const selectors = [".thread-bar", ".chat-error", ".suggestion-stack", ".chat-activity-strip", ".chat-compare", ".chat-scroll", ".chat-question-card", ".chat-plan-card", ".chat-composer-area", ".chat-status-bar"];
+  const assigned = selectors.map((selector) => declarations(`.chat-surface > ${selector}`)["grid-row"]);
+  assert.equal(new Set(assigned).size, selectors.length, "optional panels must not overlap another grid slot");
+  for (const row of assigned) assert.ok(chatRows.includes(row), `missing explicit row: ${row}`);
+  assert.equal(declarations(".chat-surface > .chat-task-header").display, "none", "thread title already supplies the context");
+  assert.equal(declarations(".work-message.assistant .maple-output-card").border, "0");
 });
 
-test("Chat uses a transcript-first work rail and exposes throughput telemetry", () => {
-  assert.match(styles, /\.chat-surface\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 2fr\) minmax\(320px, 1fr\);/s);
-  assert.match(styles, /\.chat-surface > \.chat-activity-strip\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*3;/s);
-  assert.match(styles, /\.chat-surface > \.chat-scroll\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*4;/s);
-  assert.match(styles, /\.chat-surface > \.chat-host-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*3 \/ span 2;/s);
-  assert.match(styles, /\.chat-surface > \.chat-evidence-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*5;/s);
-  assert.match(styles, /\.chat-surface > \.chat-compose\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*8;/s);
-  assert.match(styles, /\.chat-status-bar\s*\{[^}]*grid-column:\s*1 \/ -1;[^}]*grid-row:\s*9;/s);
-  assert.match(styles, /\.chat-surface > \.chat-work-rail\s*\{[^}]*grid-column:\s*2;[^}]*grid-row:\s*3 \/ span 6;/s);
-  assert.match(styles, /\.window-chat \.window-bar\s*\{[^}]*background:\s*#0b3228;/s);
+test("Chat composer stays below the transcript, outside the host inspector", () => {
+  const composer = declarations(".chat-surface > .chat-composer-area");
+  assert.equal(composer["grid-column"], "1");
+  assert.equal(composer["grid-row"], "composer");
+  const inspectorSource = mainSource.match(/<aside\b[^>]*className="chat-work-rail"[^>]*>([\s\S]*?)<\/aside>/)?.[1];
+  assert.ok(inspectorSource);
+  assert.doesNotMatch(inspectorSource, /chat-compose|interaction-mode-bar|composer-model-line/);
+  assert.match(mainSource, /className="chat-composer-area"/);
+  assert.match(mainSource, /className="chat-inspector-toggle" aria-expanded=\{inspectorOpen\}/);
+  assert.doesNotMatch(styles, /\.chat-work-rail > \.(?:chat-compose|interaction-mode-bar)/);
+});
+
+test("Chat adapts to its window width, not the desktop viewport", () => {
+  assert.equal(declarations(".chat-surface")["grid-template-columns"], "minmax(0, 1fr)");
+  const wide = "container window (min-width: 900px)";
+  assert.equal(declarations(".chat-surface:not(.is-inspector-hidden)", wide)["grid-template-columns"], "minmax(0, 1fr) 296px");
+  assert.equal(declarations(".chat-surface > .chat-work-rail", wide)["grid-column"], "2");
+  assert.equal(declarations(".chat-surface > .chat-work-rail", wide)["grid-row"], "activity / status");
+  css.walkAtRules("media", (rule) => {
+    if (!/width/.test(rule.params)) return;
+    rule.walkDecls("grid-template-columns", (decl) => assert.notEqual(decl.parent.selector, ".chat-surface"));
+  });
+});
+
+test("Chat retains forest chrome and exposes throughput telemetry", () => {
+  assert.equal(declarations(".os-window.window-chat.is-active .window-bar").background, "#0b3228");
   assert.match(mainSource, /chat-evidence-rail/);
   assert.match(mainSource, /className="chat-status-bar"/);
   assert.match(mainSource, /thread-context-label/);
@@ -95,9 +142,8 @@ test("Hotfix: live stream renders below the transcript and the plan card owns it
   assert.ok(streamAt > -1 && transcriptAt > -1 && jumpAt > -1);
   assert.ok(streamAt > transcriptAt && streamAt < jumpAt, "live stream must sit between messages.map and the jump-to-latest/thinking block");
   assert.match(mainSource, /aria-label="Live model stream" aria-live="polite"/);
-  // Plan card occupies grid row 5 in column 1 (below the transcript) — it must
-  // never share column 2 rows 3-8 with .chat-work-rail again.
-  assert.match(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*5;/s);
+  // Plan and transcript share the reading column, never the inspector slot.
+  assert.equal(declarations(".chat-surface > .chat-plan-card")["grid-column"], "1");
   assert.doesNotMatch(styles, /\.chat-surface > \.chat-plan-card\s*\{[^}]*grid-column:\s*2;/s);
   // flushStreamedMessages only appends new streams at the end of the transcript.
   assert.match(mainSource, /return \[\.\.\.current, \{ id: crypto\.randomUUID\(\), role: "assistant"/);
@@ -144,4 +190,58 @@ test("T11-B verification status colors and budget counters hold the contrast flo
   // Live steps/commands counters and grant stepper values stay legible.
   assert.match(styles, /\.budget-usage\s*\{[^}]*font:\s*600 10px "DM Mono", monospace;/s);
   assert.match(styles, /\.budget-stepper strong\s*\{[^}]*color:\s*#5d4a1e;/s);
+});
+
+test("Shell preserves floating desktop windows and truly hides minimized ones", () => {
+  assert.equal(declarations(".os-window").position, "absolute");
+  assert.notEqual(declarations(".os-window.window-center .window-bar").display, "none", "Command Center keeps a reachable draggable titlebar");
+  for (const property of ["left", "top", "width", "height", "inset"]) {
+    assert.equal(declarations(".os-window.window-center")[property], undefined, `Command Center must not lock ${property} over managed bounds`);
+  }
+  assert.equal(declarations(".os-window.is-minimized").display, "none");
+  assert.equal(declarations(".os-window.window-chat.is-maximized").position, undefined, "maximizing chat must not cover the shell and dock");
+  css.walkAtRules("media", (rule) => {
+    rule.walkRules((child) => {
+      if (!child.selectors.includes(".os-window")) return;
+      if (!child.nodes.some((node) => node.prop === "position" && node.value === "relative")) return;
+      assert.match(rule.params, /max-width: 759px/, "native windows remain floating at Electron's 760px minimum");
+    });
+  });
+  assert.equal(declarations(".system-brand").background, "transparent");
+  assert.equal(declarations(".understory-dock")["overflow-x"], "auto");
+  assert.equal(declarations(".understory-dock .dock-item")["flex-shrink"], "0");
+});
+
+test("Keyboard, touch, and reduced motion have explicit usable states", () => {
+  assert.match(styles, /summary:focus-visible/);
+  assert.match(styles, /outline: 2px solid var\(--focus-ink, var\(--gold-bright\)\) !important/);
+  assert.equal(declarations(".message-actions", "media (hover: none)").opacity, "1");
+  assert.equal(declarations(".thread-row-actions", "media (hover: none)").opacity, "1");
+  assert.equal(declarations("*", "media (prefers-reduced-motion: reduce)").animation, "none");
+  assert.equal(declarations("*", "media (prefers-reduced-motion: reduce)").transition, "none");
+  assert.equal(declarations(".dock-item:hover", "media (prefers-reduced-motion: reduce)").transform, "none");
+  assert.equal(declarations(".chat-scroll > .chat-live-stream .chat-live-stream-body")["max-height"], "none");
+  assert.equal(declarations(".chat-scroll > .chat-live-stream .chat-live-channel pre").overflow, "visible");
+});
+
+function luminance(hex) {
+  const rgb = hex.slice(1).match(/.{2}/g).map((part) => Number.parseInt(part, 16) / 255);
+  const linear = rgb.map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+}
+
+test("Paper, understory, and chrome metadata tokens clear WCAG contrast", () => {
+  const root = declarations(":root");
+  for (const [name, palette] of [["paper", root], ["understory", { ...root, ...declarations(".understory") }]]) {
+    for (const text of ["--ink", "--muted-ink", "--ink-muted"]) {
+      for (const surface of ["--paper", "--paper-warm", "--surface", "--surface-soft"]) {
+        const contrast = (luminance(palette[surface]) + 0.05) / (luminance(palette[text]) + 0.05);
+        assert.ok(contrast >= 4.5, `${name}: ${text} on ${surface}: ${contrast.toFixed(2)}:1`);
+      }
+    }
+  }
+  for (const background of ["#0b3025", "#0a2a21", "#18211e"]) {
+    const contrast = (luminance("#aebfa4") + 0.05) / (luminance(background) + 0.05);
+    assert.ok(contrast >= 4.5, `moss on ${background}: ${contrast.toFixed(2)}:1`);
+  }
 });

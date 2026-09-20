@@ -18,6 +18,7 @@ test("serializes intents, preserves FIFO order, and lets steering bypass the que
       task.status = "running";
       calls.push(payload.text);
       if (payload.text === "first") await firstGate;
+      task.status = "completed";
       return { status: "completed", answer: payload.text };
     },
     steer: async (payload) => ({ content: payload.text, taskId: task.id }),
@@ -51,7 +52,7 @@ test("cancels a queued request without touching the active request", async () =>
     getTask: () => task,
     execute: async (payload) => {
       task.status = "running";
-      return new Promise((resolve) => release.push(() => resolve({ status: "completed", answer: payload.text })));
+      return new Promise((resolve) => release.push(() => { task.status = "completed"; resolve({ status: "completed", answer: payload.text }); }));
     },
   });
   const active = queue.submit({ requestId: "req-active", text: "active" });
@@ -76,6 +77,7 @@ test("steering while a request is mid-flight leaves the durable FIFO order untou
       task.status = "running";
       calls.push(payload.text);
       if (payload.text === "first") await activeGate;
+      task.status = "completed";
       return { status: "completed", answer: payload.text };
     },
     steer: async () => ({ content: "steered" }),
@@ -117,6 +119,7 @@ test("rejects a duplicate queued objective without starting work or reordering t
       task.status = "running";
       calls.push(payload.text);
       if (payload.text === "active") await activeGate;
+      task.status = "completed";
       return { status: "completed", answer: payload.text };
     },
     emit: () => {},
@@ -138,4 +141,47 @@ test("rejects a duplicate queued objective without starting work or reordering t
 
   releaseActive();
   await active;
+});
+
+test("drain holds while the previous task is alive and releases on terminal", async () => {
+  const calls = [];
+  const task = { id: "task-active", status: "ready" };
+  const queue = new AgentIntentQueue({
+    getTask: () => task,
+    execute: async (payload) => {
+      calls.push(payload.text);
+      // Plan proposed but not yet approved: the queue must hold, not
+      // overwrite agentTask with the next intent.
+      task.status = "waiting_for_approval";
+      return { status: "accepted" };
+    },
+    emit: () => {},
+  });
+
+  await queue.submit({ requestId: "req-first", text: "first" });
+  const second = await queue.submit({ requestId: "req-second", text: "second" });
+  assert.equal(second.status, "queued");
+  for (let attempt = 0; attempt < 5; attempt += 1) await tick();
+  assert.deepEqual(calls, ["first"], "queue holds while the task awaits approval");
+
+  task.status = "paused";
+  await queue.notifyTaskSettled();
+  assert.deepEqual(calls, ["first"], "a paused task still holds the queue");
+
+  task.status = "completed";
+  await queue.notifyTaskSettled();
+  for (let attempt = 0; attempt < 10 && calls.length < 2; attempt += 1) await tick();
+  assert.deepEqual(calls, ["first", "second"], "terminal status releases the next intent");
+});
+
+test("a paused active task counts as active for new submissions", async () => {
+  const task = { id: "task-paused", status: "paused" };
+  const queue = new AgentIntentQueue({
+    getTask: () => task,
+    execute: async () => ({ status: "completed" }),
+    emit: () => {},
+  });
+  const result = await queue.submit({ requestId: "req-queued", text: "queued behind pause" });
+  assert.equal(result.status, "queued");
+  assert.equal(queue.snapshot().pending.length, 1);
 });

@@ -1,0 +1,58 @@
+.hemlock-icon { display: inline-block; flex-shrink: 0; vertical-align: middle; pointer-events: none; }
+.dock-item .dock-icon .hemlock-icon { width: 22px; height: 22px; }
+.overview-app .window-glyph .hemlock-icon { width: 22px; height: 22px; }
+.window-controls .window-actions-trigger { border-right: 1px solid var(--paper-line); border-radius: 5px; margin-right: 3px; }
+.window-controls button:last-child:hover { background: #f2ded4; color: #843e2b; }
+.window-chat .window-controls button:last-child:hover { background: #f2ded4; color: #843e2b; }
+.workspace-strip-actions { display: inline-flex; align-items: center; gap: 5px; }
+.workspace-strip-actions button { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--moss); font-size: 11px; }
+.workspace-strip-actions button:hover, .workspace-strip-actions button[aria-pressed="true"] { color: var(--gold-bright); background: rgba(183, 202, 165, .12); border-color: var(--gold); }
+.window-actions-backdrop { position: fixed; inset: 0; z-index: 65; }
+.window-actions-menu { position: fixed; display: flex; flex-direction: column; width: 260px; max-width: calc(100vw - 16px); max-height: calc(100dvh - 16px); overflow-y: auto; overscroll-behavior: contain; padding: 6px; border: 1px solid var(--surface-border); border-radius: 10px; background: var(--surface); color: var(--ink); box-shadow: 0 14px 40px rgba(4, 17, 14, .28); }
+.window-actions-heading { padding: 9px 10px 11px; border-bottom: 1px solid var(--paper-line); margin-bottom: 4px; font: 500 16px "Newsreader", Georgia, serif; }
+.window-actions-menu button { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 8px 10px; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; font-size: 12px; }
+.window-actions-menu button:hover:not(:disabled), .window-actions-menu button:focus-visible { background: var(--surface-soft); }
+.window-actions-menu button > span { flex: 1; }
+.window-actions-menu kbd { color: var(--muted-ink); font: 10px "DM Mono", monospace; }
+.window-actions-menu .is-destructive { margin-top: 4px; border-top: 1px solid var(--paper-line); color: #843e2b; }
+.palette-backdrop.shortcut-backdrop { place-items: center; padding: 24px; }
+.shortcut-guide { display: flex; flex-direction: column; width: min(780px, 100%); max-height: calc(100dvh - 48px); border: 1px solid var(--surface-border); border-radius: 12px; background: var(--surface); color: var(--ink); box-shadow: 0 24px 70px rgba(4, 17, 14, .35); }
+.shortcut-guide > header { display: flex; justify-content: space-between; align-items: center; padding: 20px 24px 0; gap: 12px; }
+.shortcut-guide > header > div { display: flex; gap: 12px; align-items: center; }
+.shortcut-guide h2 { margin: 0; font: 500 29px/1.2 "Newsreader", Georgia, serif; }
+.shortcut-guide > header > button { width: 34px; height: 34px; border-radius: 6px; background: var(--surface-soft); color: var(--ink); }
+.shortcut-intro { margin: 10px 24px 18px; max-width: 66ch; color: var(--muted-ink); font-size: 13px; line-height: 1.5; }
+.shortcut-scroll { overflow-y: auto; min-height: 0; overscroll-behavior: contain; padding: 0 24px 20px; }
+.shortcut-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 28px; }
+.shortcut-guide h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.shortcut-guide dl { margin: 0; }
+.shortcut-guide dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--paper-line); }
+.shortcut-guide dt { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; line-height: 1.5; }
+.shortcut-guide dt .hemlock-icon { color: var(--muted-ink); }
+.shortcut-guide dd { margin: 0; max-width: 145px; text-align: right; }
+.shortcut-guide kbd { color: var(--muted-ink); font: 10px/1.5 "DM Mono", monospace; }
+.shortcut-apps { margin-top: 24px; }
+.shortcut-apps > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 18px; }
+.shortcut-apps button { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 8px; border: 1px solid transparent; border-radius: 6px; color: var(--ink); background: transparent; text-align: left; }
+.shortcut-apps button > span { flex: 1; font-size: 12px; }
+.shortcut-apps button:hover, .shortcut-apps button:focus-visible { border-color: var(--surface-border); background: var(--surface-soft); }
+.shortcut-guide footer { padding: 12px 24px; border-top: 1px solid var(--paper-line); color: var(--muted-ink); font-size: 11px; line-height: 1.5; }
+.message-actions .copy-message-control { display: inline-flex; align-items: center; gap: 5px; }
+.message-actions button { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; }
+.copy-message-status { color: var(--muted-ink); font: 10px/1.4 "DM Sans", sans-serif; }
+.copy-message-status.is-error { color: #843e2b; }
+.message-meta, .message-actions, .copy-message-control { flex-wrap: wrap; }
+.copy-message-status { max-width: 220px; white-space: normal; }
+.overview-shortcut-link { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 5px; background: var(--surface-soft); color: var(--ink); font-size: 11px; }
+.overview-shortcut-link:hover { background: var(--paper-warm); }
+.settings-workspace button > .hemlock-icon { vertical-align: middle; }
+.settings-workspace-nav button { display: flex; align-items: center; gap: 9px; }
+@media (max-width: 600px) {
+  .shortcut-groups, .shortcut-apps > div { grid-template-columns: 1fr; }
+  .palette-backdrop.shortcut-backdrop { padding: 12px; }
+  .shortcut-guide { max-height: calc(100dvh - 24px); }
+  .shortcut-guide > header { padding-inline: 16px; }
+  .shortcut-intro { margin-inline: 16px; }
+  .shortcut-scroll { padding-inline: 16px; }
+  .workspace-strip-actions button > span { display: none; }
+}

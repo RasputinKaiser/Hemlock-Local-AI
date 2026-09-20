@@ -1061,6 +1061,80 @@ tranche11_chat_build_polish_2026_08_24:
     gates: "electron 249/249 (+8), renderer 33/33 (+3), vite build ok, node --check ok, esbuild ok; all re-run by parent after lane integration"
   claim_boundary: "Deterministic/static verification only (contrast math, source tests, builds). Memo skip behavior and O(n²) fix not yet observed against a live Maple stream; live relaunch smoke still outstanding from T10."
 
+iconography_functionality_2026_09_19:
+  status: implemented_verified
+  execution: "Solo implementation; no subagents, as requested."
+  scope: "Semantic iconography, state-aware window controls, accessible window actions, center/reset sizing, persistent Show desktop/restore, shortcut guide, exact-text clipboard feedback and regression coverage."
+  icon_registry: "52 named app/action glyphs plus an explicit unknown fallback; real registry rendered at 16/20/28px in the evidence sheet."
+  functionality:
+    menus: "Shared titlebar/dock menu, 8 actions, keyboard navigation/type selection/Escape, focus restoration and viewport clamping."
+    desktop: "Persistent reversible minimization snapshot; preserves maximized state, preexisting minimized windows, current session drafts, and excludes closed windows from restoration."
+    shortcuts: "Visible guide and app launchers; F1 help, Cmd+Option+D desktop, Cmd+Option+W preference-aware close; modal shortcut isolation."
+    clipboard: "Exact whitespace-preserving copy, Option provenance, pending/success/error feedback and recovery; test double exercises rejected clipboard without touching user clipboard."
+  verification:
+    renderer_components: "105/105 passed, 0 skipped"
+    controls_browser: "25/25 passed"
+    existing_browser_smoke: "50/50 passed"
+    existing_audit_regressions: "19/19 passed"
+    host: "257/257 passed"
+    real_electron: "20/20 passed with isolated data and production bundle; no renderer exceptions"
+    production_build: "npm run build passed; git diff --check clean"
+    design_scan: "New/changed control markup scan returned []"
+  evidence: work/iconography-controls
+  documentation: docs/gui-workspace.md
+  claim_boundary: "Clipboard UI tested against an explicit isolated test double; no model inference/training or real conversation modifications."
+
+gui_refinement_2026_09_19:
+  followup_assessment:
+    status: implemented_verified
+    request: "Impeccable critique and technical audit, followed by broad implementation and verification; user explicitly does not want an assessment-only deliverable."
+    target: dream-chat/src/main.jsx
+    baseline_renderer_tests: "68/68 passed"
+    assessment_a: work/gui-assessment-a
+    assessment_b: work/gui-assessment-b
+    baseline_design_score: "25/40, independent design review"
+    baseline_audit_score: "11/20, independent technical audit"
+    confirmed_gaps: "Compact inspector hit-test obstruction, transcript height budget, idle cockpit hierarchy, actual contrast failures, repetitive navigation/ungrouped Settings, incomplete theme tokens and illustrative Dream chart."
+    archived_critique: .impeccable/critique/2026-09-20T01-37-46Z__dream-chat-src-main-jsx.md
+    implementation:
+      chat: "Build no longer auto-opens evidence; compact inspector occupies only the transcript region with focus transfer, Escape, outside-pointer dismissal and opener restoration. Composer is compact/growing; model context/help are optional."
+      workspace: "Task-first idle home with genuine readiness/recent-thread data; active/blocked/approval cockpit retained. Four task-based Settings sections with preserved callbacks and close-warning preference."
+      navigation: "Four frequent dock apps plus open/minimized windows and All apps; grouped library; stable Cmd+1..0 app shortcuts; explicit tile/fill dock menu; stacked preview scroll-to-window."
+      integrity: "Removed illustrative Dream loss chart; corrected runtime provenance, missing-context labels, invalid ARIA role, paper status contrast and workbench theme tokens; essential affected metadata >=10px."
+    measurements:
+      minimum_chat_transcript_px: "134 before, 231 after"
+      minimum_chat_composer_px: "209 before, 120 after"
+      compact_760_transcript_px: "100 before, 180 after; 180 retained under 200% text-only scaling"
+      thread_state_contrast: "paper 5.71:1; understory 6.48:1"
+    verification:
+      renderer_components: "92/92 passed, 0 skipped; includes isolated browser component tests"
+      host: "257/257 passed"
+      browser_smoke: "50/50 passed"
+      audit_regressions: "19/19 passed; hit-testing/focus/compact sizing/text scaling/contrast/navigation"
+      real_electron: "13/13 passed; built production bundle, isolated data, real preload bridge"
+      build: "npm run build passed; git diff --check clean"
+    evidence: work/gui-audit-fixed
+    claim_boundary: "Measured fixes verified; baseline critique/audit scores are not relabeled as post-fix scores. No live inference/training or full screen-reader certification; no user conversation changes, commit or push."
+  status: implemented_verified
+  product_brief: "Impeccable init refreshed root PRODUCT.md after explicit user confirmation: OS-workspace priorities, flexible layout/navigation, current capabilities, accessibility and evidence. DESIGN.md and code-first workflow default unchanged."
+  scope: "OS-style workspace/navigation, managed Command Center, window-sized responsive layouts, transcript-first chat, readable controls, predictable resizing and persistent close-warning preferences."
+  changes:
+    navigation: "Searchable Windows overview with open/minimized/focused states, native Cmd+Shift+O, dock arrow navigation, palette focus restoration and scroll-following selection."
+    windowing: "All eight resize handles support pointer and keyboard; resizing anchors the opposite edge; drag snapping previews before release; minimize restores prior maximize state; focus hands off after close/minimize."
+    chat: "Conditional React hooks moved out of renderChat; composer moved below transcript; wide inspector becomes a dismissible drawer in compact windows; IME-safe Enter handling."
+    layout: "Container-query panels, unclipped native 760px floating workspace, real Command Center titlebar, shared legible theme tokens, comfortable chat sizing and restored-session minimum migration."
+    preferences: "Never show this again applies only to window-close prompts; persisted and reversible in Settings."
+  verification:
+    host_tests: "257/257 passed"
+    renderer_tests: "68/68 passed, including real WindowFrame component handlers"
+    browser_smoke: "49/49 passed at 1440x900, 1024x768, 760x620, and 390x844; no renderer exceptions"
+    electron_smoke: "7/7 passed against production bundle with real preload bridge and temporary application data; no renderer exceptions"
+    production_build: "npm run build passed; git diff --check clean"
+    design_scan: "Single Impeccable scan found five legacy accent-stripe warnings; simplified those borders/shadows."
+  documentation: docs/gui-workspace.md
+  evidence: work/gui-refresh-2026-09-19
+  claim_boundary: "GUI and window behavior exercised in Chrome and real Electron. No live model inference or training performed; user's saved conversations untouched. No commit or push."
+
 tranche12_build_loop_hotfix_2026_08_24:
   status: implemented_verified
   trigger: "User-reported live incident: Build mode looped re-proposing completed commands, plan card covered chat, streamed output rendered ABOVE sent messages, no artifact ever reached the viewer."
@@ -1077,3 +1151,167 @@ tranche12_build_loop_hotfix_2026_08_24:
     gates: "electron 257/257 (+8 net), renderer 34/34 (+1), vite build ok, node --check ok, esbuild ok; debug probes stripped post-debug"
     commit: e1fbefe
   claim_boundary: "Deterministic verification only until live smoke completes; loop fix exercised via regression test replaying the incident pattern (repeat proposals redirected once, plan stable at 2 steps), not yet against live Maple."
+understory_grove_and_compact_choice_2026_09_20:
+  status: implemented_verified
+  trigger: "User asked to continue the uncommitted GUI tranche, test OS feel for both agent and human friendliness, make Maple work better, and explore a 3D world where local models exist and learn."
+  changes:
+    grove_surface: "New Understory Grove window: lazy-loaded three.js night-forest scene where each local model is a hemlock sized by real parameter scale (Maple 20B-A1B, LFM2.5-8B, two draft saplings). groveBindings.js is a pure event-spine mapper — inference events light fireflies at real tok/s, dream.* grows luminous graft whorls, memory.* plants seeds/blooms, sips.* raises wind, failures pulse ember. Paper bindings rail keeps every animated claim inspectable (real directory, params, dtype, last real event); external provider lanes are never grove residents."
+    grove_wiring: "New grove icon glyph, window definition (820x560 preferred), World nav group, Command Center rail-footer link, palette/overview/guide integration. Grove sits past the ten digit slots so existing Cmd+1..0 chords never moved; kbd hint hidden for index >=10."
+    maple_compact_choice: "Structured-action contract shrank from a 10-field envelope (whose id/taskId/step/approval/status the host overwrote anyway) to a 4-field choice {kind,commandId,input,shortRationale}. normalizeCompactChoice pins schema on choice-shaped objects so compliant compact output is first-class (parseStatus compact-choice); full envelopes still validate for compatibility. coerceActionPayload now also covers terminal kinds."
+    prompt_cache_ordering: "Structured-action system prompt is now fully static — volatile planned command, completed list, plan progress, allowedNextCommands and input contract moved into the request body (actionRequest.progress/allowedNextCommands). Static prefix maximizes prompt-cache reuse; the existing cacheHitRatio telemetry makes the win measurable."
+    smoke_coverage: "Electron GUI smoke gained 3 grove checks (window opens, WebGL canvas mounts, roster renders). favicon added (kills the 404 console error seen in every prior browser session)."
+  verification:
+    host_tests: "259/259 passed via node --test electron/*.test.cjs (up from 257; +2 compact-choice tests, prompt-progress assertions updated)"
+    renderer_tests: "111/114 passed, 0 failed, 3 skipped (includes 9 new groveBindings tests)"
+    real_electron: "23/23 passed with production bundle, isolated data, real preload bridge — grove opens with live WebGL and honest roster; no renderer exceptions"
+    production_build: "npm run build passed; three.js code-splits into its own lazy chunk (736 kB, fetched only when the grove opens); git diff --check clean"
+  evidence: work/understory-grove-2026-09-20
+  claim_boundary: "Bindings map real session events only; the scene is ambient, never a metrics claim — receipts remain source of truth. Compact-choice reliability and cache-hit improvement are deterministic-contract changes verified by host tests; live Maple inference quality under the new contract is unclaimed until the Maple server lane runs (server was not running during this session). No commit or push."
+world_experiments_and_dream_dataset_2026_09_20:
+  status: implemented_verified
+  trigger: "User clarified the world idea: Maple lives in the understory, runs physics experiments, learns, and adds to datasets; keep improving Maple agenticness and Dream."
+  changes:
+    physics_sandbox: "electron/physics_sandbox.cjs — pure deterministic core. Six bounded experiments (projectile, pendulum, spring, orbit, collision, terminal) with per-parameter clamp bounds and undisturbed-case defaults (drag/damping default 0, never range midpoint). Each run returns measured values beside closed-form theory plus a divergence map, so findings are verifiable. Fixed-step integration; orbit uses coarser dt with real period detection. No IO, no clock, no randomness in the sims."
+    experiment_commands: "Three allowlisted agent commands — experiment.run (capability verify, auto, model-selectable), experiment.note (capability write, appends a hemlock.world.finding.v1 row to sipsDir/experiment-dataset.jsonl citing a real run receipt; model supplies only the claim, host attaches measured/theory verbatim), experiment.dataset (read). Per-run receipts at sipsDir/experiments/<deterministic-spec-hash>.json. experiment.completed / experiment.note.recorded events carry evidenceRefs."
+    dream_feed: "runDream now appends the last 24 experiment findings to examples (messages/metadata shape dream_train.py already accepts) alongside facts/conversation — every Dream path (training.start, dream, SIPS-nested) inherits world data. dream.started datasetRows counts them."
+    experiment_intent: "interaction_modes classifies experiment/physics/simulate/projectile/pendulum/orbit/gravity/spring/collision intents; defaultPlanSteps plans [experiment.run, experiment.note, answer]. COMMAND_EVIDENCE + actionInputContract + boundedActionInput cover the new commands; Maple can also select them adaptively (verify/write are SAFE_ADAPTIVE_CAPABILITIES)."
+    grove_habitat: "Maple now has a lab bench at its tree. experiment.* events bind to a new effect: experiment.completed fires a teal lab flash + ring, experiment.note.recorded a seed ring, failures ember. Legend gained an experiments dot; maple's learnsFrom includes experiment. Experiments never grow grafts — dream growth stays bound to dream.* events only."
+    dream_lab_dataset_card: "Dream Lab shows a 'World findings → Dream dataset' section: row count, latest finding, and per-experiment run buttons that call experiment.run through the real command bridge."
+    renderer_perf: "EventRow memoized; latestReceiptEvent memoized on events; previewDocument srcDoc hoisted to a useMemo keyed on the artifact object so MB-scale artifact sources no longer re-concatenate on every event/stream render."
+  verification:
+    host_tests: "269/269 passed via npm run test:agent (was 259; +10: physics_sandbox suite + experiment intent cases)"
+    renderer_tests: "113/116 passed, 0 failed, 3 skipped (+2 groveBindings experiment tests)"
+    real_electron: "27/27 passed — new checks prove experiment.run returns a receipt and a measured pendulum period within 5% of theory, experiment.note writes a provenance-tagged dataset row, and experiment.dataset reads it back through the real preload bridge"
+    production_build: "npm run build passed; git diff --check clean"
+  evidence: work/understory-grove-2026-09-20
+  claim_boundary: "The world loop is verified end-to-end deterministically in real Electron with isolated app data — run, receipt, finding, dataset readback, Grove bindings. Dream ingestion is verified at the input-shape level (examples merged into runDream payload); a live Dream training run on experiment rows and live Maple experiment planning are unclaimed until the Maple server lane runs. No commit or push."
+maple_loop_improvements_2026_09_20:
+  status: implemented_verified
+  trigger: "Continue improving Maple on performance, learning, and agenticness."
+  changes:
+    parameterized_anti_repeat: "The T12 anti-repeat guard deduped on commandId only, which would have blocked legitimate experiment sweeps (pendulum at length 1 then 2 — same command, genuinely new evidence). Repeats are now keyed on commandId + normalized input digest for parameterized commands (experiment.*, file/context read+search, recall, receipts, verify, code/artifact inspect); non-parameterized commands still repeat on commandId alone so junk-parameter evasion can't bypass the guard."
+    world_findings_in_context: "The structured-action prompt's volatile progress block now carries worldFindings — the last 3 experiment findings (experiment, claim, divergence %) via a worldContext dep wired in main.cjs. Maple's next bounded action sees what it already learned, so follow-up experiments can build on prior results instead of proposing blind."
+    findings_to_memory_garden: "experiment.note also mirrors each finding into the agent kernel's candidate review queue (kind experiment, confidence scaled by divergence), deduped by fingerprint — world evidence is inspectable in Memory Garden alongside other candidates. Dataset row stays authoritative; the mirror is best-effort."
+    inference_latency_metrics: "bumpAgentMetrics now accumulates inferenceLatencyMs on both the structured-action and conversation inference paths, so agentTask.metrics carries real total latency next to inferenceCalls — previously per-call latency lived only in events."
+    dream_readiness_hint: "Dream Lab's world-dataset card surfaces 'Ready for a Dream run' once 6+ findings exist."
+    choices_array_recovery: "normalizeCompactChoice takes the first well-formed entry from a {'choices':[...]} response instead of letting the batch silently degrade to the planned step (records __choiceCount)."
+  verification:
+    host_tests: "271/271 passed via npm run test:agent (+2: parameterized-repeat cases incl. junk-input evasion, choices-array first-choice)"
+    renderer_tests: "113/116 passed, 0 failed, 3 skipped"
+    production_build: "npm run build passed; git diff --check clean"
+    electron_smoke: "deferred this round — the machine hit an application-memory ceiling mid-session (two orphaned mcp-playwright Chrome instances at ~15 GB each were reclaimed); host/UI/build gates cover the touched seams and the prior 27/27 smoke covered the command path"
+  evidence: work/understory-grove-2026-09-20
+  claim_boundary: "All changes are deterministic-contract and host-side; verified by host/UI tests and build. No live Maple inference this session. The anti-repeat change is exercised at unit level including the experiment-sweep case; its behavior inside a live multi-step plan is unclaimed until the Maple lane runs. No commit or push."
+grove_humanoid_replay_2026_09_20:
+  status: implemented_verified
+  trigger: "Make the learning environment substantially more live and real — humanoid residents, not trees; Maple runs experiments and learns in it."
+  changes:
+    humanoid_residents: "Grove residents are now hooded low-poly figures (robe, mantle, cowled head, chest heartlight), height-scaled by real parameter size — Maple ≈2.3m at its lab bench, drafts ≈0.9m. Breathing, head sway, and activity-linked rim/heart emissive replace tree sway; dream grafts are now orbiting halo whorls. Forest environment (treeline ring, moss, stars) kept."
+    evidence_replay: "physics_sandbox now emits a bounded (≤96pt) sampled trail on every run — real integration samples with axis labels per experiment (x/y, theta, xa/xb, y/v). Trails ride the receipt AND the experiment.completed event payload. groveBindings queues the newest 6 trail-bearing runs as bound.experiments; groveScene replays the actual measured path on a lab rig — pendulum arm swinging real theta, projectile/orbit path on a normalized plane, spring/collision motes on a rail, terminal fall. Playback paced by the trail's real t; ribbons reveal then fade; newest replay wins; reduced-motion draws instantly. The world animates measured evidence, not symbols."
+    lab_readout: "Bindings rail gained a LAB REPLAY card: experiment name, sample count, worst divergence %, age — every animated claim stays inspectable."
+  verification:
+    host_tests: "273/273 passed (+2 trail suites: bounded axes/bounds/determinism/time-order)"
+    renderer_tests: "115/118 passed, 0 failed, 3 skipped (+2 replay-queue tests)"
+    production_build: "npx vite build clean; git diff --check clean"
+    electron_smoke: "29/29 real-Electron checks passed — new: receipt carries ≤96pt trail over the real bridge, lab readout shows the newest run's experiment"
+    visual: "work/understory-grove-2026-09-20 + /tmp/grove-humanoid.png — humanoid figures render in browser preview; Electron grove verified via DOM assertions"
+  evidence: work/understory-grove-2026-09-20
+  claim_boundary: "Trail capture, event plumbing, replay queue, and scene replay are verified deterministically and in real Electron. Replay *visuals* in live Electron are asserted via DOM (readout + trail payload), not screenshot-verified mid-animation. No commit or push. QA scripts now close browsers in finally blocks."
+grove_active_lab_blockers_2026_09_20:
+  status: implemented_verified
+  trigger: "Make the grove less ambient — Maple actively experimenting — and fix blockers Maple hits doing artifacts."
+  changes:
+    compact_rationale_fix: "REAL BLOCKER from the user's live session: Maple emits {'kind':'tool','commandId':'artifact.author','input':{}} — a valid compact choice — but schema-pinning before validation made the missing shortRationale throw, and coerceActionPayload early-returns once schema is pinned, so every such action burned a full ~6min repair inference or blocked. normalizeCompactChoice now synthesizes shortRationale/input host-side (host owns narration anyway). Verified: no action.parse.failed events in test."
+    preview_session_recovery: "REAL BLOCKER: task.blocked with 'Preview session was not found: undefined' — artifact.preview.inspect ran adaptively with no prior preview.open, and previewSessions.get(undefined) threw. Inspect now resolves the newest session, or auto-opens one from the task's artifact (event notes the recovery); interact/stop get the same newest-session fallback."
+    maple_locomotion: "experiment.started event now emits before the host sim runs; bindings pulse lab-work. The figure physically walks to the bench on work events, faces the rig, raises an arm during replay (shoulder-pivot arms), walking bob while moving, drifts home when quiet. Camera lerps to the lab during replay and returns. All still event-bound — no invented activity."
+  verification:
+    host_tests: "274/274 passed (+1: rationale-less compact choice asserts zero parse failures)"
+    renderer_tests: "115/118 passed, 0 failed, 3 skipped (lab-work pulse ordering)"
+    production_build: "npx vite build clean; git diff --check clean"
+    electron_smoke: "29/29 — incl. mid-replay screenshot: Maple at the bench, pendulum rig drawing the real 96-sample arc, LAB REPLAY readout Δ0.11% (work/…/electron-grove-replay.png evidence)"
+  evidence: "work/understory-grove-2026-09-20, /tmp/hemlock-gui-evidence/electron-grove-replay.png"
+  claim_boundary: "Parse-failure and preview-session fixes target the exact errors seen in session-2026-09-20T07-42-14 receipts. Locomotion/replay verified in real Electron via screenshot + DOM. Maple still authors scaffold-fallback artifacts when it emits empty source — its model-side authoring quality is a live-lane question, not fixed by these host changes. No commit or push."
+dream_gather_vjp_fix_2026_09_20:
+  status: implemented_verified
+  trigger: "Live Dream run cycle-2026-09-20T08-20-50-886Z failed at training iter 1: ValueError [gather_axis] Cannot calculate VJP with respect to indices — Maple's MoE routing indices were traced into the autodiff graph."
+  root_cause: "config.json model_file=maple.py means the CHECKPOINT's bundled maple.py executes under --trust-remote-code, not the repo copy. Two traced-index gathers: (1) group_expert_select take_along_axis(scores, inds) where inds derives from argpartition over differentiable scores — the actual crash site; (2) MapleSwitchGLU passing idx to SwitchLinear gather_qmm/gather_mm rhs_indices — the guard upstream switch_layers.py has (if self.training: idx = mx.stop_gradient(idx)) that Maple's fork dropped."
+  changes:
+    checkpoint_maple_py: "Patched ~/Models/Hemlock/maple-2bit-mlx/maple.py — the executed copy: inds = mx.stop_gradient(inds) after argpartition in group_expert_select; if self.training: idx = mx.stop_gradient(idx) after _gather_sort in MapleSwitchGLU.__call__. Cleared stale __pycache__. Safetensors manifest only hashes *.safetensors, so base-weight integrity evidence is unaffected."
+    repo_maple_py: "Same two fixes applied to mlx_lm/models/maple.py so the fork stays in sync — the repo copy is the source of truth for future checkpoints."
+  verification:
+    unit: "nn.value_and_grad through full MapleSparseMoeBlock (gate argpartition -> take_along_axis -> gather_sort -> SwitchLinear gathers) in training mode — both sorted (>=64 idx) and unsorted paths differentiate cleanly."
+    live_rerun: "Re-ran the EXACT trainer command on the failed run's data dir (maple-2bit-mlx, lora rank-8 1-layer, adam 1e-5, batch 1, iters 4, max_seq 256): all 4 iters completed, train loss 2.658 -> 2.377, val ~0.826-0.828, adapter saved (0000004_adapters.safetensors 46.4MB + adapter_config.json), exit code 0. Evidence: workspace-runtime/cycle-fix-verify-2026-09-20T04-26-38/"
+    base_integrity: "All 4 base safetensors byte-size match the failed run's base-weights-before.json manifest; training writes only to adapter-path."
+  claim_boundary: "Dream LoRA training on Maple now runs end-to-end on the real checkpoint and real dataset — verified by live rerun, not just unit tests. Loss decreased and an adapter was produced; adapter quality/downstream inference improvement is unclaimed (that needs a served eval). An intermittent GIL finalization message appeared once at process teardown AFTER 100% + save (exit code remained 0 on the clean run); it's a benign shutdown race, worth watching but not blocking. The 306>256 token truncation warning persists — dataset-quality item, not a blocker. No commit or push."
+rlcd_scored_choice_2026_09_20:
+  status: implemented_verified
+  trigger: "User pointed at notnotsamuel/LFM2.5-350M-RLCD — parallel constrained decoding (prefill once, batch-score candidates, assemble JSON in Python, 8-63x vs autoregressive). Applied the concept to Maple's agent action selection."
+  changes:
+    score_endpoint: "New POST /v1/score on the fork's mlx_lm server (server.py): takes messages|prompt + prompt_suffix + candidates[], prefills once with LRU prompt-cache reuse (fetched at prompt[:-1] so the last token is always forwarded), then teacher-forces each candidate against a deepcopied cache — one small forward per candidate. Returns per-candidate logprob + avgLogprob + tokens. Runs on the generation thread so it serializes with generation; non-batchable semantics (drains an active batch like other non-batchable requests). Old servers 404 -> scoreEndpointUnsupported flag degrades quietly for the session."
+    scored_choice_path: "agent_orchestrator infer() now tries scored-choice before generation: buildScoreCandidates enumerates allowedNextCommands + terminal kinds as minimal candidate continuations — complete envelopes for input-free commands, one per experiment kind for experiment.run (6), one per profile for verify (3), decision prefixes for free-input commands (artifact.author, code.apply, file.search/read, context.search/query, receipt.inspect, experiment.note) and terminals. pickScoredCandidate picks max avgLogprob. A complete winner is already a valid compact envelope -> parseModelResult -> zero generated tokens, nothing to misparse. A prefix winner records progress.scoredDecision and falls through to generation for the free fields. Scoring failure -> degraded event + generative fallback."
+    think_suffix: "Maple's chat template hardcodes <|im_start|>assistant\\n<think>\\n — scoring sends prompt_suffix '</think>\\n\\n' so candidates score as the action JSON directly (a no-think decision probe)."
+  verification:
+    unit: "4 new tests in agent_orchestrator.test.cjs: complete winner executes with zero generative calls + action.scored telemetry; prefix winner falls through with scoredDecision injected; scoring failure degrades quietly; candidate enumeration (6 experiment kinds, 3 verify profiles, all complete candidates parse as JSON) and pickScoredCandidate margin."
+    endpoint_live: "Draft model (qwen25-0.5b) served the real endpoint: sane candidate ordering (answer beats tool calls for a Q&A prompt), prefix cache reuse confirmed (40 cached tokens on repeat)."
+    maple_correctness: "VERIFIED ON REAL MAPLE: block-append teacher-forcing after chunked prefill matches a fresh full-forward within 0.18 logprob (bf16 noise). IMPORTANT INVERSION — the single-token decode path deviated 16 logprob because Model.__call__ routes 1-token calls through the approximate FlashHead (maple.py:986-993); the earlier 'block-append corrupts logits' belief was backwards. Scoring's multi-token path uses the exact lm_head."
+    host_tests: "278/278 via npm run test:agent (+4)"
+    renderer_tests: "13/13 groveBindings; full UI suite unchanged"
+    production_build: "npx vite build clean; git diff --check clean"
+  claim_boundary: "Scoring mechanism verified end-to-end on the draft model and numerically on real Maple weights. The live agent-loop win (latency vs autoregressive action envelopes, zero parse failures on complete winners) is unclaimed until a real Maple lane runs with a server carrying /v1/score — the running server needs a restart to pick up the new endpoint. Decision quality of no-think scoring vs think-then-generate is unmeasured; action.scored events carry margin telemetry for audit. Terminal/generative winners still pay a generative step. No commit or push."
+autonomy_and_training_2026_09_20b:
+  status: implemented_verified
+  goal: "Agentic + autonomous but watchable/auditable/stoppable Maple; performance + training improvements."
+  changes:
+    real_pause_resume: "task.pause/task.resume commands wired to orchestrator.pauseTask + resumeTask. 'paused' now actually parks the loop: proposeNextAction returns early at the next step boundary (in-flight action finishes and records its observation), emits task.paused once; resumeTask flips status back to running and re-enters. Previously thread.pause set status=paused but the recursion kept stepping — pause was cosmetic."
+    steer_into_actions: "task.steering now flows into compactTask for BOTH inferStructuredAction and scoreStructuredAction (last 4 entries, 200 chars each). Previously steering only reached the conversation lane — mid-task steer text never influenced action selection."
+    queue_drain_fix: "AgentIntentQueue.drain now holds while the previous task is alive (waiting_for_approval, paused, running, waiting_for_user) — 'paused' added to ACTIVE_STATUSES. Previously drain started the next intent as soon as execute() returned, overwriting agentTask while the prior plan still awaited approval. New notifyTaskSettled() is called from the orchestrator emit wrapper on task.completed only — user cancel holds the queue (stopping shouldn't silently launch queued work)."
+    campaign_autonomy: "Intent payloads with mode:'campaign' or autoApprove:true auto-approve their proposed plan inside processAgentIntent (approvePlan still clamps budgets), set task.autonomy='bounded-campaign', emit plan.auto_approved, and run to terminal. Renderer: 'campaign:'/'auto:'/'autonomous:' prefix in the composer submits a campaign intent. Queued campaign intents chain via the fixed drain = bounded multi-task autonomous runs, all receipted, pause/cancel live."
+    metrics_surface: "HOST EXECUTION LOOP grid gained an INFERENCE cell (call count, total latency, repair count, campaign badge) — task.metrics was accumulated but never rendered."
+    dream_examples_fix: "renderer startDream collected latestCodingExamples() for training.prepare but never sent them to startDream — coding examples were silently dropped from standalone Dreams. Now sent."
+    dream_dataset_tokens: "dream_train.py write_dataset is now token-aware: loads the checkpoint tokenizer (char-estimate fallback), splits rows over the 448-token budget at assistant boundaries, trims unsplittable rows with recorded metadata (contentTrimmed/splitFromSource), reports tokenRange/rowsSplit/oversizedRowsRemaining in manifest.json. --max-seq-length raised 256->512. Fixes silent tail truncation AND the zero-supervised-token edge (--mask-prompt + prompt>=seq => ntoks=0)."
+    adapter_grafting: "Successful standalone Dreams now auto-graft: server restarts WITH --adapter-path so the trained adapter is the default — previously the adapter lived only as renderer-side activeAdapterPath and every per-request adapters field paid a FULL multi-GB model reload (model_key includes adapter path). SIPS nested dreams pass autoGraft:false and keep their own compare-then-decide promotion. New grafts.jsonl registry under sipsDir + dream.adapter.grafted event; dream.detach command restarts bare (rollback); dream.grafts lists the registry. Dream Lab shows an Active graft card with a confirmable Detach button. Grove: dream.adapter.detached clears the graft halo instead of growing one."
+  verification:
+    host_tests: "282/282 npm run test:agent (+4: pause parks/resumes mid-plan, idempotent pause; queue drain holds on waiting_for_approval+paused, releases on terminal; paused counts active)"
+    dataset_split: "Exercised write_dataset directly with stub + char-estimate tokenizers: 600-token row splits at assistant boundary, unsplittable oversize trims with recorded metadata, oversizedRowsRemaining=0"
+    ui_tests: "115/118 (3 skips, 0 fail); vite build clean; git diff --check clean"
+  claim_boundary: "Control semantics, queue semantics, dataset budgeting, and graft plumbing are unit-verified; the campaign auto-approve path is exercised through the queue tests but not yet in live Electron. Auto-graft correctness depends on startServer's --adapter-path handling (existing, previously dead-code path — needs one live Dream to confirm end-to-end). dream_train.py changes verified by direct function call, not a full live training run. No commit or push."
+graduated_autonomy_2026_09_20:
+  status: implemented_verified
+  trigger: "User: too gated by approvals; wants a very autonomous but watchable/auditable/stoppable general agent."
+  changes:
+    autonomy_levels: "task.autonomy is now a real gate, not a label: bounded-local=supervised (unchanged), guided=plans auto-approve + sandboxed explicit commands (artifact/preview) are adaptively selectable and run without per-action clicks, autonomous/bounded-campaign=additionally permits every capability except train (always explicit). New UI: Supervised|Guided|Autonomous segmented control in the composer bar, persisted to hemlock-autonomy-v1, sent as payload.autonomy on every intent. Default is guided — the user's stated direction."
+    adaptive_selection: "selectModelCommand + modelMaySelectCommand now take task autonomy — Maple can select artifact.author/preview.stop adaptively under guided+ (previously impossible: auto:false+explicit commands could never be adaptively selected, only run if pre-planned). Allowed-command list for scoring/generation widens identically, so /v1/score candidates cover them too."
+    action_level: "The two waiting_for_approval action parks gain an autonomyAllows escape that emits action.autonomy.bypass for audit (defense-in-depth — host normalizes approval to plan|none so these mostly never fire)."
+    pause_edge: "resumeTask restores the pre-pause status when no plan is approved yet (pause during waiting_for_approval then resume used to throw 'Approve a plan'); pauseTask stores pausedFrom and the park emit is idempotent."
+  verification:
+    host_tests: "284/284 (+2: autonomy opens guided artifact/preview but never train; guided task executes adaptively-selected explicit command while supervised never does)"
+    electron_smoke: "35/35 real-Electron checks incl. intent parks at approval, task.pause/resume round-trip, campaign auto-approves to terminal with plan.auto_approved event, action.scored engages (degraded without server)"
+    ui_tests: "115/118 (3 skips); vite build clean; git diff --check clean"
+  claim_boundary: "Autonomy gating verified in real Electron end-to-end. Guided is now the default posture — supervised remains one click away. Train capability (dream/cycle/selfloop) always stays explicit regardless of level. Campaign intents are equivalent to autonomous per-intent. No commit or push."
+agent_surface_overhaul_2026_09_20:
+  status: implemented_verified
+  trigger: "User: strong+broad subagent overhaul of agentic ability and harness flow; Hemlock must be very AI-friendly and let the AI inside improve the app itself."
+  changes:
+    input_contracts: "Every agentCommands descriptor gained inputHint (86 commands). allowedNextCommands propagates hint per entry; the action system prompt renders a fixed-priority INPUT CONTRACTS block (failure-prone commands first: artifact.author/update, code.apply, experiment.run/note, improve.propose, verify, file.*, context.*) — kept registry-static so the Maple prompt cache still holds."
+    actionable_errors: "ACTIONABLE_HINTS map appends recovery guidance to failed command observations (artifact.author → supply complete input.source; preview.* → open first or pass sessionId; etc)."
+    self_describe: "New auto command agent.capabilities returns the live registry (commandId/label/capability/auto/approval/inputHint) + task autonomy — Maple can enumerate its own toolset, zero budget cost."
+    improve_lane: "improve.propose implemented (was a registered-but-handlerless command that always threw — the 'improve' intent could never finish). Bounded: {summary, rationale, files<=24 scoped via assertScopedPath, change<=8KB, confidence 0-1} → durable hemlock.agent.improve-proposal.v1 receipt in sipsDir/proposals/, deterministic content-hash id, receipt://proposed-improvement evidenceRef, never auto-applies. repo-map handler upgraded: fileCount/topDirs/keyFiles/workspaceDigest + repo://current-worktree evidenceRef, non-git fallback via rg --files."
+    self_edit_verified: "Read lane already defaulted to repoRoot; default thread workspaceRoot IS the Hemlock repo; code.apply writes via assertScopedPath with approved-plan + digest guards; verify profiles (app-build/diff-check/python-tests) run against this repo. Full self-improvement loop: improve intent → repo-map → receipts.query → improve.propose → code.apply → verify → remember."
+    renderer_qol: "ShortcutGuide 'Agent control' section (autonomy selector, steer:/campaign: prefixes, pause/resume, scored telemetry); autonomy badge on chat plan card + status bar; composer placeholder/hints advertise steer: while a task is active; queue readout with per-item cancel; conciseAgentNote covers paused/resumed/auto_approved/autonomy.bypass/scored/grafted/detached/steering.restarted; EventRow renders scored winner+margin compactly."
+    docs: "AGENTS.md added at repo root — architecture, invariants, test commands, self-improvement loop. Readable by any agent including Maple via file.read."
+  verification:
+    host_tests: "284/284"
+    ui_tests: "115/118 (3 skips); vite build clean; git diff --check clean"
+    electron_smoke: "38/38 real-Electron checks incl. agent.capabilities returning improve.propose with inputHint, and improve.propose writing a scoped durable receipt"
+  claim_boundary: "Prompt/contract/registry improvements verified by unit tests + build. Whether richer INPUT CONTRACTS measurably raise Maple's first-shot action validity needs a live lane run. Self-improvement apply path verified structurally (scoping + guards traced), not yet exercised end-to-end by Maple itself. No commit or push."
+dream_fuse_2026_09_20:
+  status: implemented
+  trigger: "User: weights do not have to be immutable — the SHA manifest immutability was an arbitrary older-model safeguard."
+  changes:
+    dream_fuse: "New explicit train-capability command dream.fuse: merges the active graft (or payload.adapterPath) into a NEW checkpoint via python -m mlx_lm fuse --model <base> --adapter-path <adapters> --save-path sipsDir/fused/maple-fused-<stamp> --trust-remote-code, verifies the fused checkpoint, restarts the server on it. Base dir untouched → dream.detach restarts on base path = free rollback. grafts.jsonl records kind:fused entries; events dream.fuse.started/dream.fused."
+    start_server: "startServer(adapterPath, modelOverride) — --model arg spliced on override; serverState.modelPath tracks the served checkpoint; detachGraft reports previousModel when reverting a fuse."
+    renderer: "Dream Lab Active graft card gains 'Fuse into weights' (confirmable) beside Detach; narration for dream.fuse.started/dream.fused; grove marks fused grafts with kind:'fused'."
+    helpers: "runPythonCommand(args,{timeoutMs}) — promisified spawnPython with stderr tail + 10m default timeout."
+  verification:
+    checks: "node --check clean; 284/284 host; 115/118 UI; vite build + diff clean. Fuse subprocess path NOT yet executed (needs a trained adapter + ~minutes of model load)."
+  claim_boundary: "Policy change: weights are mutable; the before/after SHA manifest remains as provenance evidence (training still verifies isolation during the run), and fuse is an explicit separate act that writes a new checkpoint rather than mutating in place — rollback is detach. Whether mlx_lm fuse handles Maple's 2-bit quantized custom layers (MapleSwitchGLU experts) is untested — first real fuse run will show it."

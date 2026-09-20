@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import copy
 import json
 import logging
 import pickle
@@ -204,6 +205,9 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+
+    prompt_suffix: Optional[str] = None
+    candidates: Optional[List[str]] = None
 
 
 @dataclass
@@ -691,6 +695,23 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                # Scoring requests never join a generation batch: they run
+                # a prefill plus one teacher-forced forward per candidate.
+                if getattr(request, "candidates", None) is not None:
+                    if batch_generator is not None:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+                    try:
+                        self.model_provider.load(
+                            args.model.model, args.model.adapter, args.model.draft
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+                    self._serve_score((rqueue, request, args))
+                    continue
+
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
@@ -1013,6 +1034,112 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
+    def _serve_score(self, request):
+        """Teacher-forced logprob scoring of candidate continuations.
+
+        Prefills the prompt once (reusing the LRU prompt cache for the
+        shared prefix), then scores each candidate against a deepcopy of
+        the prefilled cache — the parallel-constrained-decision pattern,
+        so hosts can pick an action by calibrated argmax instead of
+        autoregressive JSON generation.
+        """
+        rqueue, request, args = request
+        try:
+            model = self.model_provider.model
+            tokenizer = self.model_provider.tokenizer
+            model_key = self.model_provider.model_key
+
+            prompt, _, _, _ = self._tokenize(tokenizer, request, args)
+            if request.prompt_suffix:
+                prompt = prompt + tokenizer.encode(
+                    request.prompt_suffix, add_special_tokens=False
+                )
+            if not prompt:
+                rqueue.put(ValueError("score request has an empty prompt"))
+                return
+
+            self._log_cache_stats()
+            # Fetch the cache for all but the last prompt token, so the
+            # final token is always forwarded and its logits (which score
+            # the first candidate token) are available even on an exact
+            # prefix hit.
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                model_key, prompt[:-1]
+            )
+            prompt_cache_count = len(prompt) - 1 - len(rest)
+            if cache is None:
+                cache = make_prompt_cache(model)
+            to_feed = prompt[prompt_cache_count:]
+
+            # Prefill the uncached remainder exactly like chunked prefill,
+            # keeping the last-position logprobs for the first candidate
+            # token.
+            step_size = self.cli_args.prefill_step_size or 2048
+            logits = None
+            for i in range(0, len(to_feed), step_size):
+                logits = model(mx.array(to_feed[i : i + step_size])[None], cache=cache)
+                mx.eval([c.state for c in cache])
+            last_logprobs = logits[:, -1, :] - mx.logsumexp(
+                logits[:, -1, :].astype(mx.float32), axis=-1, keepdims=True
+            )
+            mx.eval(last_logprobs)
+            del logits
+
+            results = []
+            for text in request.candidates:
+                cand = tokenizer.encode(text, add_special_tokens=False)
+                if not cand:
+                    results.append(
+                        {
+                            "index": len(results),
+                            "text": text,
+                            "logprob": None,
+                            "avgLogprob": None,
+                            "tokens": 0,
+                        }
+                    )
+                    continue
+                # A fresh deepcopy per candidate: the shared prefilled cache
+                # is never mutated by candidate appends.
+                c_cache = copy.deepcopy(cache)
+                score = last_logprobs[0, cand[0]]
+                if len(cand) > 1:
+                    inp = mx.array(cand[:-1])[None]
+                    cand_logits = model(inp, cache=c_cache)
+                    log_probs = cand_logits.astype(mx.float32) - mx.logsumexp(
+                        cand_logits.astype(mx.float32), axis=-1, keepdims=True
+                    )
+                    targets = mx.array(cand[1:])[None, :, mx.newaxis]
+                    score = score + mx.take_along_axis(
+                        log_probs, targets, axis=-1
+                    ).sum()
+                mx.eval(score)
+                del c_cache
+                total = float(score.item())
+                results.append(
+                    {
+                        "index": len(results),
+                        "text": text,
+                        "logprob": total,
+                        "avgLogprob": total / len(cand),
+                        "tokens": len(cand),
+                    }
+                )
+
+            self.prompt_cache.insert_cache(model_key, prompt, cache)
+
+            rqueue.put(
+                {
+                    "schema": "hemlock.score.v1",
+                    "promptTokens": len(prompt),
+                    "cachedTokens": prompt_cache_count,
+                    "candidates": results,
+                }
+            )
+            rqueue.put(None)
+        except Exception as e:
+            rqueue.put(e)
+
     def generate(
         self,
         request: CompletionRequest,
@@ -1096,6 +1223,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/score": self.handle_score_request,
         }
 
         if self.path not in request_factories:
@@ -1202,8 +1330,17 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
-        self.handle_completion(request, stop_words)
+        try:
+            request = request_factories[self.path]()
+        except (AssertionError, ValueError) as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+        if request.candidates is not None:
+            self.handle_score(request, stop_words)
+        else:
+            self.handle_completion(request, stop_words)
 
     def _validate(
         self,
@@ -1619,6 +1756,92 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+        )
+
+    def handle_score_request(self) -> CompletionRequest:
+        """
+        Build a scoring request: a chat/text prompt plus candidate
+        continuations whose conditional logprobs are compared host-side.
+        """
+        body = self.body
+        candidates = body.get("candidates")
+        if (
+            not isinstance(candidates, list)
+            or not candidates
+            or len(candidates) > 256
+            or not all(isinstance(c, str) for c in candidates)
+        ):
+            raise ValueError(
+                "score requests need a non-empty 'candidates' list of strings (max 256)"
+            )
+        self.request_id = f"score-{uuid.uuid4()}"
+        self.object_type = "score.result"
+        request = CompletionRequest(
+            "chat" if "messages" in body else "text",
+            body.get("prompt", ""),
+            body.get("messages") or [],
+            None,
+            body.get("role_mapping"),
+            body.get("prompt_suffix"),
+            candidates,
+        )
+        return request
+
+    def handle_score(self, request: CompletionRequest, stop_words: List[str]):
+        """Run candidate scoring and return the result as a single JSON body."""
+        args = GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+                presence_penalty=self.presence_penalty,
+                presence_context_size=self.presence_context_size,
+                frequency_penalty=self.frequency_penalty,
+                frequency_context_size=self.frequency_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+            ngram_draft=bool(self.ngram_draft),
+            ngram_window=int(self.ngram_window),
+        )
+
+        try:
+            ctx, _ = self.response_generator.generate(request, args)
+        except Exception as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
+        self._set_completion_headers(200)
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(
+                {
+                    "id": self.request_id,
+                    "object": self.object_type,
+                    "model": self.requested_model,
+                    **ctx,
+                }
+            ).encode()
         )
 
     def handle_text_completions(self) -> CompletionRequest:
