@@ -7,9 +7,9 @@ const crypto = require("node:crypto");
 const { ContextBroker } = require("./context_broker.cjs");
 const { AgentKernel } = require("./agent_kernel.cjs");
 const { AgentOrchestrator } = require("./agent_orchestrator.cjs");
-const { AgentIntentQueue, isActiveTask } = require("./agent_queue.cjs");
+const { AgentIntentQueue, isActiveTask, safePayload } = require("./agent_queue.cjs");
 const { DEFAULT_BUDGET, mergeBudget, clampBudgetOverrides, compactObservation } = require("./agent_contracts.cjs");
-const { ThreadManager, DEFAULT_PROVIDER_CAPS, workspaceFingerprint } = require("./thread_manager.cjs");
+const { ThreadManager, DEFAULT_PROVIDER_CAPS, PARKABLE_THREAD_STATUSES, workspaceFingerprint } = require("./thread_manager.cjs");
 const { CodingWorkspace } = require("./coding_workspace.cjs");
 const { CodingAutopilot } = require("./coding_autopilot.cjs");
 const { chooseVerificationProfile, verificationSummary, skippedVerification } = require("./verification_profile.cjs");
@@ -18,12 +18,13 @@ const { ContextSourceRegistry } = require("./context_sources.cjs");
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { ChangeSetApplier } = require("./changeset_apply.cjs");
 const { PreviewSessionManager } = require("./preview_policy.cjs");
-const { recordCrash, shouldRespawn } = require("./crash_policy.cjs");
+const { recordCrash, sanitizeCrashHistory, shouldRespawn } = require("./crash_policy.cjs");
+const { createHealthMonitor } = require("./health_monitor.cjs");
 const { nextReadinessDelay, classifyHealthFailure, missingCheckpointItem } = require("./readiness_probe.cjs"); // T9-H1
 const { cacheStats } = require("./prompt_cache_stats.cjs");
 const { Utf8SseParser, parseSsePayload, extractModelChannels, extractModelDelta, compactModelPayload, selectStructuredActionText, streamStateSnapshot, createStreamId, shouldCheckpointStream, digest: streamDigest } = require("./stream_protocol.cjs");
 const { createStreamFrameCoalescer } = require("./stream_dispatcher.cjs");
-const { firstTokenWatchdog } = require("./stream_watchdog.cjs");
+const { firstTokenWatchdog, DEFAULT_STALL_MS } = require("./stream_watchdog.cjs");
 const {
   PROVIDER_DEFINITIONS,
   normalizeSelection,
@@ -41,7 +42,9 @@ const { applyDigestCompaction, insertDigestBlock } = require("./thread_digest.cj
 const { verifyArtifactSource, verifyPreviewReport } = require("./artifact_verifier.cjs");
 const { createWorkNotifier, trackChatResponseJob } = require("./work_notifications.cjs");
 const { COMPARISON_SCHEMA, canRunComparison, lastUserMessage, buildComparisonRecord } = require("./comparison_lane.cjs");
-const { runExperiment, EXPERIMENTS } = require("./physics_sandbox.cjs");
+const { runExperiment, EXPERIMENTS, suggestExperiments } = require("./physics_sandbox.cjs");
+const { resolveExec, EXEC_OUTPUT_LIMIT } = require("./shell_exec.cjs");
+const { appendJsonlLine, quarantineCorruptFile, readJsonFile: readJsonDurable, readJsonlFile, writeFileAtomic, writeJsonAtomic } = require("./durable_io.cjs");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -211,7 +214,7 @@ function persistModelOutput({ taskId, operationId = null, streamId = null, mode 
     rawPayload,
     createdAt: new Date().toISOString(),
   };
-  fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf-8");
+  writeJsonAtomic(filePath, record);
   return filePath;
 }
 
@@ -264,8 +267,8 @@ function assertDreamStorage(runDir) {
       modelPath,
     }, { reversible: true });
     throw new Error(
-      `Dream is blocked by storage pressure: ${Math.round(storage.freeBytes / 1024 ** 3)} GiB free, ` +
-      `but Hemlock requires at least ${Math.round(minimumDreamFreeBytes / 1024 ** 3)} GiB. ` +
+      `Dream is blocked by storage pressure: ${(storage.freeBytes / 1024 ** 3).toFixed(1)} GiB free, ` +
+      `but Hemlock requires at least ${(minimumDreamFreeBytes / 1024 ** 3).toFixed(1)} GiB. ` +
       "Clear transient training data or choose a larger local volume before retrying.",
     );
   }
@@ -278,49 +281,72 @@ const serverScript = "-m";
 // constrained machine with HEMLOCK_MAPLE_MAX_TOKENS.
 const requestedMapleMaxTokens = Number(process.env.HEMLOCK_MAPLE_MAX_TOKENS);
 const mapleMaxTokens = Number.isFinite(requestedMapleMaxTokens)
-  ? Math.max(4096, requestedMapleMaxTokens)
+  ? Math.max(8192, requestedMapleMaxTokens)
   : 16384;
 const maplePromptCacheSize = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE))
   ? Math.max(1, Math.min(16, Number(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_SIZE)))
   : 12;
-const maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "768M");
+
+// ── Maple-Preview performance optimizations ──────────────────────────────
+//
+// 1. KV cache quantization (--kv-bits): opt-in via HEMLOCK_KV_BITS (0 =
+//    disabled, the default). Maple mixes cache types: the 18 sliding-window
+//    layers run RotatingKVCache (cannot quantize — mlx_lm leaves them exact)
+//    while the 6 full-attention layers convert to QuantizedKVCache once the
+//    cache grows past --quantized-kv-start tokens (HEMLOCK_KV_QUANT_START,
+//    server default 5000). Below that threshold decoding is bit-exact;
+//    past it, full-layer KV reads shrink ~2x at 8 bits / ~4x at 4 bits,
+//    which speeds up long-context decode and raises the practical context
+//    ceiling. It is a numerics change past the start point, so it stays
+//    opt-in: prefer 8 (near-lossless) over 4.
+//    History: an earlier revision crashed here — maybe_quantize_kv_cache
+//    called to_quantized() on every cache exposing the method, and
+//    RotatingKVCache's stub raises NotImplementedError which aborted the
+//    GPU command buffer (SIGABRT) mid-session. The fork now quantizes only
+//    true KVCache entries, so enabling this is safe.
+//
+// 2. Prefill step size (--prefill-step-size): smaller chunks improve
+//    responsiveness on long prompts. Tune with HEMLOCK_PREFILL_STEP_SIZE.
+// Persistent cross-restart prompt caching (--prompt-cache-file): the forked
+// mlx_lm server saves the K most-recent prompt-cache entries (default 4,
+// HEMLOCK_PROMPT_CACHE_SLOTS to tune; 1 = legacy single-entry file) as
+// per-entry safetensors plus a manifest on shutdown and reloads them on
+// boot (validates model_key before trusting). Wired into serverArgs below;
+// HEMLOCK_NO_CACHE_FILE=1 disables.
+// n-gram speculative drafting is architecturally incompatible with Maple
+// (SWA-512 RotatingKVCache defeats the verifier's cache rewind —
+// mlx_lm/speculative.py:476 fallback). FlashHead (checkpoint flash_head) is
+// the decode-speed lever; enabled below.
+const mapleKvBits = Number.isFinite(Number(process.env.HEMLOCK_KV_BITS))
+  ? Math.max(0, Math.min(8, Math.round(Number(process.env.HEMLOCK_KV_BITS))))
+  : 0;
+const mapleKvQuantStart = Number.isInteger(Number(process.env.HEMLOCK_KV_QUANT_START))
+  ? Math.max(0, Number(process.env.HEMLOCK_KV_QUANT_START))
+  : 5000;
+const maplePrefillStepSize = Number.isInteger(Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  ? Math.max(256, Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
+  : 1024;
+
+// Prompt-cache byte cap — each entry persists a whole KV state. One
+// ~64k-token entry is ~768MB of fp16 full-attention KV (6 layers ×
+// 2KB/token/layer) plus ~18MB of exact sliding-window cache (18 layers × a
+// 512-token window × 2KB/token). With --kv-bits the full layers shrink ~2x
+// at 8-bit / ~4x at 4-bit — a 64k entry is ~384MB at 8 bits — so two hot
+// 64k entries plus sliding overhead fit in ~800MB and the default rises to
+// 1G. Exact KV stays at 768M, room for one full 64k entry.
+// HEMLOCK_MAPLE_PROMPT_CACHE_BYTES always wins; applyRuntimeSettingEnv
+// re-derives this default when kvBits changes live.
+function defaultMaplePromptCacheBytes(kvBits) {
+  return kvBits > 0 ? "1G" : "768M";
+}
+let maplePromptCacheBytes = String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || defaultMaplePromptCacheBytes(mapleKvBits));
+
 const maplePromptConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_PROMPT_CONCURRENCY)))
   : 1;
 const mapleDecodeConcurrency = Number.isInteger(Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY))
   ? Math.max(1, Math.min(4, Number(process.env.HEMLOCK_MAPLE_DECODE_CONCURRENCY)))
   : 1;
-
-// ── Maple-Preview performance optimizations ──────────────────────────────
-//
-// 1. KV cache quantization (--kv-bits): 4-bit reduces KV cache memory by
-//    ~75%, letting the prompt cache hold more entries and context extend
-//    farther on the same hardware. Disable with HEMLOCK_KV_BITS=0.
-//
-// 2. Prefill step size (--prefill-step-size): smaller chunks improve
-//    responsiveness on long prompts. Tune with HEMLOCK_PREFILL_STEP_SIZE.
-// Persistent cross-restart prompt caching (--prompt-cache-file) is NOT available:
-// mlx_lm's HTTP server exposes only in-memory --prompt-cache-size/--prompt-cache-bytes
-// (both already tuned below); the on-disk cache flag exists only in generate.py CLI.
-// Verified 2026-08-22 — do not re-attempt against this server without an upstream change.
-// n-gram speculative drafting is architecturally incompatible with Maple
-// (SWA-512 RotatingKVCache defeats the verifier's cache rewind —
-// mlx_lm/speculative.py:476 fallback). FlashHead (checkpoint flash_head) is
-// the decode-speed lever; enabled below.
-// KV cache quantization is DISABLED by default (HEMLOCK_KV_BITS=0). The
-// maple-2bit-mlx model uses a RotatingKVCache, and MLX raises
-// `NotImplementedError: RotatingKVCache Quantization NYI` then aborts the GPU
-// command buffer (SIGABRT) when --kv-bits is set. That silently kills the
-// server mid-session and the app records an empty `conversation-failed`
-// inference — the real cause of "Maple-Preview never responds". Only enable
-// it if a future model uses a quantizable KV cache; override with
-// HEMLOCK_KV_BITS=n (0 disables).
-const mapleKvBits = Number.isFinite(Number(process.env.HEMLOCK_KV_BITS))
-  ? Math.max(0, Math.min(8, Math.round(Number(process.env.HEMLOCK_KV_BITS))))
-  : 0;
-const maplePrefillStepSize = Number.isInteger(Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
-  ? Math.max(256, Number(process.env.HEMLOCK_PREFILL_STEP_SIZE))
-  : 1024;
 
 const serverArgs = [
   "mlx_lm",
@@ -352,20 +378,31 @@ const serverArgs = [
   "--log-level",
   "INFO",
   // ── Performance optimizations ──────────────────────────────
-  // KV cache quantization: 4-bit saves ~75% KV cache memory
-  ...(mapleKvBits > 0 ? ["--kv-bits", String(mapleKvBits)] : []),
+  // KV cache quantization (opt-in): full-attention layers only, past
+  // --quantized-kv-start; sliding layers stay exact RotatingKVCache.
+  ...(mapleKvBits > 0
+    ? ["--kv-bits", String(mapleKvBits), "--quantized-kv-start", String(mapleKvQuantStart)]
+    : []),
   // Prefill in smaller chunks for better responsiveness
   "--prefill-step-size",
   String(maplePrefillStepSize),
+  // Persist the hottest prompt-cache entry across restarts: the runtime
+  // evidence shows a 3–12× first-inference penalty on a cold KV cache. The
+  // server validates model_key before trusting the file; corruption or a
+  // checkpoint change cold-starts cleanly. HEMLOCK_NO_CACHE_FILE=1 disables.
+  "--prompt-cache-file",
+  path.join(runtimeDataRoot, "maple-prompt-cache.safetensors"),
 ];
 const serverUrl = "http://127.0.0.1:8080";
-const readinessTimeoutMs = 180000;
-const inferenceProbeTimeoutMs = 180000;
+// 2-bit Maple cold loads (weights + KV cache + adapters) can exceed three
+// minutes on constrained hardware; readiness waits are sized for that.
+const readinessTimeoutMs = 300000;
+const inferenceProbeTimeoutMs = 300000;
 // Maple can spend several minutes on a short visible response because its
 // reasoning channel is emitted before content. Do not mistake that honest
 // latency for an empty response; cancellation and steering still abort the
 // active request immediately.
-const inferenceTimeoutMs = Math.max(30000, Number(process.env.HEMLOCK_INFERENCE_TIMEOUT_MS || 600000));
+const inferenceTimeoutMs = Math.max(30000, Number(process.env.HEMLOCK_INFERENCE_TIMEOUT_MS || 900000));
 
 const isDev = !app.isPackaged;
 
@@ -407,6 +444,23 @@ function createWindow() {
     void target;
     return { action: "deny" };
   });
+  // Renderer health: record every crash durably, auto-reload at most once
+  // per window per minute so a crash loop cannot reload-loop, and never
+  // auto-act on "unresponsive" — a busy renderer is not a dead one.
+  window.webContents.on("render-process-gone", (_event, details = {}) => {
+    appendAgentEvent("renderer.crashed", "failed", { reason: String(details?.reason || "unknown"), exitCode: details?.exitCode ?? null, windowId: window.id }, { reversible: false });
+    const lastReloadAt = rendererLastReloadAt.get(window.id) || 0;
+    if (window.isDestroyed()) return;
+    if (Date.now() - lastReloadAt >= 60000) {
+      rendererLastReloadAt.set(window.id, Date.now());
+      try { window.webContents.reload(); } catch { /* window may be mid-teardown */ }
+    } else {
+      appendAgentEvent("renderer.reload.suppressed", "degraded", { windowId: window.id, reason: "auto-reload budget exhausted (1 per 60s)" }, { reversible: false });
+    }
+  });
+  window.webContents.on("unresponsive", () => {
+    appendAgentEvent("renderer.unresponsive", "degraded", { windowId: window.id }, { reversible: false });
+  });
 }
 
 let serverProcess = null;
@@ -417,7 +471,12 @@ let sipsCycleActive = false;
 const activeChildren = new Set();
 let serverState = { processReady: false, inferenceReady: false, adapterPath: "" };
 let serverLaunchPromise = null;
-let mapleCrashTimestamps = []; // bounded respawn budget (crash_policy.cjs)
+let mapleCrashTimestamps = []; // bounded respawn budget (crash_policy.cjs); persisted in each session's maple-runtime.json
+let mapleHealthMonitor = null; // created lazily by syncMapleHealthMonitor
+let mapleWarmupPromise = null; // in-flight post-launch inference probe
+let mapleRespawnPendingResume = false; // an unexpected exit happened while a task was mid-loop
+const taskMapleExitCounts = new Map(); // taskId -> unexpected exits observed while that task was active
+const rendererLastReloadAt = new Map(); // window.id -> last auto-reload ms (bounded renderer crash recovery)
 let agentInferenceEndpoint = serverUrl;
 const providerStatusCache = new Map();
 const activeStreams = new Map();
@@ -606,35 +665,114 @@ const previousSessionId = fs.readdirSync(sessionsDir, { withFileTypes: true })
 const previousSessionDir = previousSessionId ? path.join(sessionsDir, previousSessionId) : "";
 const previousStatePath = previousSessionDir ? path.join(previousSessionDir, "state.json") : "";
 const previousEventsPath = previousSessionDir ? path.join(previousSessionDir, "events.jsonl") : "";
-const readJsonFile = (filePath, fallback) => {
-  try { return JSON.parse(fs.readFileSync(filePath, "utf-8")); } catch { return fallback; }
-};
+// Integrity recovery journal: every corrupt durable file that gets rebuilt
+// from defaults or a last-good backup is buffered here and emitted as a
+// durable `integrity.recovered` event once this session's events.jsonl exists
+// (early boot reads happen before sessionDir is created).
+const pendingIntegrityRecoveries = [];
+const integrityNotedKeys = new Set();
+let integrityJournalReady = false;
+
+function noteIntegrityRecovery(recovery = {}) {
+  const key = `${recovery.file || ""}|${recovery.reason || ""}`;
+  if (integrityNotedKeys.has(key)) return;
+  integrityNotedKeys.add(key);
+  pendingIntegrityRecoveries.push(recovery);
+  flushIntegrityRecoveries();
+}
+
+function flushIntegrityRecoveries() {
+  if (!integrityJournalReady) return;
+  while (pendingIntegrityRecoveries.length) {
+    const recovery = pendingIntegrityRecoveries.shift();
+    try {
+      appendAgentEvent("integrity.recovered", "degraded", {
+        ...recovery,
+        claimBoundary: "The corrupt file was quarantined (never deleted) and rebuilt from defaults or the last-good copy; the listed content was lost.",
+      }, { evidenceRefs: [recovery.file, recovery.quarantinePath].filter(Boolean), reversible: false });
+    } catch (error) {
+      pendingIntegrityRecoveries.unshift(recovery);
+      console.warn(`[hemlock] integrity event could not be journaled: ${error.message}`);
+      break;
+    }
+  }
+}
+
+// readJsonFile is the shared durable-JSON reader: a file that exists but does
+// not parse is quarantined (renamed, never deleted) and reported through the
+// integrity journal; the caller rebuilds from `fallback` (or the optional
+// `backupPath` last-good copy). Missing files return the fallback silently.
+const readJsonFile = (filePath, fallback, options = {}) =>
+  readJsonDurable(filePath, fallback, { ...options, onIntegrity: noteIntegrityRecovery });
 const readEventLog = (filePath) => {
   if (!filePath) return [];
-  try {
-    return fs.readFileSync(filePath, "utf-8").split(/\r?\n/).filter(Boolean).flatMap((line) => {
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
-  } catch { return []; }
+  return readJsonlFile(filePath, { label: "session-events", onIntegrity: noteIntegrityRecovery }).rows;
 };
-const previousTask = previousStatePath ? readJsonFile(previousStatePath, {}).task : null;
+// A corrupt previous state.json recovers from the .bak copy writeAgentState
+// rotates next to it; with no usable backup the session restores defaults and
+// the integrity journal records what was lost.
+const previousState = previousStatePath ? readJsonFile(previousStatePath, {}, { label: "session-state", backupPath: `${previousStatePath}.bak` }) : {};
+// writeAgentState persists a BARE task snapshot ({...agentTask, pendingIntents})
+// carrying schema "hemlock.agent.task.v1"; earlier builds wrapped it in an
+// envelope ({task: {...}}). Accept both shapes so the restore path stays live.
+const previousTask = previousState?.schema === "hemlock.agent.task.v1"
+  ? previousState
+  : (previousState?.task && typeof previousState.task === "object" ? previousState.task : null);
+// Pending queue intents persist as a field of the session state file (see
+// writeAgentState). They restore as queued — never auto-executed.
+const previousPendingIntents = Array.isArray(previousState?.pendingIntents) ? previousState.pendingIntents : [];
 const shouldResumeTask = previousTask && ["accepted", "planning", "running", "waiting_for_approval", "verifying", "blocked"].includes(previousTask.status);
-const threadManager = new ThreadManager({ root: runtimeDataRoot, defaultWorkspaceRoot: previousTask?.workspaceRoot || repoRoot, providerCaps: DEFAULT_PROVIDER_CAPS });
+const threadManager = new ThreadManager({ root: runtimeDataRoot, defaultWorkspaceRoot: previousTask?.workspaceRoot || repoRoot, providerCaps: DEFAULT_PROVIDER_CAPS, onIntegrity: noteIntegrityRecovery });
 const restoredThread = previousTask?.threadId ? threadManager.thread(previousTask.threadId) : null;
-const defaultThread = restoredThread || threadManager.ensureDefaultThread({ workspaceRoot: previousTask?.workspaceRoot || repoRoot, task: previousTask });
+// Never seed a fresh default thread with the dead session's live status — a
+// resumable snapshot is parked blocked here exactly like agentTask below.
+const defaultThread = restoredThread || threadManager.ensureDefaultThread({ workspaceRoot: previousTask?.workspaceRoot || repoRoot, task: shouldResumeTask ? { ...previousTask, status: "blocked", phase: "resume" } : previousTask });
+// A crash can also leave an existing registry thread stamped with a live
+// status ("running", "waiting_for_approval", ...) while no process performs
+// it. Park it paused — same shape as parkForSwitch — so the restored registry
+// never claims work that cannot be running. Parked threads stay resumable
+// through thread.resume; terminal/archived threads are untouched.
+const parkedBootThreadIds = [];
+for (const thread of [...new Set([restoredThread, defaultThread].filter(Boolean))]) {
+  if (!PARKABLE_THREAD_STATUSES.has(thread.status)) continue;
+  try {
+    threadManager.checkpoint(thread.id, { taskId: thread.taskSnapshot?.id || thread.taskId, phase: "paused", status: "paused", reason: "session-restarted-mid-task" });
+  } catch { /* a missing workspace must not block the boot */ }
+  const parkedSnapshot = thread.taskSnapshot && typeof thread.taskSnapshot === "object"
+    ? { ...thread.taskSnapshot, status: "paused", phase: "paused", blockedReason: thread.taskSnapshot.blockedReason || "The previous session was interrupted; inspect and resume the task." }
+    : null;
+  threadManager.updateThread(thread.id, {
+    status: "paused",
+    phase: "paused",
+    blockedReason: "The previous session was interrupted; inspect and resume the task.",
+    ...(parkedSnapshot ? { taskSnapshot: parkedSnapshot } : {}),
+  });
+  parkedBootThreadIds.push(thread.id);
+}
 const sessionId = `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
 const sessionDir = path.join(sessionsDir, sessionId);
 const sessionEventsPath = path.join(sessionDir, "events.jsonl");
 const sessionStatePath = path.join(sessionDir, "state.json");
+const mapleRuntimeStatePath = path.join(sessionDir, "maple-runtime.json");
+const previousMapleRuntimeStatePath = previousSessionDir ? path.join(previousSessionDir, "maple-runtime.json") : "";
+// Crash-loop memory survives an app restart: load the previous session's
+// persisted timestamps, pruned to the live window at load.
+mapleCrashTimestamps = sanitizeCrashHistory(readJsonFile(previousMapleRuntimeStatePath, {}, { label: "maple-runtime-state" }).mapleCrashTimestamps);
 // World habitat: deterministic experiment receipts and the findings dataset
 // that Dream consumes. Both live beside the other SIPS artifacts so the same
 // storage boundary rules apply.
 const experimentDatasetPath = path.join(sipsDir, "experiment-dataset.jsonl");
 const experimentReceiptsDir = path.join(sipsDir, "experiments");
 const experimentRuns = new Map(); // this-session run receipts for finding citation
-const agentEvents = readEventLog(previousEventsPath).slice(-120);
+const agentEvents = readEventLog(previousEventsPath).slice(-240);
 const agentEventIds = new Set(agentEvents.map((event) => event.id).filter(Boolean));
 let sessionClosed = false;
+// Declared before the first writeAgentState() call: the state writer reads
+// the queue's pending list once the queue exists, and `let` would throw a
+// TDZ error if a write landed before the declaration line ran.
+let agentKernel = null;
+let agentOrchestrator = null;
+let agentIntentQueue = null;
 let agentTask = {
   schema: "hemlock.agent.task.v1",
   id: shouldResumeTask ? previousTask.id : `task-${sessionId}`,
@@ -651,15 +789,27 @@ let agentTask = {
   budget: shouldResumeTask ? mergeBudget(previousTask.budget || DEFAULT_BUDGET) : mergeBudget(DEFAULT_BUDGET),
   steering: shouldResumeTask ? (previousTask.steering || []) : [],
   evidenceRefs: shouldResumeTask ? (previousTask.evidenceRefs || []) : [],
-  blockedReason: shouldResumeTask ? `Hemlock restarted during the previous ${previousSessionId} session; no operation was resumed automatically.` : null,
-  artifactRepair: shouldResumeTask ? (previousTask.artifactRepair || { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
-  codeRepair: shouldResumeTask ? (previousTask.codeRepair || { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
+  // Same staleness guard as thread.switch: the snapshot's sessionId belongs to
+  // a dead session (boot always mints a fresh one), so a resumable previous
+  // task restores as blocked — never auto-runs.
+  blockedReason: shouldResumeTask ? "The previous session was interrupted; inspect and resume the task." : null,
+  artifactRepair: shouldResumeTask ? (previousTask.artifactRepair || { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxArtifactRepairs, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxArtifactRepairs, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
+  codeRepair: shouldResumeTask ? (previousTask.codeRepair || { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxCodeRepairs, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" }) : { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxCodeRepairs, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
   metrics: shouldResumeTask ? (previousTask.metrics || { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 }) : { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 },
   startedAt: shouldResumeTask ? (previousTask.startedAt || new Date().toISOString()) : new Date().toISOString(),
+  // Which live session owns this task's action loop. A taskSnapshot restored
+  // with a different sessionId belongs to a dead process — its loop can never
+  // run again, so it must restore as blocked rather than "running".
+  sessionId,
   updatedAt: new Date().toISOString(),
 };
 
 fs.mkdirSync(sessionDir, { recursive: true });
+// The events journal is live from here: any integrity recoveries buffered by
+// the boot-time reads above (state.json, registry, maple-runtime) are now
+// emitted as durable integrity.recovered events.
+integrityJournalReady = true;
+flushIntegrityRecoveries();
 // Persist the initial task state immediately. Without this, the session's
 // state.json on disk can still describe the *previous* session's task (e.g.
 // status "running" from a session that crashed mid-task), and a later
@@ -667,9 +817,7 @@ fs.mkdirSync(sessionDir, { recursive: true });
 // an action loop that can never run.
 writeAgentState();
 
-let agentKernel = new AgentKernel({ root: runtimeDataRoot, repoRoot, task: agentTask });
-let agentOrchestrator = null;
-let agentIntentQueue = null;
+agentKernel = new AgentKernel({ root: runtimeDataRoot, repoRoot, task: agentTask, onIntegrity: noteIntegrityRecovery });
 
 function artifactEvent(type, status, payload, evidenceRefs = []) {
   const artifact = payload?.artifact;
@@ -717,8 +865,7 @@ function recordPreviewReport(report = {}) {
     verification,
   };
   const receiptPath = previewReceiptPath(session);
-  fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
-  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+  writeJsonAtomic(receiptPath, receipt);
   const stored = { ...verification, receiptPath, evidenceRefs: [artifactRegistry.manifestPath(session.taskId, session.artifactId), receiptPath] };
   previewReportCache.set(previewReportKey(session), stored);
   previewSessions.recordReport(session.id, stored);
@@ -733,7 +880,7 @@ function recordPreviewReport(report = {}) {
   return stored;
 }
 
-function awaitPreviewReport(session, timeoutMs = 8000) {
+function awaitPreviewReport(session, timeoutMs = 20000) {
   const cached = previewReportCache.get(previewReportKey(session));
   if (cached) return Promise.resolve(cached);
   const existing = previewReportWaiters.get(session.id);
@@ -768,9 +915,25 @@ function artifactCommandReceipt(result, command) {
 }
 
 function writeAgentState() {
-  const tempPath = `${sessionStatePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(agentTask, null, 2)}\n`, "utf-8");
-  fs.renameSync(tempPath, sessionStatePath);
+  // Pending queue intents ride the session state file as an additive field,
+  // so a restart restores them as queued work instead of losing them. The
+  // file otherwise stays a flat task snapshot (existing readers untouched).
+  const pendingIntents = agentIntentQueue?.persistablePending?.() || [];
+  // Temp + fsync + rename — a crash mid-write must not produce the truncated
+  // state.json a restart would then "restore". The .bak copy is the
+  // last-good fallback the boot reader uses when the primary is corrupt.
+  writeJsonAtomic(sessionStatePath, { ...agentTask, pendingIntents });
+  try { fs.copyFileSync(sessionStatePath, `${sessionStatePath}.bak`); } catch { /* backup is best-effort */ }
+}
+
+// Persist the crash-loop budget beside the session's state.json so an app
+// restart inherits it (load site: previousMapleRuntimeStatePath at boot).
+function persistMapleRuntimeState() {
+  try {
+    writeJsonAtomic(mapleRuntimeStatePath, { schema: "hemlock.maple.runtime-state.v1", mapleCrashTimestamps, updatedAt: new Date().toISOString() });
+  } catch (error) {
+    console.warn(`[hemlock] maple runtime state persist skipped: ${error.message}`);
+  }
 }
 
 function appendAgentEvent(type, status = "observed", payload = {}, options = {}) {
@@ -791,7 +954,7 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
   if (agentEventIds.has(event.id)) return event;
   agentEventIds.add(event.id);
   // T11-A: the dedup set grew one entry per event for the process lifetime
-  // (agentEvents itself is capped at 160, but this Set never was). Bound it to
+  // (agentEvents itself is capped, but this Set never was). Bound it to
   // a recent window — insertion order makes oldest ids drop first, so retry-
   // window dedup semantics are preserved while memory stays flat.
   if (agentEventIds.size > AGENT_EVENT_ID_WINDOW) {
@@ -801,8 +964,11 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
     }
   }
   agentEvents.push(event);
-  if (agentEvents.length > 160) agentEvents.shift();
-  fs.appendFileSync(sessionEventsPath, `${JSON.stringify(event)}\n`, "utf-8");
+  if (agentEvents.length > 400) agentEvents.shift();
+  // fsync'd journal append: the event is durable before this returns, and a
+  // torn tail line (killed mid-append) is dropped by readEventLog's per-line
+  // recovery rather than corrupting the journal.
+  appendJsonlLine(sessionEventsPath, event);
   agentKernel?.ingestEvent(event);
   if (agentTask.threadId && ["plan.proposed", "plan.approved", "inference.started", "inference.completed", "command.started", "command.completed", "artifact.repair.started", "artifact.repair.completed", "task.blocked", "task.completed", "thread.switched"].includes(type)) {
     try {
@@ -816,6 +982,11 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
         artifactRepair: agentTask.artifactRepair || null,
         verificationIssues: agentTask.artifactRepair?.issues || agentTask.codeRepair?.issues || [],
         reason: type,
+        // A bare event type ("command.started") is not a legible cause —
+        // blocked checkpoints carry the model's own declared reason.
+        blockedReason: type === "task.blocked"
+          ? String(payload?.reason || payload?.error || agentTask.blockedReason || "unspecified").slice(0, 500)
+          : null,
       });
     } catch (checkpointError) {
       console.warn(`[hemlock] checkpoint skipped: ${checkpointError.message}`);
@@ -823,6 +994,22 @@ function appendAgentEvent(type, status = "observed", payload = {}, options = {})
   }
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send("agent:event", event);
   return event;
+}
+
+// Fatal-error receipts: observe and persist before the process exits. The
+// ~2KB stack bound keeps a pathological trace from flooding the journal.
+// Never throws — a crash-time write must not mask the original failure.
+function recordRuntimeError(kind, error) {
+  try {
+    const err = error instanceof Error ? error : new Error(String(error));
+    appendAgentEvent("runtime.error", "failed", {
+      kind,
+      message: String(err.message || err).slice(0, 2000),
+      stack: String(err.stack || "").slice(0, 2048),
+    }, { reversible: false });
+  } catch (recordError) {
+    console.error(`[hemlock] runtime.error event failed: ${recordError.message}`);
+  }
 }
 
 function emitStreamFrame(stream, { delta = "", channel = "content", terminal = false, status = "running", usage = null, stopReason = null, time = null } = {}) {
@@ -969,6 +1156,40 @@ const codingWorkspace = new CodingWorkspace({
 });
 
 function updateAgentTask(patch, { emit = true } = {}) {
+  // A new objective landing on a non-active task is a new intent, not an
+  // edit: mint a fresh task id + budget so the previous task keeps its own
+  // objective, metrics, and terminal record. Observed bug: a stale task
+  // resumed across a restart had its objective overwritten by "Run local
+  // Dream", and its spent training budget then blocked the launch.
+  const retargeted = typeof patch?.objective === "string"
+    && patch.objective.trim()
+    && patch.objective !== agentTask.objective
+    && patch.id === undefined
+    && !isActiveTask(agentTask);
+  if (retargeted) {
+    const previousTaskId = agentTask.id;
+    const previousObjective = agentTask.objective;
+    patch = {
+      status: "accepted",
+      phase: "ready",
+      budget: mergeBudget(DEFAULT_BUDGET),
+      activePlanId: null,
+      activeActionId: null,
+      steering: [],
+      evidenceRefs: [],
+      blockedReason: null,
+      fallbackLane: null, // a minted task inherits no lane override; env default applies
+      artifactRepair: { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxArtifactRepairs, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
+      codeRepair: { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxCodeRepairs, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
+      metrics: { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 },
+      startedAt: new Date().toISOString(),
+      ...patch,
+      // The minted id and the superseded-task link always win over the patch.
+      id: `task-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 7)}`,
+      retargetedFromTaskId: previousTaskId,
+    };
+    appendAgentEvent("task.retargeted", "accepted", { previousTaskId, previousObjective, taskId: patch.id, objective: patch.objective }, { reversible: true });
+  }
   // T7-S1: pin the pending question durably on the projection while the task
   // waits on the user (Chat reads task.question), and clear it the moment the
   // phase moves on so a stale question never lingers.
@@ -977,7 +1198,7 @@ function updateAgentTask(patch, { emit = true } = {}) {
   } else if (patch.phase && patch.phase !== "waiting_for_user" && patch.question === undefined) {
     patch = { ...patch, question: null };
   }
-  agentTask = { ...agentTask, ...patch, updatedAt: new Date().toISOString() };
+  agentTask = { ...agentTask, sessionId, ...patch, updatedAt: new Date().toISOString() };
   writeAgentState();
   agentKernel?.syncTask(agentTask);
   const activeThread = agentTask.threadId ? threadManager.thread(agentTask.threadId) : null;
@@ -1000,6 +1221,9 @@ function updateAgentTask(patch, { emit = true } = {}) {
     });
   }
   if (emit) appendAgentEvent("task.updated", agentTask.status, { task: agentTask });
+  // The /health monitor follows the task lifecycle: it polls only while a
+  // task is mid-loop and a server is expected to answer.
+  try { syncMapleHealthMonitor(); } catch { /* health monitor is advisory */ }
   return agentTask;
 }
 
@@ -1045,7 +1269,8 @@ function getAgentState() {
     contextSources: contextSources.getState(),
     queue: agentIntentQueue?.snapshot() || { schema: "hemlock.agent.queue.v1", active: null, pending: [], count: 0 },
     experimentDataset: experimentDatasetSummary(),
-    events: agentEvents.slice(-80),
+    world: readWorldMarkers(48),
+    events: agentEvents.slice(-160),
     commands: Object.entries(agentCommands).map(([id, descriptor]) => ({ id, ...descriptor })),
   };
 }
@@ -1054,16 +1279,7 @@ function getAgentState() {
 // Maple proposes; the host simulates deterministically and keeps the receipts.
 
 function readExperimentRows(limit = 400) {
-  let lines = [];
-  try {
-    lines = fs.readFileSync(experimentDatasetPath, "utf8").split("\n").filter(Boolean).slice(-limit);
-  } catch {
-    lines = [];
-  }
-  const rows = lines.map((line) => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter((row) => row?.schema === "hemlock.world.finding.v1");
-  return { rows, count: rows.length };
+  return readJsonlFile(experimentDatasetPath, { tail: limit, schema: "hemlock.world.finding.v1", label: "experiment-dataset", onIntegrity: noteIntegrityRecovery });
 }
 
 function experimentDatasetSummary() {
@@ -1074,6 +1290,7 @@ function experimentDatasetSummary() {
     count,
     datasetPath: experimentDatasetPath,
     experiments: EXPERIMENTS,
+    markerCount: readWorldMarkers(200).count,
     latest: latest ? { id: latest.id, experiment: latest.experiment, recordedAt: latest.recordedAt } : null,
   };
 }
@@ -1089,20 +1306,28 @@ function loadExperimentReceipt(experimentId) {
   if (!safe) return null;
   if (experimentRuns.has(safe)) return experimentRuns.get(safe);
   const file = path.join(experimentReceiptsDir, `${safe}.json`);
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    return parsed?.schema === "hemlock.world.experiment.receipt.v1" ? { ...parsed, receiptPath: file } : null;
-  } catch {
-    return null;
-  }
+  const parsed = readJsonFile(file, null, { label: "experiment-receipt" });
+  return parsed?.schema === "hemlock.world.experiment.receipt.v1" ? { ...parsed, receiptPath: file } : null;
+}
+
+// Command-envelope keys that ride the payload but are not sim parameters —
+// stripped before strict input validation so "action"/"hypothesis" never look
+// like typo'd parameter names.
+const EXPERIMENT_ENVELOPE_KEYS = new Set(["experiment", "input", "seed", "hypothesis", "action", "automatic", "operationId", "taskId", "threadId"]);
+
+function stripExperimentEnvelope(obj = {}) {
+  return Object.fromEntries(Object.entries(obj).filter(([key]) => !EXPERIMENT_ENVELOPE_KEYS.has(key) && !key.startsWith("__")));
 }
 
 async function runWorldExperiment(payload = {}) {
   const nested = payload.input && typeof payload.input === "object" ? payload.input : {};
-  appendAgentEvent("experiment.started", "running", { experiment: String(payload.experiment || nested.experiment || "").toLowerCase(), input: nested, hypothesis: String(payload.hypothesis || nested.hypothesis || "").trim() || null }, { reversible: true });
+  const hypothesis = String(payload.hypothesis || nested.hypothesis || "").trim() || null;
+  appendAgentEvent("experiment.started", "running", { experiment: String(payload.experiment || nested.experiment || "").toLowerCase(), input: nested, hypothesis }, { reversible: true });
+  const cleanNested = stripExperimentEnvelope(nested);
+  const mergedInput = stripExperimentEnvelope({ ...nested, ...payload });
   const result = runExperiment({
     experiment: payload.experiment || nested.experiment,
-    input: Object.keys(nested).length && payload.experiment ? nested : { ...nested, ...payload },
+    input: Object.keys(cleanNested).length && payload.experiment ? cleanNested : mergedInput,
     seed: payload.seed ?? nested.seed,
   });
   // Deterministic id: the same spec always mints the same receipt name, so a
@@ -1111,15 +1336,25 @@ async function runWorldExperiment(payload = {}) {
   fs.mkdirSync(experimentReceiptsDir, { recursive: true });
   const receiptPath = path.join(experimentReceiptsDir, `${runId}.json`);
   const receipt = {
+    // result carries its own inner schema (hemlock.experiment.result.v1), so
+    // the envelope fields must come after the spread — otherwise the receipt
+    // fails the schema check every receipt reader applies.
+    ...result,
     schema: "hemlock.world.experiment.receipt.v1",
     id: runId,
-    ...result,
-    hypothesis: String(payload.hypothesis || nested.hypothesis || "").trim() || null,
+    hypothesis,
+    // Hypothesis bookkeeping is honest bookkeeping: the host cannot verify a
+    // natural-language claim, so a declared hypothesis stays "open" until a
+    // hemlock.world.finding.v1 row cites this run's id — then "addressed".
+    // confirmed/refuted is never a host-computed outcome.
+    hypothesisOutcome: hypothesis
+      ? (readExperimentRows(400).rows.some((row) => row.experimentId === runId) ? "addressed" : "open")
+      : null,
     taskId: agentTask.id,
     receiptPath,
     recordedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2));
+  writeJsonAtomic(receiptPath, receipt);
   experimentRuns.set(runId, receipt);
   while (experimentRuns.size > 32) experimentRuns.delete(experimentRuns.keys().next().value);
   appendAgentEvent("experiment.completed", "passed", {
@@ -1130,6 +1365,7 @@ async function runWorldExperiment(payload = {}) {
     computeMs: result.computeMs,
     input: result.input,
     trail: result.trail,
+    hypothesisOutcome: receipt.hypothesisOutcome,
   }, { evidenceRefs: [receiptPath] });
   return { schema: "hemlock.world.experiment.result.v1", status: "completed", experiment: receipt, receiptPath };
 }
@@ -1162,8 +1398,19 @@ async function recordExperimentFinding(payload = {}) {
     taskId: agentTask.id,
     recordedAt: new Date().toISOString(),
   };
-  fs.mkdirSync(path.dirname(experimentDatasetPath), { recursive: true });
-  fs.appendFileSync(experimentDatasetPath, `${JSON.stringify(finding)}\n`);
+  appendJsonlLine(experimentDatasetPath, finding);
+  // A finding citing a hypothesized run flips its receipt to "addressed" —
+  // the honest signal that an interpretation was recorded, never that the
+  // claim was confirmed (the host cannot judge natural-language hypotheses).
+  if (receipt.hypothesis && receipt.hypothesisOutcome !== "addressed") {
+    receipt.hypothesisOutcome = "addressed";
+    receipt.hypothesisAddressedAt = finding.recordedAt;
+    receipt.addressedByFindingId = finding.id;
+    if (experimentRuns.has(receipt.id)) experimentRuns.set(receipt.id, receipt);
+    if (receipt.receiptPath) {
+      try { writeJsonAtomic(receipt.receiptPath, receipt); } catch { /* the dataset row stays authoritative */ }
+    }
+  }
   // Mirror the finding into the Memory Garden review queue so world evidence
   // is inspectable where other candidates live — deduped by fingerprint.
   try {
@@ -1189,12 +1436,8 @@ async function recordExperimentFinding(payload = {}) {
 const graftsPath = path.join(sipsDir, "grafts.jsonl");
 
 function readGrafts(limit = 20) {
-  try {
-    const rows = fs.readFileSync(graftsPath, "utf8").split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
-    return { rows: rows.slice(-limit), count: rows.length };
-  } catch {
-    return { rows: [], count: 0 };
-  }
+  const { rows, count } = readJsonlFile(graftsPath, { schema: "hemlock.dream.graft.v1", label: "graft-registry", onIntegrity: noteIntegrityRecovery });
+  return { rows: rows.slice(-limit), count };
 }
 
 // Graft registry: every auto-grafted Dream adapter is recorded so the active
@@ -1211,8 +1454,7 @@ function registerGraft({ adapterPath, runId, trainingReceipt }) {
     graftedAt: new Date().toISOString(),
   };
   try {
-    fs.mkdirSync(path.dirname(graftsPath), { recursive: true });
-    fs.appendFileSync(graftsPath, `${JSON.stringify(entry)}\n`);
+    appendJsonlLine(graftsPath, entry);
   } catch { /* registry is best-effort; the adapter file itself is authoritative */ }
   appendAgentEvent("dream.adapter.grafted", "passed", entry, { evidenceRefs: [graftsPath, adapterPath].filter(Boolean) });
   return entry;
@@ -1258,7 +1500,7 @@ async function fuseGraft(payload = {}) {
   await stopServer();
   void startServer("", fusedDir);
   const entry = { schema: "hemlock.dream.graft.v1", kind: "fused", adapterPath, fusedModelPath: fusedDir, baseModel: modelPath, fusedAt: new Date().toISOString() };
-  try { fs.mkdirSync(path.dirname(graftsPath), { recursive: true }); fs.appendFileSync(graftsPath, `${JSON.stringify(entry)}\n`); } catch { /* registry is best-effort */ }
+  try { appendJsonlLine(graftsPath, entry); } catch { /* registry is best-effort */ }
   appendAgentEvent("dream.fused", "passed", entry, { evidenceRefs: [graftsPath, fusedDir], reversible: true });
   return { schema: "hemlock.dream.fuse.result.v1", status: "fused", fusedModelPath: fusedDir, adapterPath, rollback: "dream.detach returns to the base checkpoint", grafts: readGrafts() };
 }
@@ -1266,7 +1508,369 @@ async function fuseGraft(payload = {}) {
 function experimentDataset(payload = {}) {
   const limit = Math.max(1, Math.min(400, Math.round(Number(payload.limit ?? payload.input?.limit) || 60)));
   const { rows, count } = readExperimentRows(limit);
-  return { schema: "hemlock.world.dataset.v1", status: "read", count, rows, datasetPath: experimentDatasetPath, evidenceRefs: [experimentDatasetPath] };
+  return { schema: "hemlock.world.dataset.v1", status: "read", count, rows, markerCount: readWorldMarkers(200).count, datasetPath: experimentDatasetPath, evidenceRefs: [experimentDatasetPath] };
+}
+
+// Every durable run receipt on disk, sorted by filename for a deterministic
+// coverage basis — the in-memory map is only a this-session cache.
+function readExperimentReceipts(limit = 400) {
+  let names = [];
+  try {
+    names = fs.readdirSync(experimentReceiptsDir).filter((name) => name.endsWith(".json")).sort();
+  } catch {
+    names = [];
+  }
+  const receipts = [];
+  for (const name of names.slice(-limit)) {
+    // Corrupt receipts are quarantined + journaled by readJsonFile — a
+    // malformed receipt is evidence, not noise to skip silently.
+    const parsed = readJsonFile(path.join(experimentReceiptsDir, name), null, { label: "experiment-receipt" });
+    if (parsed?.schema === "hemlock.world.experiment.receipt.v1") receipts.push(parsed);
+  }
+  return receipts;
+}
+
+// experiment.suggest — ranks coverage gaps from durable records only, so Maple
+// can pick the next experiment like a scientist instead of at random.
+function experimentSuggest(payload = {}) {
+  const limit = Math.max(1, Math.min(48, Math.round(Number(payload.limit ?? payload.input?.limit) || 12)));
+  const receipts = readExperimentReceipts(400);
+  const findings = readExperimentRows(400).rows;
+  const { suggestions, coverageSummary } = suggestExperiments({ receipts, findings, limit });
+  appendAgentEvent("world.suggest", "suggested", {
+    suggestionCount: suggestions.length,
+    top: suggestions[0] ? { experiment: suggestions[0].experiment, reason: suggestions[0].reason } : null,
+    coverageSummary,
+  }, { evidenceRefs: [experimentDatasetPath, experimentReceiptsDir], reversible: true });
+  return {
+    schema: "hemlock.world.suggest.v1",
+    status: "read",
+    suggestions,
+    coverageSummary,
+    markerCount: readWorldMarkers(200).count,
+    datasetPath: experimentDatasetPath,
+    receiptsDir: experimentReceiptsDir,
+    evidenceRefs: [experimentDatasetPath, experimentReceiptsDir],
+    claimBoundary: "Suggestions rank gaps in recorded receipts and findings only; they derive from history and predict nothing about outcomes.",
+    summary: suggestions.length
+      ? `${suggestions.length} coverage gap(s); top: ${suggestions[0].experiment} — ${suggestions[0].reason}`
+      : "No coverage gaps found across recorded experiments.",
+  };
+}
+
+// --- Understory grove markers + self/world projections -----------------------
+// world.place is the only command that mutates the grove; its markers persist
+// beside the experiment dataset and are re-read by world.state and the
+// renderer's grove bindings — no marker exists until a world.placed event does.
+const worldMarkersPath = path.join(sipsDir, "world-markers.jsonl");
+const WORLD_MARKER_KINDS = new Set(["marker", "monument", "sign"]);
+
+function readWorldMarkers(limit = 200) {
+  return readJsonlFile(worldMarkersPath, { tail: limit, schema: "hemlock.world.marker.v1", label: "world-markers", onIntegrity: noteIntegrityRecovery });
+}
+
+// Deterministic placement for world.place calls that omit a position: the
+// marker fingerprint seeds a polar scatter inside the lit understory so the
+// same label always lands in the same spot.
+function seededMarkerPosition(fingerprint) {
+  const digest = crypto.createHash("sha256").update(String(fingerprint)).digest();
+  const angle = (digest[0] / 255) * Math.PI * 2 + (digest[1] / 255) * 0.6;
+  const radius = 4 + (digest[2] / 255) * 14;
+  return { x: Math.round(Math.cos(angle) * radius * 100) / 100, z: Math.round(Math.sin(angle) * radius * 100) / 100 };
+}
+
+function placeWorldMarker(payload = {}) {
+  const kind = String(payload.kind || "marker").trim().toLowerCase();
+  if (!WORLD_MARKER_KINDS.has(kind)) throw new Error(`world.place kind must be marker, monument, or sign — got "${kind}".`);
+  const label = String(payload.label || "").trim().slice(0, 80);
+  if (!label) throw new Error("world.place needs a label — the grove does not render nameless artifacts.");
+  const note = String(payload.note || "").trim().slice(0, 500) || null;
+  const fingerprint = crypto.createHash("sha256").update(`${kind}:${label.toLowerCase()}`).digest("hex").slice(0, 12);
+  const existing = readWorldMarkers(400).rows.find((row) => row.fingerprint === fingerprint);
+  if (existing) {
+    return { schema: "hemlock.world.place.result.v1", status: "existing", marker: existing, markers: readWorldMarkers(200).count, markersPath: worldMarkersPath, summary: `A ${kind} labeled "${label}" already stands in the grove.` };
+  }
+  const raw = payload.position && typeof payload.position === "object" ? payload.position : {};
+  let position = null;
+  if (Number.isFinite(Number(raw.x)) && Number.isFinite(Number(raw.z))) {
+    const x = Number(raw.x);
+    const z = Number(raw.z);
+    const radius = Math.hypot(x, z);
+    const scale = radius > 30 ? 30 / radius : 1; // keep markers inside the lit understory ring
+    position = { x: Math.round(x * scale * 100) / 100, z: Math.round(z * scale * 100) / 100 };
+  }
+  const marker = {
+    schema: "hemlock.world.marker.v1",
+    id: `marker-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`,
+    fingerprint,
+    kind,
+    label,
+    note,
+    position: position || seededMarkerPosition(fingerprint),
+    seededPosition: !position,
+    taskId: agentTask.id,
+    placedAt: new Date().toISOString(),
+  };
+  appendJsonlLine(worldMarkersPath, marker);
+  appendAgentEvent("world.placed", "placed", { marker }, { evidenceRefs: [worldMarkersPath], reversible: true });
+  return { schema: "hemlock.world.place.result.v1", status: "placed", marker, markers: readWorldMarkers(200).count, markersPath: worldMarkersPath, evidenceRefs: [worldMarkersPath], summary: `Placed a ${kind} labeled "${label}" in the understory grove.` };
+}
+
+// Recent experiment receipts on disk, newest first — the grove's landmarks.
+function listExperimentReceipts(limit = 5) {
+  let names = [];
+  try {
+    names = fs.readdirSync(experimentReceiptsDir).filter((name) => name.endsWith(".json"));
+  } catch {
+    names = [];
+  }
+  const entries = names.map((name) => {
+    const filePath = path.join(experimentReceiptsDir, name);
+    let mtime = 0;
+    try { mtime = fs.statSync(filePath).mtimeMs; } catch { /* keep 0 */ }
+    return { filePath, mtime };
+  }).sort((a, b) => b.mtime - a.mtime);
+  const recent = entries.slice(0, Math.max(1, limit)).map((entry) => {
+    const parsed = readJsonFile(entry.filePath, null, { label: "experiment-receipt" });
+    const receipt = parsed?.schema === "hemlock.world.experiment.receipt.v1" ? parsed : null;
+    const worst = Number(receipt?.divergence?.worst);
+    return {
+      id: receipt?.id || path.basename(entry.filePath, ".json"),
+      experiment: receipt?.experiment || null,
+      verdict: Number.isFinite(worst) ? (worst < 0.05 ? "within-tolerance" : "diverged") : "recorded",
+      divergenceWorst: Number.isFinite(worst) ? worst : null,
+      recordedAt: receipt?.recordedAt || null,
+    };
+  });
+  return { count: entries.length, recent };
+}
+
+// Mirrors the renderer's groveBindings ambience math on the same event spine,
+// so world.state reports the grove the user would actually see.
+const WORLD_BOUND_EVENT = /^inference\.|^dream\.|^experiment\.|^memory\.|^sips\.|^(action|command|operation)\.|^(task|plan)\.|^world\./;
+function worldAmbience(now = Date.now()) {
+  let dreamAt = null;
+  let dreamHeat = 0;
+  let recentFailures = 0;
+  let recentBound = 0;
+  for (const event of agentEvents) {
+    const type = String(event?.type || "");
+    if (!WORLD_BOUND_EVENT.test(type)) continue;
+    const at = Date.parse(event.createdAt || "") || now;
+    if (now - at < 120000) recentBound += 1;
+    const failed = event.status === "failed" || event.status === "blocked" || type.includes("failed") || type.includes("blocked");
+    if (failed && now - at < 300000) recentFailures += 1;
+    if (/^dream\./.test(type) && (dreamAt === null || at >= dreamAt)) {
+      dreamAt = at;
+      dreamHeat = failed ? 0.15 : /started|running|progress|fus/i.test(type) ? 1 : 0.55;
+    }
+  }
+  return {
+    dream: dreamAt === null ? 0 : dreamHeat * Math.max(0, 1 - (now - dreamAt) / (12 * 60 * 1000)),
+    alert: Math.min(1, recentFailures / 2),
+    bustle: Math.min(1, recentBound / 8),
+  };
+}
+
+// world.state — the model-facing grove projection. It reads the same durable
+// records the renderer binds: the event spine, experiment receipts, the
+// findings dataset, and the marker store.
+function worldStateSnapshot() {
+  const dataset = experimentDatasetSummary();
+  const markers = readWorldMarkers(200);
+  const landmarks = listExperimentReceipts(5);
+  return {
+    schema: "hemlock.world.state.v1",
+    status: "read",
+    landmarks: { experimentReceipts: landmarks.count, markers: markers.count },
+    experiments: landmarks.recent,
+    dataset: { rows: dataset.count, latest: dataset.latest, datasetPath: dataset.datasetPath },
+    markers: markers.rows.slice(-48),
+    ambience: worldAmbience(),
+    evidenceRefs: [experimentDatasetPath, worldMarkersPath, experimentReceiptsDir],
+    claimBoundary: "Reads durable local records only; ambience derives from this session's event spine and predicts nothing.",
+    summary: `The grove holds ${landmarks.count} experiment receipts, ${dataset.count} findings, and ${markers.count} placed markers.`,
+  };
+}
+
+// The advertised context ceiling comes from the checkpoint's own config.json
+// (read once, cached) — never a hardcoded claim. The enforced budget is much
+// lower (budget.contextMaxTokens): KV memory on the full-attention layers is
+// the real constraint, not positions.
+let cachedModelContextCeiling;
+function modelContextCeiling() {
+  if (cachedModelContextCeiling !== undefined) return cachedModelContextCeiling;
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(modelPath, "config.json"), "utf8"));
+    const value = Number(config?.max_position_embeddings ?? config?.text_config?.max_position_embeddings);
+    cachedModelContextCeiling = Number.isFinite(value) && value > 0 ? Math.round(value) : null;
+    // Publish the real ceiling for the context-budget seam: the orchestrator
+    // clamps HEMLOCK_CONTEXT_MAX_TOKENS against modelMax minus generation
+    // headroom and reads this env per call. When config is unreadable the
+    // seam falls back to Maple's verified 128000.
+    if (cachedModelContextCeiling != null) process.env.HEMLOCK_MODEL_MAX_TOKENS = String(cachedModelContextCeiling);
+  } catch {
+    cachedModelContextCeiling = null;
+  }
+  return cachedModelContextCeiling;
+}
+
+// agent.self — the model-facing self snapshot. Everything below reads
+// host-owned state; nothing is synthesized.
+function agentSelfSnapshot() {
+  const { classifyFailure, failureHint, resolveFailureClass } = require("./agent_contracts.cjs");
+  const { classifyInferenceError } = require("./error_taxonomy.cjs");
+  // Hand the registry to the kernel so its failure-observation suggestions can
+  // name required inputHint fields; idempotent, and read paths stay pure.
+  agentKernel?.attachCommandRegistry?.(agentCommands);
+  const projection = agentKernel.getProjection();
+  const kernelTask = projection?.task && typeof projection.task === "object" ? projection.task : {};
+  const budget = mergeBudget({ ...(agentTask.budget || {}), ...(kernelTask.budget || {}) });
+  const queue = agentIntentQueue?.snapshot() || { active: null, pending: [], count: 0 };
+  const pendingEntries = Array.isArray(queue.pending) ? queue.pending : [];
+  const ownPosition = pendingEntries.findIndex((entry) => entry?.payload?.taskId === agentTask.id || entry?.taskId === agentTask.id);
+  const pendingApprovals = [
+    ...(projection.plans || []).filter((plan) => plan.status === "proposed").map((plan) => ({ type: "plan", id: plan.id, label: String(plan.rationale || plan.title || plan.id).slice(0, 140) })),
+    ...(projection.actions || []).filter((action) => ["proposed", "validated"].includes(action.status)).map((action) => ({ type: "action", id: action.id, label: String(action.commandId || action.kind || action.id).slice(0, 140) })),
+    ...(agentTask.question?.prompt ? [{ type: "question", id: agentTask.question.id || agentTask.id, label: String(agentTask.question.prompt).slice(0, 140) }] : []),
+  ].slice(-12);
+  const dataset = experimentDatasetSummary();
+  const markers = readWorldMarkers(200);
+  // Failure teaching on the durable spine: the last action/inference failures
+  // the host recorded, each with its class and the host-authored next step.
+  const actionsById = new Map((projection.actions || []).map((action) => [action.id, action]));
+  const isFailureEvent = (event) => {
+    const type = String(event?.type || "");
+    const failed = event?.status === "failed" || event?.status === "blocked" || type.includes("fail") || type.includes("blocked");
+    return failed && (type.startsWith("action.") || type.startsWith("inference.") || type === "observation.recorded" || type === "command.blocked");
+  };
+  const recentFailures = agentEvents.filter(isFailureEvent).slice(-5).map((event) => {
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const action = payload.actionId ? actionsById.get(payload.actionId) : payload.action || null;
+    const commandId = payload.commandId || payload.command || action?.commandId || payload.observation?.commandId || null;
+    const errorClass = resolveFailureClass(
+      payload.category || payload.errorClass || payload.failureCategory || action?.failureCategory || action?.errorClass || payload.observation?.errorClass
+        || (event.type === "inference.failed"
+          ? classifyInferenceError({ message: payload.error, code: payload.code, status: payload.status }).kind
+          : classifyFailure(null, { code: payload.code, error: payload.error || payload.reason || payload.observation?.error })),
+      { message: payload.error || payload.reason || payload.observation?.error },
+    );
+    const suggestion = payload.observation?.suggestion || action?.suggestion
+      || failureHint(errorClass, { message: payload.error || payload.reason || payload.observation?.error, commandId, inputHint: agentCommands[commandId]?.inputHint });
+    return { type: event.type, commandId, errorClass, suggestion, createdAt: event.createdAt };
+  });
+  // Current capability boundary — the same allowedNextCommands the action
+  // prompt advertises, recomputed only if the orchestrator is live.
+  let allowedNow = null;
+  try {
+    const activePlan = (projection.plans || []).find((plan) => plan.id === agentTask.activePlanId) || { steps: [] };
+    const allowed = agentOrchestrator?.allowedNextCommands?.(agentTask, activePlan, agentKernel.getTaskHistory(agentTask.id));
+    if (Array.isArray(allowed)) {
+      allowedNow = allowed.map((entry) => ({
+        commandId: entry.commandId,
+        capability: entry.capability || agentCommands[entry.commandId]?.capability || null,
+        source: entry.source || null,
+        inputHint: entry.hint || agentCommands[entry.commandId]?.inputHint || null,
+      }));
+    }
+  } catch { allowedNow = null; }
+  // Memory ledger summary from durable records + the event spine.
+  let memoryRecords = null;
+  let memoryDemoted = null;
+  try {
+    const memoryLedgerPath = path.join(sipsDir, "memory.jsonl");
+    if (fs.existsSync(memoryLedgerPath)) {
+      const { rows } = readJsonlFile(memoryLedgerPath, { label: "memory-ledger", onIntegrity: noteIntegrityRecovery });
+      memoryRecords = rows.length;
+      memoryDemoted = rows.reduce((count, row) => (row?.status === "demoted" ? count + 1 : count), 0);
+    }
+  } catch { /* ledger unreadable — honest nulls below */ }
+  const lastConsolidated = [...agentEvents].reverse().find((event) => event.type === "memory.consolidated");
+  const memory = {
+    records: memoryRecords ?? ((Number(projection?.memory?.candidates) || 0) + (Number(projection?.memory?.promoted) || 0)),
+    promoted: Number(projection?.memory?.promoted) || 0,
+    candidates: Number(projection?.memory?.candidates) || 0,
+    demoted: memoryDemoted ?? agentEvents.filter((event) => event.type === "memory.demote" || event.type === "memory.demoted").length,
+    lastConsolidatedAt: lastConsolidated?.createdAt || null,
+    lastUpdatedAt: projection?.memory?.lastUpdatedAt || null,
+  };
+  return {
+    schema: "hemlock.agent.self.v1",
+    status: "ok",
+    task: {
+      id: agentTask.id,
+      status: agentTask.status,
+      phase: agentTask.phase,
+      objective: agentTask.objective,
+      autonomy: agentTask.autonomy,
+    },
+    budget: {
+      agentStepsUsed: budget.agentStepsUsed,
+      maxAgentSteps: budget.maxAgentSteps,
+      commandsUsed: budget.commandsUsed,
+      maxCommands: budget.maxCommands,
+    },
+    queue: {
+      pending: pendingEntries.length,
+      position: ownPosition >= 0 ? ownPosition + 1 : null,
+    },
+    pendingApprovals,
+    recentFailures,
+    allowedNow,
+    memory,
+    // Real context accounting written back by the action loop from server
+    // usage. usedTokens is usage-derived (last step's prompt+completion ≈
+    // committed context); estimatedTokens is the chars/4 guard heuristic and
+    // stays labeled. A contextUsage from a superseded task id reports nulls
+    // rather than presenting stale numbers as current.
+    context: (() => {
+      const usage = agentTask.contextUsage && typeof agentTask.contextUsage === "object" && (!agentTask.contextUsage.taskId || agentTask.contextUsage.taskId === agentTask.id)
+        ? agentTask.contextUsage
+        : {};
+      const number = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+      // The enforced ceiling resolves the task's stored pin (or the live
+      // env/kv-aware default when unpinned) clamped to the model ceiling
+      // minus generation headroom — practicalCeiling is that enforced number,
+      // the real bound Maple can use. modelContextCeiling() runs first so its
+      // HEMLOCK_MODEL_MAX_TOKENS publish lands before the resolver reads it.
+      const modelMax = modelContextCeiling();
+      const ceiling = require("./agent_orchestrator.cjs").resolveContextMaxTokens({ budget });
+      return {
+        usedTokens: number(usage.usedTokens),
+        promptTokens: number(usage.promptTokens),
+        completionTokens: number(usage.completionTokens),
+        cachedTokens: number(usage.cachedTokens),
+        estimatedTokens: number(usage.estimatedTokens),
+        maxTokens: ceiling.requestedMaxTokens,
+        maxTokensClamped: ceiling.clamped,
+        practicalCeiling: Math.min(ceiling.maxTokens, Number.isFinite(modelMax) ? modelMax : ceiling.maxTokens),
+        kvBits: ceiling.kvBits,
+        modelMaxTokens: modelMax,
+        source: usage.source || null,
+        updatedAt: usage.updatedAt || null,
+      };
+    })(),
+    server: {
+      processReady: serverState.processReady === true,
+      inferenceReady: serverState.inferenceReady === true,
+      adapterPath: serverState.adapterPath || null,
+      lastWarmAt: serverState.lastWarmAt || null,
+      warmCachedTokens: Number.isFinite(Number(serverState.warmCachedTokens)) ? Number(serverState.warmCachedTokens) : null,
+    },
+    counts: {
+      artifacts: artifactRegistry.list().length,
+      memories: {
+        promoted: Number(projection?.memory?.promoted) || 0,
+        candidate: Number(projection?.memory?.candidates) || 0,
+      },
+      experimentFindings: dataset.count,
+      markers: markers.count,
+    },
+    recentReceipts: agentEvents.filter((event) => event.evidenceRefs?.length).slice(-5).map((event) => ({ type: event.type, status: event.status, createdAt: event.createdAt, id: event.id })),
+    evidenceRefs: [sessionEventsPath],
+    claimBoundary: "A read-only snapshot of host-owned state; it records what the host has already observed and predicts nothing.",
+    summary: `Task ${agentTask.status}/${agentTask.phase}; ${budget.commandsUsed}/${budget.maxCommands} commands used; ${pendingApprovals.length} approvals pending.`,
+  };
 }
 
 async function recordAgentMemory(payload = {}) {
@@ -1373,7 +1977,7 @@ async function processAgentIntent(payload = {}) {
   const taskId = `task-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 7)}`;
   updateAgentTask({
     id: taskId,
-    objective: text.slice(0, 1000),
+    objective: text.slice(0, 12000),
     intent,
     interactionMode,
     threadId: thread?.id || null,
@@ -1383,28 +1987,36 @@ async function processAgentIntent(payload = {}) {
     phase: "recall",
     status: "accepted",
     foregroundStep: "Recall scoped context and prepare a bounded plan",
-    budget: mergeBudget(DEFAULT_BUDGET),
+    // Wall-clock budget starts at task creation, not lazily at the first
+    // action step — conversation-mode and pre-step tasks otherwise report
+    // wallClockStartedAt: null forever.
+    budget: { ...mergeBudget(DEFAULT_BUDGET), wallClockStartedAt: Date.now() },
     steering: [],
     provider: selection.provider,
     model: selection.model || null,
     reasoning: selection.reasoning,
+    // Per-task lane fallback override (HEMLOCK_FALLBACK_LANE is the global
+    // default): codex|claude pins a lane, "none" disables the fallback for
+    // this task. Unset → env default. Consumed by the orchestrator's
+    // lane-fallback path in agent_orchestrator.cjs.
+    fallbackLane: ["codex", "claude", "none"].includes(String(payload.fallbackLane || "").toLowerCase()) ? String(payload.fallbackLane).toLowerCase() : null,
     evidenceRefs: [],
     blockedReason: null,
-    artifactRepair: { attempt: 0, maxAttempts: 2, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
-    codeRepair: { attempt: 0, maxAttempts: 2, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
+    artifactRepair: { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxArtifactRepairs, baseRevision: null, candidateRevision: null, lastGoodRevision: null, issues: [], status: "idle" },
+    codeRepair: { attempt: 0, maxAttempts: DEFAULT_BUDGET.maxCodeRepairs, baseChangeSetId: null, candidateChangeSetId: null, lastGoodChangeSetId: null, issues: [], status: "idle" },
     metrics: { inferenceCalls: 0, repairCalls: 0, previewWaitMs: 0, artifactRevisionCount: 0 },
     startedAt: new Date().toISOString(),
   });
   threadManager.checkpoint(agentTask.threadId, { taskId: taskId, phase: "conversation", status: "accepted", reason: "intent-accepted", provider: selection.provider, model: selection.model, reasoning: selection.reasoning, autonomyPolicy: agentTask.autonomy });
   appendAgentEvent("task.created", "accepted", { task: agentTask, source: payload.source || "command-center" });
-  appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 500), intent, interactionMode, source: payload.source || "command-center" });
+  appendAgentEvent("prompt.submitted", "received", { content: text.slice(0, 1000), intent, interactionMode, source: payload.source || "command-center" });
   threadManager.appendConversation(agentTask.threadId, { role: "user", content: text, provider: selection.provider, model: selection.model, reasoning: selection.reasoning });
   // Auto-title: a thread still carrying its default title takes its name from
   // the first user message, so the picker shows recognizable identities.
   {
     const autoTitleThread = threadManager.thread(agentTask.threadId);
     if (autoTitleThread && (!autoTitleThread.title || autoTitleThread.title === "New Hemlock thread" || autoTitleThread.title === "Hemlock thread")) {
-      const derivedTitle = text.replace(/\s+/g, " ").trim().slice(0, 60) || autoTitleThread.title;
+      const derivedTitle = (String(payload.title || "").replace(/\s+/g, " ").trim() || text.replace(/\s+/g, " ").trim()).slice(0, 60) || autoTitleThread.title;
       if (derivedTitle && derivedTitle !== autoTitleThread.title) {
         threadManager.updateThread(agentTask.threadId, { title: derivedTitle });
         agentTask = { ...agentTask, objective: agentTask.objective && agentTask.objective !== "New Hemlock thread" ? agentTask.objective : derivedTitle };
@@ -1421,7 +2033,7 @@ async function processAgentIntent(payload = {}) {
 
   let recall = { schema: "hemlock.agent.recall.v1", status: "unavailable", records: [], reason: "SIPS memory was not queried." };
   try {
-    recall = await runSipsRuntime({ action: "recall", query: text, limit: 6 });
+    recall = await runSipsRuntime({ action: "recall", query: text, limit: 8 });
     appendAgentEvent("memory.recalled", "passed", { query: text, count: recall.records?.length || 0, records: recall.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
   } catch (error) {
     appendAgentEvent("memory.recall.failed", "degraded", { query: text, error: error.message }, { reversible: true });
@@ -1582,12 +2194,12 @@ function steerActiveAgentTask(payload = {}) {
   if (!content) throw new Error("A steering update needs a concise instruction.");
   const steering = {
     id: `steer-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-    content: content.slice(0, 1000),
+    content: content.slice(0, 2000),
     source: payload.source || "command-center",
     createdAt: new Date().toISOString(),
     status: "accepted",
   };
-  const history = [...(agentTask.steering || []), steering].slice(-12);
+  const history = [...(agentTask.steering || []), steering].slice(-24);
   updateAgentTask({ steering: history, foregroundStep: `Steering received: ${steering.content.slice(0, 120)}` });
   appendAgentEvent("task.steering.received", "accepted", { taskId: agentTask.id, steering }, { reversible: true });
   abortStreamsForTask(agentTask.id, "steering");
@@ -1927,7 +2539,7 @@ async function injectGroundedContext(messages = [], refreshQuery = "") {
   const query = String(refreshQuery || "").trim();
   if (query) {
     try {
-      recall = await runSipsRuntime({ action: "recall", query, limit: 6 });
+      recall = await runSipsRuntime({ action: "recall", query, limit: 8 });
       updateAgentTask({ recall });
       appendAgentEvent("memory.recalled", "passed", { query, count: recall.records?.length || 0, records: recall.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
     } catch (error) {
@@ -1984,16 +2596,17 @@ async function runInference(payload = {}) {
     stream.controller = controller;
     const timeoutHandle = setTimeout(() => controller.abort("timeout"), inferenceTimeoutMs);
     // T8-S3: first-token stall watchdog — Maple can accept the request and then
-    // wedge without emitting a single SSE byte; abort in 45s (not the full
-    // inferenceTimeoutMs) so the bounded transport recovery below takes over.
+    // wedge without emitting a single SSE byte; abort at DEFAULT_STALL_MS (not
+    // the full inferenceTimeoutMs) so the bounded transport recovery below
+    // takes over. The bound is generous because cold 2-bit prefills are slow.
     const stallStartedAt = Date.now();
     let firstByteAt = null;
     const stallHandle = setTimeout(() => {
       if (!firstTokenWatchdog({ now: Date.now(), startedAt: stallStartedAt, firstByteAt }).stalled) return;
-      const stallError = new Error("first-token stall (no SSE bytes in 45s)");
+      const stallError = new Error(`first-token stall (no SSE bytes in ${Math.round(DEFAULT_STALL_MS / 1000)}s)`);
       stallError.code = "MAPLE_FIRST_TOKEN_STALL";
       controller.abort(stallError);
-    }, 45000);
+    }, DEFAULT_STALL_MS);
     try {
       const base = {
         model: selection.provider === "maple" ? resolveLocalModelPath(selection.model) : "default_model",
@@ -2195,7 +2808,7 @@ async function runInference(payload = {}) {
         channels: stream.channels,
         rawPayload: rawPayloads.length ? rawPayloads : responsePayload,
       });
-      if (!reason && isMapleTransportError(error) && mapleTransportRetries < 1 && !stream.text.trim()) {
+      if (!reason && isMapleTransportError(error) && mapleTransportRetries < 2 && !stream.text.trim()) {
         mapleTransportRetries += 1;
         finishStream(stream, { status: "restarting", stopReason: error.message, rawOutputRef: interruptedRawOutputRef });
         // T7.5-R2: recovery must be visible, not silent — the receipt rides
@@ -2278,10 +2891,10 @@ function walkFiles(root, predicate = () => true, output = []) {
 
 function queryReceipts(payload = {}) {
   const files = walkFiles(sipsDir, (filePath) => /(?:receipt|training-receipt)\.json$/i.test(filePath));
-  const receipts = files.slice(-80).reverse().map((filePath) => ({
+  const receipts = files.slice(-160).reverse().map((filePath) => ({
     path: filePath,
     relativePath: path.relative(runtimeDataRoot, filePath),
-    receipt: readJsonFile(filePath, null),
+    receipt: readJsonFile(filePath, null, { label: "receipt-scan" }),
   }));
   return { schema: "hemlock.agent.receipts.v1", status: "ready", receipts, count: receipts.length, evidenceRefs: receipts.map((item) => item.path) };
 }
@@ -2300,7 +2913,7 @@ async function prepareChangeSet(payload = {}) {
   const baselineStatus = await runChild("git", ["status", "--short", "--untracked-files=all"], { cwd: repoRoot, timeoutMs: 30000 });
   const touchedPaths = [...patch.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)].flatMap((match) => [match[1], match[2]]).filter((item, index, items) => items.indexOf(item) === index);
   const patchPath = path.join(root, "change.patch");
-  fs.writeFileSync(patchPath, patch, "utf-8");
+  writeFileAtomic(patchPath, patch);
   const manifest = {
     schema: "hemlock.agent.change-set.v1",
     id: changeSetId,
@@ -2345,15 +2958,16 @@ function prepareArtifactChangeSet({ artifact, taskId }) {
 }
 
 function writeJsonFile(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+  // Temp + fsync + rename (durable_io): manifests, receipts, settings, and
+  // scheduler state must never be observed half-written after a crash.
+  writeJsonAtomic(filePath, value);
 }
 
 async function transitionChangeSet(payload = {}, transition) {
   const changeSetId = String(payload.changeSetId || "");
   const root = changeSetPath(changeSetId);
   const manifestPath = path.join(root, "manifest.json");
-  const manifest = readJsonFile(manifestPath, null);
+  const manifest = readJsonFile(manifestPath, null, { label: "change-set-manifest" });
   if (!manifest) throw new Error(`Hemlock change set was not found: ${changeSetId}`);
   if (transition === "approve") {
     if (payload.confirm !== true) throw new Error("Applying a prepared change set requires explicit confirmation.");
@@ -2404,8 +3018,8 @@ function prepareTrainingDataset(payload = {}) {
   fs.mkdirSync(datasetRoot, { recursive: true });
   const trainPath = path.join(datasetRoot, "train.jsonl");
   const validationPath = path.join(datasetRoot, "validation.jsonl");
-  fs.writeFileSync(trainPath, trainingRows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf-8");
-  if (holdoutRows.length) fs.writeFileSync(validationPath, holdoutRows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf-8");
+  writeFileAtomic(trainPath, trainingRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  if (holdoutRows.length) writeFileAtomic(validationPath, holdoutRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
   const manifest = {
     schema: "hemlock.agent.dataset.v1",
     datasetId,
@@ -2444,7 +3058,7 @@ function repoInspect(payload = {}) {
     const absolute = scopedRepoPath(item, workspaceRoot);
     if (!fs.existsSync(absolute)) return [];
     if (fs.statSync(absolute).isFile()) return [path.relative(workspaceRoot, absolute)];
-    return walkFiles(absolute, () => true).slice(0, 80).map((filePath) => path.relative(workspaceRoot, filePath));
+    return walkFiles(absolute, () => true).slice(0, 160).map((filePath) => path.relative(workspaceRoot, filePath));
   }).slice(0, 160);
   return {
     schema: "hemlock.agent.repo.inspection.v1",
@@ -2462,7 +3076,7 @@ function readFileTool(payload = {}) {
   const workspaceRoot = path.resolve(payload.workspaceRoot || agentTask.workspaceRoot || repoRoot);
   const absolute = scopedRepoPath(payload.path || "README.md", workspaceRoot);
   if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) throw new Error(`Scoped file was not found: ${payload.path}`);
-  const maxBytes = Math.min(Math.max(Number(payload.maxBytes || 20000), 256), 50000);
+  const maxBytes = Math.min(Math.max(Number(payload.maxBytes || 64000), 256), 200000);
   const content = fs.readFileSync(absolute, "utf-8");
   const truncated = Buffer.byteLength(content) > maxBytes;
   const excerpt = truncated ? content.slice(0, maxBytes) : content;
@@ -2474,9 +3088,9 @@ async function searchFilesTool(payload = {}) {
   const query = String(payload.query || payload.pattern || "").trim();
   if (!query) throw new Error("file.search needs a query.");
   const target = scopedRepoPath(payload.path || ".", workspaceRoot);
-  const result = await runChild("rg", ["--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "40", query, target], { cwd: workspaceRoot, timeoutMs: 30000 });
+  const result = await runChild("rg", ["--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "120", query, target], { cwd: workspaceRoot, timeoutMs: 30000 });
   if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error(result.stderr || `file.search failed with exit code ${result.exitCode}`);
-  return { schema: "hemlock.agent.file.search.v1", status: "passed", query, path: path.relative(workspaceRoot, target) || ".", matches: result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 120), matchCount: result.stdout.split(/\r?\n/).filter(Boolean).length, summary: `Search completed for ${JSON.stringify(query)}.`, evidenceRefs: [`repo://${workspaceRoot}`] };
+  return { schema: "hemlock.agent.file.search.v1", status: "passed", query, path: path.relative(workspaceRoot, target) || ".", matches: result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 320), matchCount: result.stdout.split(/\r?\n/).filter(Boolean).length, summary: `Search completed for ${JSON.stringify(query)}.`, evidenceRefs: [`repo://${workspaceRoot}`] };
 }
 
 async function gitStatusTool(payload = {}) {
@@ -2491,17 +3105,19 @@ async function gitDiffTool(payload = {}) {
   const args = ["diff", "--no-ext-diff", "--binary"];
   if (paths.length) args.push("--", ...paths);
   const result = await runChild("git", args, { cwd: workspaceRoot, timeoutMs: 30000 });
-  return { schema: "hemlock.agent.git.diff.v1", status: result.exitCode === 0 ? "passed" : "failed", diff: result.stdout.slice(0, 30000), truncated: result.stdout.length > 30000, paths, exitCode: result.exitCode, summary: result.exitCode === 0 ? "The scoped diff was read without mutation." : result.stderr || "Git diff failed.", evidenceRefs: [`git://${workspaceRoot}/diff`] };
+  return { schema: "hemlock.agent.git.diff.v1", status: result.exitCode === 0 ? "passed" : "failed", diff: result.stdout.slice(0, 120000), truncated: result.stdout.length > 120000, paths, exitCode: result.exitCode, summary: result.exitCode === 0 ? "The scoped diff was read without mutation." : result.stderr || "Git diff failed.", evidenceRefs: [`git://${workspaceRoot}/diff`] };
 }
 
 function testDiscover() {
-  const packageJson = readJsonFile(path.join(repoRoot, "dream-chat", "package.json"), {});
-  const testFiles = walkFiles(repoRoot, (filePath) => /(?:test|spec)\.(?:cjs|js|mjs|py|tsx?|jsx?)$/i.test(filePath)).slice(0, 120).map((filePath) => path.relative(repoRoot, filePath));
+  // Repo source, not durable state: never quarantine a package.json that
+  // fails to parse — discovery just reports empty scripts.
+  const packageJson = readJsonDurable(path.join(repoRoot, "dream-chat", "package.json"), {}, { quarantine: false });
+  const testFiles = walkFiles(repoRoot, (filePath) => /(?:test|spec)\.(?:cjs|js|mjs|py|tsx?|jsx?)$/i.test(filePath)).slice(0, 240).map((filePath) => path.relative(repoRoot, filePath));
   return { schema: "hemlock.agent.test.discovery.v1", status: "passed", scripts: packageJson.scripts || {}, testFiles, summary: `Discovered ${testFiles.length} local test files and ${Object.keys(packageJson.scripts || {}).length} npm scripts.`, evidenceRefs: [`repo://${repoRoot}`] };
 }
 
 function verificationList() {
-  return { schema: "hemlock.agent.verification.list.v1", status: "passed", profiles: Object.entries(verificationProfiles).map(([id, profile]) => ({ id, label: profile.label, command: profile.command, timeoutMs: profile.timeoutMs })), summary: "Allowlisted verification profiles are available.", evidenceRefs: ["verification://profiles"] };
+  return { schema: "hemlock.agent.verification.list.v1", status: "passed", profiles: Object.entries(verificationProfiles).map(([id, profile]) => ({ id, label: profile.label, command: profile.command, timeoutMs: profile.timeoutMs, requires: profile.requires || [] })), summary: "Allowlisted verification profiles are available.", evidenceRefs: ["verification://profiles"] };
 }
 
 function inspectReceipt(payload = {}) {
@@ -2514,7 +3130,7 @@ function inspectReceipt(payload = {}) {
     error.code = "SCOPE_OUTSIDE_RUNTIME";
     throw error;
   }
-  const receipt = readJsonFile(absolute, null);
+  const receipt = readJsonFile(absolute, null, { label: "receipt-inspect" });
   if (!receipt) throw new Error(`Receipt was not found or was not valid JSON: ${requested}`);
   return { schema: "hemlock.agent.receipt.inspection.v1", status: "passed", path: absolute, receipt, summary: `Inspected local receipt ${path.relative(runtimeDataRoot, absolute)}.`, evidenceRefs: [absolute] };
 }
@@ -2522,11 +3138,52 @@ function inspectReceipt(payload = {}) {
 function agentCapabilities() {
   const autonomy = String(agentTask.autonomy || "bounded-local");
   const autonomyLevel = autonomy === "autonomous" || autonomy === "bounded-campaign" ? "autonomous" : autonomy === "guided" ? "guided" : "supervised";
-  const commands = Object.entries(agentCommands).map(([commandId, descriptor]) => ({ commandId, label: descriptor.label, capability: descriptor.capability, auto: descriptor.auto === true, approval: descriptor.approval, inputHint: descriptor.inputHint || null }));
-  return { schema: "hemlock.agent.capabilities.v1", status: "passed", taskId: agentTask.id, autonomy, autonomyLevel, commands, summary: `${commands.length} allowlisted commands; autonomy ${autonomyLevel} (${autonomy}).`, evidenceRefs: ["registry://agent-commands"] };
+  // The live selection boundary — the same allowedNextCommands the action
+  // prompt advertises — so the model can see what it may pick right now, not
+  // just what is registered. Falls back to auto:true when no plan is live.
+  let allowedNow = [];
+  try {
+    const activePlan = agentKernel.getProjection().plans.find((plan) => plan.id === agentTask.activePlanId) || { steps: [] };
+    allowedNow = agentOrchestrator?.allowedNextCommands?.(agentTask, activePlan, agentKernel.getTaskHistory(agentTask.id)) || [];
+  } catch { allowedNow = []; }
+  const selectableIds = new Set(allowedNow.map((entry) => entry.commandId));
+  const commands = Object.entries(agentCommands).map(([commandId, descriptor]) => ({
+    commandId,
+    label: descriptor.label,
+    capability: descriptor.capability,
+    auto: descriptor.auto === true,
+    approval: descriptor.approval,
+    inputHint: descriptor.inputHint || null,
+    countsAgainstBudget: descriptor.countsAgainstBudget !== false,
+    selectable: selectableIds.size ? selectableIds.has(commandId) : descriptor.auto === true,
+  }));
+  const capabilityEntry = (command) => ({ commandId: command.commandId, capability: command.capability, auto: command.auto, approval: command.approval, inputHint: command.inputHint });
+  const byCapability = {};
+  for (const command of commands.filter((item) => item.selectable)) {
+    (byCapability[command.capability || "other"] ||= []).push(capabilityEntry(command));
+  }
+  const freeReads = commands
+    .filter((command) => command.countsAgainstBudget === false)
+    .map((command) => ({ ...capabilityEntry(command), selectable: command.selectable }));
+  const selectableCount = commands.filter((command) => command.selectable).length;
+  return {
+    schema: "hemlock.agent.capabilities.v1",
+    status: "passed",
+    taskId: agentTask.id,
+    autonomy,
+    autonomyLevel,
+    commands,
+    selectable: commands.filter((command) => command.selectable).map((command) => command.commandId),
+    byCapability,
+    freeReads,
+    summary: `${commands.length} allowlisted commands, ${selectableCount} selectable now, ${freeReads.length} free reads; autonomy ${autonomyLevel} (${autonomy}).`,
+    evidenceRefs: ["registry://agent-commands"],
+  };
 }
 
-const MAX_PROPOSAL_CHANGE_BYTES = 8 * 1024;
+// Bounded so a proposal stays a reviewable spec/patch, but large enough for a
+// real multi-file change sketch rather than only a one-paragraph stub.
+const MAX_PROPOSAL_CHANGE_BYTES = 32 * 1024;
 
 function proposeImprovement(payload = {}) {
   const summary = String(payload.summary || "").trim();
@@ -2534,10 +3191,10 @@ function proposeImprovement(payload = {}) {
   if (!summary) throw new Error("improve.propose needs a summary of the bounded change.");
   if (!rationale) throw new Error("improve.propose needs a rationale grounded in local evidence.");
   const change = typeof payload.change === "string" ? payload.change.trim() : "";
-  if (Buffer.byteLength(change, "utf8") > MAX_PROPOSAL_CHANGE_BYTES) throw new Error("improve.propose change text exceeds the 8KB bound.");
+  if (Buffer.byteLength(change, "utf8") > MAX_PROPOSAL_CHANGE_BYTES) throw new Error(`improve.propose change text exceeds the ${MAX_PROPOSAL_CHANGE_BYTES / 1024}KB bound.`);
   const thread = threadManager.thread(String(payload.threadId || agentTask.threadId || ""));
   const workspaceRoot = path.resolve(thread?.workspaceRoot || agentTask.workspaceRoot || repoRoot);
-  const files = (Array.isArray(payload.files) ? payload.files : []).slice(0, 24).map((item) => {
+  const files = (Array.isArray(payload.files) ? payload.files : []).slice(0, 48).map((item) => {
     const absolute = thread
       ? threadManager.assertScopedPath(thread.id, path.join(workspaceRoot, String(item)))
       : scopedRepoPath(item, workspaceRoot);
@@ -2567,6 +3224,284 @@ function proposeImprovement(payload = {}) {
   return { schema: "hemlock.agent.improve-proposal.result.v1", status: "proposed", proposal: receipt, receiptPath, evidenceRefs: [receiptPath, "receipt://proposed-improvement"], summary: `Recorded bounded improvement proposal ${proposalId}; nothing was applied.` };
 }
 
+// ── Runtime settings store + dependency probe ────────────────────────────
+// A persisted JSON store in the data dir for user-tunable runtime knobs.
+// Each field declares appliesOn honestly: values that feed serverArgs or a
+// boot-time constant only take effect on the next server/app launch; values
+// read through a live seam (the orchestrator's per-call HEMLOCK_FALLBACK_LANE
+// env read, or renderer-held defaults) apply immediately.
+const RUNTIME_SETTINGS_PATH = path.join(runtimeDataRoot, "settings.json");
+const RUNTIME_SETTING_DEFS = {
+  promptCacheSlots: { label: "Prompt cache slots", kind: "number", group: "runtime", appliesOn: "next-launch", env: "HEMLOCK_PROMPT_CACHE_SLOTS", min: 1, max: 16, default: 4, help: "Prompt-cache entries the Maple server persists across restarts. Read by the Python server at spawn — applies on the next server launch." },
+  prefillStepSize: { label: "Prefill step size", kind: "number", group: "runtime", appliesOn: "next-launch", env: "HEMLOCK_PREFILL_STEP_SIZE", min: 256, max: 8192, default: maplePrefillStepSize, help: "Prompt prefill chunk size; smaller values stay more responsive on long prompts. Feeds --prefill-step-size — applies on the next server launch." },
+  kvBits: { label: "KV cache bits", kind: "select", group: "runtime", appliesOn: "next-launch", env: "HEMLOCK_KV_BITS", default: "0", options: [{ value: "0", label: "Off — exact fp16 KV (default)" }, { value: "8", label: "8-bit — near-lossless, ~2× smaller KV" }, { value: "4", label: "4-bit — ~4× smaller KV, quality risk" }], help: "Quantizes the 6 full-attention layers' KV cache past --quantized-kv-start tokens; sliding-window layers stay exact. Speeds up long-context decode and raises the practical context ceiling. Feeds --kv-bits — applies on the next server launch." },
+  // Live seam: resolveContextMaxTokens re-reads process.env on every request
+  // for tasks that never pinned a ceiling, so an env write applies
+  // immediately — no relaunch. The default itself is kv-aware (24000 exact,
+  // 61440 with kvBits) and resolves live too.
+  contextMaxTokens: { label: "Context max tokens", kind: "number", group: "runtime", appliesOn: "live", env: "HEMLOCK_CONTEXT_MAX_TOKENS", min: 4096, max: 124000, get default() { return require("./agent_contracts.cjs").defaultContextMaxTokens(); }, help: "Per-request context budget enforced before each Maple call — over-budget requests compact, then block. Applies immediately; a task that pinned its own ceiling keeps it. Default scales with KV quantization (24000 exact / 61440 with kvBits). Values above the model ceiling minus 2048 are clamped and the clamp is receipted." },
+  fallbackLane: { label: "Fallback lane", kind: "select", group: "runtime", appliesOn: "live", env: "HEMLOCK_FALLBACK_LANE", default: "none", options: [{ value: "none", label: "None — Maple only" }, { value: "codex", label: "Codex" }, { value: "claude", label: "Claude" }], help: "Subscription lane a step retries on once when Maple's transport dies. Read per task — applies immediately." },
+  warmCooldownMs: { label: "Warm cooldown (ms)", kind: "number", group: "runtime", appliesOn: "next-launch", env: "HEMLOCK_WARM_COOLDOWN_MS", min: 60000, max: 3600000, default: 60000, help: "Minimum gap between Maple prompt-cache warm prefills. Read once at app boot — applies on the next app launch." },
+  autonomyDefault: { label: "Default autonomy", kind: "select", group: "agent", appliesOn: "live", default: "guided", options: [{ value: "bounded-local", label: "Supervised — approve every step" }, { value: "guided", label: "Guided — plans auto-approve" }, { value: "autonomous", label: "Autonomous — budgets still bind" }], help: "Autonomy level offered to new work; the workspace applies it to the composer control immediately." },
+  reasoningLevel: { label: "Default reasoning", kind: "select", group: "agent", appliesOn: "live", default: "on", options: ["on", "off", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, label: value })), help: "Reasoning level for new work; a lane falls back to its own default for levels it does not support." },
+};
+
+function coerceRuntimeSetting(key, raw) {
+  const def = RUNTIME_SETTING_DEFS[key];
+  if (!def) return { ok: false, error: `Unknown runtime setting: ${key}` };
+  if (raw === null || raw === undefined || raw === "") return { ok: true, value: null };
+  if (def.kind === "number") {
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return { ok: false, error: `${def.label} must be a number.` };
+    const rounded = Math.round(value);
+    if (rounded < def.min || rounded > def.max) return { ok: false, error: `${def.label} must be between ${def.min} and ${def.max}.` };
+    return { ok: true, value: rounded };
+  }
+  if (def.kind === "select") {
+    const value = String(raw);
+    const allowed = (def.options || []).map((option) => option.value);
+    if (!allowed.includes(value)) return { ok: false, error: `${def.label} must be one of: ${allowed.join(", ")}.` };
+    return { ok: true, value };
+  }
+  return { ok: true, value: String(raw) };
+}
+
+function readRuntimeSettings() {
+  const stored = readJsonFile(RUNTIME_SETTINGS_PATH, {}, { label: "runtime-settings" });
+  const values = {};
+  for (const key of Object.keys(RUNTIME_SETTING_DEFS)) {
+    const coerced = coerceRuntimeSetting(key, stored?.[key]);
+    if (coerced.ok && coerced.value !== null) values[key] = coerced.value;
+    else values[key] = RUNTIME_SETTING_DEFS[key].default;
+  }
+  return values;
+}
+
+// Push a stored value into the seam the runtime actually reads. Env-backed
+// knobs go to process.env (the Python server inherits it at spawn; the
+// fallback-lane read is per-call so it goes live). prefillStepSize was already
+// frozen into serverArgs before this file's settings code ran, so the flag is
+// patched in place — the next server spawn honors it either way.
+function applyRuntimeSettingEnv(key, value) {
+  const def = RUNTIME_SETTING_DEFS[key];
+  if (!def?.env) return;
+  if (value === null || value === undefined) delete process.env[def.env];
+  else process.env[def.env] = String(value);
+  if (key === "prefillStepSize") {
+    const flagIndex = serverArgs.indexOf("--prefill-step-size");
+    // A cleared override restores the boot-time default, not the last patch.
+    if (flagIndex >= 0) serverArgs[flagIndex + 1] = String(value ?? maplePrefillStepSize);
+  }
+  if (key === "kvBits") {
+    // --kv-bits is conditionally emitted into serverArgs at module load, so a
+    // settings write must patch the flags or the stored value would never
+    // reach the spawned server — leaving the context budget to believe in
+    // quantization the server does not have.
+    const resolvedBits = value === null || value === undefined ? mapleKvBits : Number(value);
+    const bits = Number.isFinite(resolvedBits) ? Math.max(0, Math.min(8, Math.round(resolvedBits))) : 0;
+    const kvIndex = serverArgs.indexOf("--kv-bits");
+    const startIndex = serverArgs.indexOf("--quantized-kv-start");
+    if (bits > 0) {
+      if (kvIndex >= 0) serverArgs[kvIndex + 1] = String(bits);
+      else serverArgs.push("--kv-bits", String(bits));
+      if (startIndex >= 0) serverArgs[startIndex + 1] = String(mapleKvQuantStart);
+      else serverArgs.splice(kvIndex >= 0 ? kvIndex + 2 : serverArgs.length, 0, "--quantized-kv-start", String(mapleKvQuantStart));
+    } else {
+      if (startIndex >= 0) serverArgs.splice(startIndex, 2);
+      if (kvIndex >= 0) serverArgs.splice(kvIndex, 2);
+    }
+    // Keep the budget's kv signal consistent with the flags the next spawn
+    // gets: a cleared override restores the boot-time value, not "0".
+    if (value === null || value === undefined) process.env.HEMLOCK_KV_BITS = String(mapleKvBits);
+    // The prompt-cache byte cap default scales with quantization too (see the
+    // maplePromptCacheBytes math); an explicit env override always wins.
+    if (!String(process.env.HEMLOCK_MAPLE_PROMPT_CACHE_BYTES || "").trim()) {
+      const bytesValue = defaultMaplePromptCacheBytes(bits);
+      maplePromptCacheBytes = bytesValue;
+      const bytesIndex = serverArgs.indexOf("--prompt-cache-bytes");
+      if (bytesIndex >= 0) serverArgs[bytesIndex + 1] = bytesValue;
+    }
+  }
+}
+
+function applyRuntimeSettingsEnv() {
+  const stored = readJsonFile(RUNTIME_SETTINGS_PATH, {}, { label: "runtime-settings" });
+  for (const key of Object.keys(RUNTIME_SETTING_DEFS)) {
+    if (stored?.[key] === undefined || stored?.[key] === null) continue;
+    const coerced = coerceRuntimeSetting(key, stored[key]);
+    if (coerced.ok && coerced.value !== null) applyRuntimeSettingEnv(key, coerced.value);
+  }
+}
+
+// Boot-time apply: stored values reach process.env (and the mutable
+// serverArgs entry) before later module constants and server spawns read them.
+applyRuntimeSettingsEnv();
+
+function promptCacheFileInfo() {
+  const flagIndex = serverArgs.indexOf("--prompt-cache-file");
+  const filePath = flagIndex >= 0 ? String(serverArgs[flagIndex + 1]) : path.join(runtimeDataRoot, "maple-prompt-cache.safetensors");
+  const base = path.basename(filePath);
+  let names = [];
+  try {
+    names = fs.readdirSync(path.dirname(filePath)).filter((name) => name === base || name.startsWith(`${base}.`));
+  } catch { names = []; }
+  let bytes = 0;
+  const files = [];
+  for (const name of names) {
+    try {
+      const stat = fs.statSync(path.join(path.dirname(filePath), name));
+      if (stat.isFile()) { bytes += stat.size; files.push(name); }
+    } catch { /* vanished between readdir and stat — skip */ }
+  }
+  return { path: filePath, bytes, files: files.length, present: files.length > 0, serverMayRewrite: serverProcess != null };
+}
+
+function runtimeSettingsSnapshot(extra = {}) {
+  const settings = readRuntimeSettings();
+  const fields = Object.entries(RUNTIME_SETTING_DEFS).map(([key, def]) => ({ key, ...def, value: settings[key] }));
+  return { schema: "hemlock.settings.v1", status: "ok", path: RUNTIME_SETTINGS_PATH, settings, fields, promptCache: promptCacheFileInfo(), summary: "Runtime settings resolved against persisted overrides and defaults.", ...extra };
+}
+
+function setRuntimeSettings(payload = {}) {
+  const edits = payload.settings && typeof payload.settings === "object"
+    ? Object.entries(payload.settings).map(([key, value]) => ({ key, value }))
+    : [{ key: payload.key, value: payload.value }];
+  const stored = readJsonFile(RUNTIME_SETTINGS_PATH, {}, { label: "runtime-settings" }) || {};
+  const applied = {};
+  for (const edit of edits) {
+    const key = String(edit.key || "");
+    if (!RUNTIME_SETTING_DEFS[key]) throw new Error(`Unknown runtime setting: ${key || "(missing key)"}`);
+    const coerced = coerceRuntimeSetting(key, edit.value);
+    if (!coerced.ok) throw new Error(coerced.error);
+    if (coerced.value === null) delete stored[key];
+    else stored[key] = coerced.value;
+    applyRuntimeSettingEnv(key, coerced.value);
+    applied[key] = { value: coerced.value === null ? RUNTIME_SETTING_DEFS[key].default : coerced.value, appliesOn: RUNTIME_SETTING_DEFS[key].appliesOn };
+  }
+  writeJsonFile(RUNTIME_SETTINGS_PATH, stored);
+  appendAgentEvent("settings.updated", "accepted", { keys: Object.keys(applied) }, { evidenceRefs: [RUNTIME_SETTINGS_PATH], reversible: true });
+  return runtimeSettingsSnapshot({ updated: applied, summary: `Updated ${Object.keys(applied).join(", ")}; fields marked next-launch take effect on restart.` });
+}
+
+function clearPromptCacheFiles() {
+  const info = promptCacheFileInfo();
+  const base = path.basename(info.path);
+  let names = [];
+  try {
+    names = fs.readdirSync(path.dirname(info.path)).filter((name) => name === base || name.startsWith(`${base}.`));
+  } catch { names = []; }
+  const removed = [];
+  for (const name of names) {
+    try { fs.unlinkSync(path.join(path.dirname(info.path), name)); removed.push(name); } catch { /* already gone */ }
+  }
+  appendAgentEvent("settings.prompt-cache.cleared", "accepted", { path: info.path, removed: removed.length, freedBytes: info.bytes, serverMayRewrite: info.serverMayRewrite }, { reversible: false });
+  return {
+    schema: "hemlock.settings.clear-prompt-cache.v1",
+    status: "cleared",
+    path: info.path,
+    removed: removed.length,
+    freedBytes: info.bytes,
+    serverMayRewrite: info.serverMayRewrite,
+    summary: info.serverMayRewrite
+      ? `Removed ${removed.length} prompt-cache file(s); the running server may rewrite entries on exit.`
+      : `Removed ${removed.length} prompt-cache file(s).`,
+  };
+}
+
+// deps.check: probe the interpreter + packages the Maple/Dream stack actually
+// needs — the resolved venv python, the repo's mlx_lm fork, mlx, transformers —
+// plus the served model checkpoint and the host's own Node runtime. Nothing in
+// this stack uses torch; no torch probe exists by design.
+function probePythonEnvironment(timeoutMs = 40000) {
+  return new Promise((resolve) => {
+    const script = [
+      "import json, sys, platform, importlib",
+      "import importlib.metadata",
+      "out = {\"executable\": sys.executable, \"version\": platform.python_version()}",
+      "for name, mod in ((\"mlx_lm\", \"mlx_lm\"), (\"mlx\", \"mlx.core\"), (\"transformers\", \"transformers\")):",
+      "    entry = {}",
+      "    try:",
+      "        importlib.import_module(mod)",
+      "        entry[\"ok\"] = True",
+      "    except Exception as exc:",
+      "        entry[\"ok\"] = False",
+      "        entry[\"error\"] = \"%s: %s\" % (type(exc).__name__, exc)",
+      "    try:",
+      "        entry[\"version\"] = importlib.metadata.version(name)",
+      "    except Exception:",
+      "        entry[\"version\"] = None",
+      "    out[name] = entry",
+      "print(json.dumps(out))",
+    ].join("\n");
+    let child;
+    try {
+      child = spawnPython([...pythonFlags, "-c", script], { env: pythonEnvironment(), stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      resolve({ error: error.message });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      finish({ error: `probe timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => { clearTimeout(timer); finish({ error: error.message }); });
+    child.once("close", () => {
+      clearTimeout(timer);
+      try {
+        finish({ report: JSON.parse(String(stdout).trim().split("\n").pop()) });
+      } catch {
+        finish({ error: String(stderr).trim().slice(-300) || "probe produced no report" });
+      }
+    });
+  });
+}
+
+async function checkDependencies() {
+  const checks = [];
+  const probe = await probePythonEnvironment();
+  const report = probe.report || null;
+  checks.push(report
+    ? { name: "python3", status: "ok", detail: `${report.version || "unknown version"} · ${report.executable || python}` }
+    : { name: "python3", status: fs.existsSync(python) ? "degraded" : "missing", detail: probe.error ? `${python} — ${probe.error}` : `not found at ${python}` });
+  for (const name of ["mlx_lm", "mlx", "transformers"]) {
+    const entry = report?.[name];
+    if (!report) checks.push({ name, status: "missing", detail: "python probe did not run" });
+    else if (entry?.ok) checks.push({ name, status: "ok", detail: `importable${entry.version ? ` · ${entry.version}` : ""}` });
+    else checks.push({ name, status: "missing", detail: `not importable — ${entry?.error || "unknown error"}` });
+  }
+  const modelConfig = path.join(modelPath, "config.json");
+  let modelCheck;
+  try {
+    JSON.parse(fs.readFileSync(modelConfig, "utf-8"));
+    modelCheck = { name: "maple-model", status: "ok", detail: `config.json readable · ${modelPath}` };
+  } catch (error) {
+    modelCheck = fs.existsSync(modelPath)
+      ? { name: "maple-model", status: "degraded", detail: `${modelPath} — config.json unreadable: ${error.message}` }
+      : { name: "maple-model", status: "missing", detail: `no checkpoint at ${modelPath}` };
+  }
+  checks.push(modelCheck);
+  checks.push({ name: "node", status: "ok", detail: `host runtime ${process.version}` });
+  const missing = checks.filter((row) => row.status === "missing").length;
+  const degraded = checks.filter((row) => row.status === "degraded").length;
+  return {
+    schema: "hemlock.deps.check.v1",
+    status: missing ? "missing" : degraded ? "degraded" : "ok",
+    checks,
+    pythonPath: python,
+    summary: missing ? `${missing} required piece(s) missing, ${degraded} degraded.` : degraded ? `${degraded} degraded; required pieces present.` : "All runtime dependencies present.",
+  };
+}
+
 const agentCommands = {
   status: { label: "System status", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{}" },
   "context.refresh": { label: "Refresh awareness context", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{reason?}" },
@@ -2586,12 +3521,13 @@ const agentCommands = {
   "receipt.inspect": { label: "Inspect a local receipt", capability: "read", auto: true, approval: "none", timeoutMs: 15000, inputHint: "{path:\"receipt path under app data\"}" },
   recall: { label: "Recall memory", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{query?, limit?}" },
   "receipts.query": { label: "Query local receipts", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{}" },
-  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true, inputHint: "{summary, rationale, files?:[\"repo-relative\"], change?:\"patch/spec <=8KB\", confidence?:0-1}" },
-  "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false, inputHint: "{text|objective:\"task\", intent?, autonomy?, threadId?|workspaceRoot?}" },
+  "improve.propose": { label: "Propose bounded local improvement", capability: "write", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: true, reversible: true, inputHint: "{summary, rationale, files?:[\"repo-relative\"], change?:\"patch/spec <=32KB\", confidence?:0-1}" },
+  "intent.submit": { label: "Accept a Hemlock intent", capability: "task", auto: true, approval: "none", timeoutMs: 90000, countsAgainstBudget: false, inputHint: "{text|objective:\"task\", intent?, autonomy?, threadId?|workspaceRoot?, fallbackLane?:\"codex|claude|none\"}" },
   "thread.list": { label: "List Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
-  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{query, limit?<=20}" },
+  "thread.search": { label: "Search Hemlock threads", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{query, limit?<=40}" },
   "conversation.history": { label: "Read thread conversation history", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
   "conversation.reset": { label: "Reset thread to fresh context", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
+  "conversation.trim": { label: "Trim thread conversation tail", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?, keep?<=80, maxChars?}" },
   "provider.capacity": { label: "Set provider concurrency caps", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{caps:{provider:maxConcurrent}}" },
   "thread.create": { label: "Create Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{title?, workspaceRoot?, projectId?|projectName?, autonomy?}" },
   "thread.switch": { label: "Switch Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId}" },
@@ -2601,6 +3537,11 @@ const agentCommands = {
   "thread.archive": { label: "Archive Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?}" },
   "thread.restore": { label: "Restore archived Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId}" },
   "thread.cancel": { label: "Cancel Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?}" },
+  "thread.checkpoints": { label: "List thread checkpoints", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?}" },
+  "thread.conversation": { label: "Read thread conversation tail", capability: "task", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{threadId?, limit?<=200}" },
+  "thread.fork": { label: "Fork Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?, title?}" },
+  "thread.checkpoint.restore": { label: "Roll a thread back to a checkpoint", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{threadId?, checkpointId}" },
+  "thread.delete": { label: "Delete Hemlock thread", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{threadId, force?}" },
   "project.list": { label: "List Hemlock projects", capability: "context", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
   "project.register": { label: "Register project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{workspaceRoot, displayName?}" },
   "project.select": { label: "Select project directory", capability: "context", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{projectId} or {workspaceRoot, projectName?}" },
@@ -2616,6 +3557,7 @@ const agentCommands = {
   "plan.propose": { label: "Propose bounded plan", capability: "task", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{rationale?, steps?:[{commandId, label}]}" },
   "plan.approve": { label: "Approve bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?, planId?, budgetOverrides?}" },
   "plan.reject": { label: "Reject bounded plan", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{planId?, reason?}" },
+  "plan.revise": { label: "Revise remaining plan steps", capability: "task", auto: false, approval: "plan", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{steps:[{commandId,label,input?}|{kind:\"answer|ask_user\",label}], rationale?}" },
   "task.pause": { label: "Pause running task", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?}" },
   "task.resume": { label: "Resume approved task", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{taskId?}" },
   "task.answer": { label: "Answer Maple's question", capability: "task", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, reversible: true, inputHint: "{answer:\"the user reply\"}" },
@@ -2629,8 +3571,15 @@ const agentCommands = {
   "dream.detach": { label: "Detach active Dream graft", capability: "train", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
   "dream.fuse": { label: "Fuse a Dream graft into new served weights", capability: "train", auto: false, approval: "explicit", timeoutMs: 600000, countsAgainstBudget: false, reversible: true, inputHint: "{adapterPath?: \"defaults to the active graft\"}" },
   "dream.grafts": { label: "List Dream grafts", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
+  "dream.dataset.preview": { label: "Preview Dream dataset composition", capability: "read", auto: true, approval: "none", timeoutMs: 120000, countsAgainstBudget: false, reversible: true, inputHint: "{facts?|examples?|conversation?, samples?:8}" },
+  "dream.eval": { label: "Compare served model vs adapter on tool-use tasks", capability: "train", auto: false, approval: "explicit", timeoutMs: 600000, countsAgainstBudget: false, reversible: true, inputHint: "{adapterPath?: \"defaults to the active graft\"}" },
   "maple.launch": { label: "Launch Maple/Dream runtime", capability: "runtime", auto: false, approval: "explicit", timeoutMs: readinessTimeoutMs, countsAgainstBudget: false, reversible: true, inputHint: "{}" },
-  verify: { label: "Run verification", capability: "verify", auto: true, approval: "none", timeoutMs: 300000, inputHint: "{profile:\"app-build|diff-check|python-tests\", workspaceRoot?}" },
+  // Host-internal warm prefill: the ready/switch hooks call it freely (it is
+  // a 1-token cache seed, never a mutation), while a model-proposed call
+  // still rides the explicit-approval gate.
+  "maple.warm": { label: "Warm Maple prompt cache prefix", capability: "runtime", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: false, reversible: true, inputHint: "{reason?}" },
+  verify: { label: "Run verification", capability: "verify", auto: true, approval: "none", timeoutMs: 300000, inputHint: "{profile:\"app-build|diff-check|python-tests|lint|typecheck|npm-test\", workspaceRoot?}" },
+  "shell.exec": { label: "Run a bounded workspace command", capability: "verify", auto: false, approval: "plan", timeoutMs: 60000, countsAgainstBudget: true, inputHint: "{command:\"git|rg|node|npm|python3|...\", args?:[...], cwd?:\"repo-relative\"}" },
   "change.prepare": { label: "Prepare isolated change set", capability: "write-preparation", auto: true, approval: "none", timeoutMs: 30000, reversible: true, inputHint: "{changeSetId?, patch?:\"unified diff\"}" },
   "code.inspect": { label: "Inspect assigned coding workspace", capability: "read", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{threadId?}" },
   "code.apply": { label: "Apply scoped coding edit", capability: "write", auto: true, approval: "plan", timeoutMs: 30000, reversible: true, inputHint: "{source:{file:\"complete contents\"}|patches:[{path,content:\"complete file\"}], baseDigests?, reason?}" },
@@ -2653,9 +3602,19 @@ const agentCommands = {
   "memory.demote": { label: "Demote project lesson", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{targetId, note?}" },
   "memory.rollback": { label: "Rollback memory promotion", capability: "memory", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{targetId, note?}" },
   "memory.feedback": { label: "Record recall usefulness feedback", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{recordId, kind:\"useful|irrelevant\", query?}" },
+  "memory.select": { label: "Select fit memories for training data", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{limit?, minFitness?, status?}" },
+  "memory.list": { label: "List memory records with staleness and provenance", capability: "memory", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{includeDemoted?, includeAudit?, threshold?}" },
+  "memory.consolidate": { label: "Consolidate near-duplicate memories", capability: "memory", auto: false, approval: "plan", timeoutMs: 30000, countsAgainstBudget: true, reversible: true, inputHint: "{threshold?:0.7, dryRun?, note?}" },
+  // memory.note is the only mint path on the agent surface — records land as
+  // "candidate" so promotion still goes through memory.promote and the
+  // append-only ledger semantics are preserved.
+  "memory.note": { label: "Record a memory note", capability: "memory", auto: false, approval: "plan", timeoutMs: 30000, countsAgainstBudget: true, reversible: true, inputHint: "{title, body, tags?, evidenceRefs?}" },
   "artifact.create": { label: "Create task artifact", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId?, title, kind?:\"html|svg|text|markdown|json\", entrypoint?, mime?}" },
-  "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{source:\"complete self-contained HTML\"|{file:\"contents\"}, artifactId?, filename?, kind?}" },
-  "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, inputHint: "{artifactId?, source|patches:\"complete-file map\", repairFor?}" },
+  // Artifact writes land in the reversible, task-scoped artifact store — a
+  // strictly safer surface than code.apply (already plan-gated), so these run
+  // under plan approval instead of per-action explicit approval.
+  "artifact.author": { label: "Author task artifact", capability: "artifact", auto: false, approval: "plan", timeoutMs: 30000, inputHint: "{source:\"complete self-contained HTML\"|{file:\"contents\"}, artifactId?, filename?, kind?}" },
+  "artifact.update": { label: "Update task artifact", capability: "artifact", auto: false, approval: "plan", timeoutMs: 30000, inputHint: "{artifactId?, source|patches:\"complete-file map\", repairFor?}" },
   "artifact.restore": { label: "Restore a verified artifact revision", capability: "artifact", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{artifactId, revision}" },
   "artifact.repair.retry": { label: "Retry artifact repair", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 120000, countsAgainstBudget: false, inputHint: "{taskId?}" },
   "artifact.repair.use-last-good": { label: "Use last good artifact revision", capability: "artifact", auto: false, approval: "explicit", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{taskId?}" },
@@ -2671,8 +3630,47 @@ const agentCommands = {
   "experiment.run": { label: "Run a bounded world physics experiment", capability: "verify", auto: true, approval: "none", timeoutMs: 30000, inputHint: "{experiment:\"pendulum|projectile|orbit|spring|collision|terminal\", input?, seed?, hypothesis?}" },
   "experiment.note": { label: "Record an experiment finding into the Dream dataset", capability: "write", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{claim:\"what the world showed\", experimentId?, hypothesis?}" },
   "experiment.dataset": { label: "List recorded experiment findings", capability: "read", auto: true, approval: "none", timeoutMs: 30000, countsAgainstBudget: false, inputHint: "{limit?}" },
+  "experiment.suggest": { label: "Rank experiment coverage gaps", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{limit?}" },
   "agent.capabilities": { label: "Describe my available commands", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "agent.self": { label: "Read my own task snapshot", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "world.state": { label: "Read the understory world state", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  // world.place mutates the grove (durable marker record + world.placed event)
+  // so it rides the same plan gate as other world writes.
+  "world.place": { label: "Place a grove marker", capability: "write", auto: false, approval: "plan", timeoutMs: 15000, countsAgainstBudget: true, reversible: true, inputHint: "{kind:\"marker|monument|sign\", label, note?, position?:{x,z}}" },
+  "deps.check": { label: "Probe local runtime dependencies", capability: "read", auto: true, approval: "none", timeoutMs: 60000, countsAgainstBudget: false, inputHint: "{}" },
+  "settings.get": { label: "Read runtime settings", capability: "read", auto: true, approval: "none", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
+  "settings.set": { label: "Update runtime settings", capability: "task", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, reversible: true, inputHint: "{key, value} or {settings:{...}}" },
+  "settings.clearPromptCache": { label: "Clear the persisted prompt cache", capability: "runtime", auto: false, approval: "explicit", timeoutMs: 15000, countsAgainstBudget: false, inputHint: "{}" },
 };
+
+// A user-initiated train run carries its own cycle budget, not the
+// foreground task's: a resumed or long-lived task can hold
+// maxTrainingCycles:0, which used to block every "Run local Dream" click
+// with TRAINING_BUDGET_EXHAUSTED before the trainer spawned. The kernel
+// reads the task budget synchronously inside startOperation, so a
+// run-scoped task record is swapped in only for that call and the live
+// task is restored immediately after. Agent-initiated runs
+// (__fromAgentAction) still spend the task's own budget — the model cannot
+// loop training past its granted cycles — and the explicit-approval gate
+// in runAgentCommand is untouched either way.
+function startCommandOperation({ command, descriptor, payload }) {
+  if (descriptor.capability !== "train" || payload.__fromAgentAction === true) {
+    return agentKernel.startOperation({ taskId: agentTask.id, command, capability: descriptor.capability, payload, descriptor });
+  }
+  const scopedTask = {
+    ...agentTask,
+    id: `task-train-${command}-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`,
+    objective: `Local ${command} run`,
+    intent: "dream",
+    budget: mergeBudget(DEFAULT_BUDGET),
+  };
+  agentKernel.syncTask(scopedTask);
+  try {
+    return agentKernel.startOperation({ taskId: scopedTask.id, command, capability: descriptor.capability, payload, descriptor });
+  } finally {
+    agentKernel.syncTask(agentTask);
+  }
+}
 
 async function runAgentCommand(action, payload = {}) {
   const command = String(action || "status");
@@ -2686,12 +3684,22 @@ async function runAgentCommand(action, payload = {}) {
   }
   let operation = null;
   try {
-    operation = agentKernel.startOperation({ taskId: agentTask.id, command, capability: descriptor.capability, payload, descriptor });
+    operation = startCommandOperation({ command, descriptor, payload });
   } catch (budgetError) {
     appendAgentEvent("command.blocked", "blocked", { command, reason: budgetError.message, code: budgetError.code || "COMMAND_BUDGET" }, { reversible: true });
     throw budgetError;
   }
-  appendAgentEvent("command.started", "running", { command, capability: descriptor.capability, operationId: operation.id });
+  // startOperation charges command/training budgets on the kernel's task
+  // projection only; mirror the counters onto agentTask so state.json,
+  // receipts, and the task.updated projection report real usage — and so a
+  // later syncTask cannot stomp the kernel's count back to the stale value.
+  try {
+    const kernelBudget = agentKernel.getProjection().task?.budget || {};
+    if (kernelBudget.commandsUsed !== agentTask.budget?.commandsUsed || kernelBudget.trainingCyclesUsed !== agentTask.budget?.trainingCyclesUsed) {
+      updateAgentTask({ budget: { ...mergeBudget(agentTask.budget), commandsUsed: kernelBudget.commandsUsed, trainingCyclesUsed: kernelBudget.trainingCyclesUsed } }, { emit: false });
+    }
+  } catch { /* the budget mirror is advisory; the operation receipt is authoritative */ }
+  appendAgentEvent("command.started", "running", { command, capability: descriptor.capability, operationId: operation.id, taskId: operation.taskId });
   try {
     let result;
     if (command === "intent.submit") result = await submitAgentIntent({ ...payload, operationId: payload.operationId || operation.id });
@@ -2700,7 +3708,7 @@ async function runAgentCommand(action, payload = {}) {
       // Bounded title+body search over recent threads. Read-only; results feed
       // the palette THREADS section's content matches.
       const query = String(payload.query || "");
-      const limit = Number.isFinite(Number(payload.limit)) ? Math.max(1, Math.min(20, Math.round(Number(payload.limit)))) : 6;
+      const limit = Number.isFinite(Number(payload.limit)) ? Math.max(1, Math.min(40, Math.round(Number(payload.limit)))) : 6;
       result = { schema: "hemlock.agent.thread.search.v1", status: "searched", query, results: threadManager.searchThreads(query, { limit }) };
     }
     else if (command === "provider.capacity") result = { schema: "hemlock.agent.provider.capacity.v1", status: "updated", providerCaps: threadManager.setProviderCaps(payload.caps || payload) };
@@ -2715,9 +3723,15 @@ async function runAgentCommand(action, payload = {}) {
         // crashed or was closed mid-task, leaving status "running" or
         // "waiting_for_approval".  Treat that as blocked so the queue
         // does not enqueue every new intent behind a stale action loop.
+        // Session identity decides: a snapshot written by a different session
+        // belongs to a dead action loop no matter how young it is (the >10min
+        // age check missed restarts seconds old). Snapshots predating the
+        // sessionId stamp keep the age heuristic as fallback.
         const staleSnapshot = thread.taskSnapshot;
-        const sessionBoundary = staleSnapshot.startedAt
-          && Date.now() - new Date(staleSnapshot.startedAt).getTime() > 600000; // 10 min
+        const sessionBoundary = staleSnapshot.sessionId
+          ? staleSnapshot.sessionId !== sessionId
+          : staleSnapshot.startedAt
+            && Date.now() - new Date(staleSnapshot.startedAt).getTime() > 600000; // 10 min
         agentTask = {
           ...staleSnapshot,
           threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot,
@@ -2728,13 +3742,17 @@ async function runAgentCommand(action, payload = {}) {
           blockedReason: sessionBoundary
             ? "The previous session was interrupted; inspect and resume the task."
             : staleSnapshot.blockedReason || null,
+          sessionId,
         };
       } else {
-        agentTask = { ...agentTask, id: thread.taskId || `task-${thread.id}`, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, objective: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase || "conversation", status: thread.status || "ready", blockedReason: thread.blockedReason || null };
+        agentTask = { ...agentTask, id: thread.taskId || `task-${thread.id}`, threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot, objective: thread.title, provider: thread.provider, model: thread.model, reasoning: thread.reasoning, autonomy: thread.autonomy, phase: thread.phase || "conversation", status: thread.status || "ready", blockedReason: thread.blockedReason || null, sessionId };
       }
       writeAgentState();
       agentKernel.syncTask(agentTask);
       appendAgentEvent("thread.switched", "accepted", { threadId: thread.id, projectId: thread.projectId, workspaceRoot: thread.workspaceRoot }, { reversible: true });
+      // The new thread's first step would cold-prefill if the switch cost
+      // the cache its entries; a bounded warm re-seeds the shared prefix.
+      void warmMaplePromptCache("thread-switch");
       result = { schema: "hemlock.agent.thread.result.v1", status: "switched", thread, task: agentTask, context: compileThreadContext(thread.id), conversation: threadManager.readConversation(thread.id) };
     }
     else if (command === "thread.rename") result = { schema: "hemlock.agent.thread.result.v1", status: "renamed", thread: threadManager.updateThread(String(payload.threadId || agentTask.threadId), { title: String(payload.title || payload.name || "Hemlock thread") }) };
@@ -2746,6 +3764,19 @@ async function runAgentCommand(action, payload = {}) {
       const reset = threadManager.resetConversation(threadId);
       appendAgentEvent("conversation.reset", "accepted", { threadId, archivedMessages: reset.archivedMessages, archivePath: reset.archivePath }, { reversible: false });
       result = { schema: "hemlock.agent.thread.result.v1", status: "reset", threadId, ...reset };
+    }
+    else if (command === "conversation.trim") {
+      // Bounded tail trim for context-budget relief: the oldest messages
+      // archive out beside the log while the recent tail stays, so the
+      // thread keeps usable context. Receipted as context.compacted like
+      // every other compaction — the spine records what was dropped.
+      const threadId = String(payload.threadId || agentTask.threadId);
+      const trimmed = threadManager.trimConversation(threadId, {
+        keep: Number.isFinite(Number(payload.keep)) ? Math.max(1, Math.min(80, Math.round(Number(payload.keep)))) : 24,
+        maxChars: Number.isFinite(Number(payload.maxChars)) ? Math.max(4000, Math.min(400000, Math.round(Number(payload.maxChars)))) : 48000,
+      });
+      appendAgentEvent("context.compacted", "degraded", { threadId, region: "thread-conversation", reason: String(payload.reason || "manual-trim"), dropped: { conversationMessages: trimmed.dropped }, kept: trimmed.kept, archivePath: trimmed.archivePath }, { reversible: false });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "trimmed", threadId, ...trimmed };
     }
     else if (command === "conversation.history") result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId: String(payload.threadId || agentTask.threadId || ""), conversation: threadManager.readConversation(String(payload.threadId || agentTask.threadId || "")) };
     else if (command === "comparison.run") result = await runComparisonLane(payload);
@@ -2768,6 +3799,35 @@ async function runAgentCommand(action, payload = {}) {
       result = { schema: "hemlock.agent.thread.result.v1", status: "restored", thread };
     }
     else if (command === "thread.cancel") result = { schema: "hemlock.agent.thread.result.v1", status: "cancelled", thread: threadManager.cancelThread(String(payload.threadId || agentTask.threadId)) };
+    else if (command === "thread.checkpoints") {
+      const threadId = String(payload.threadId || agentTask.threadId || "");
+      result = { schema: "hemlock.agent.thread.checkpoints.v1", status: "ok", threadId, checkpoints: threadManager.checkpoints(threadId) };
+    }
+    else if (command === "thread.conversation") {
+      const threadId = String(payload.threadId || agentTask.threadId || "");
+      const limit = Number.isFinite(Number(payload.limit)) ? Math.max(1, Math.min(200, Math.round(Number(payload.limit)))) : 40;
+      result = { schema: "hemlock.agent.thread.result.v1", status: "ok", threadId, conversation: threadManager.readConversation(threadId, { limit }) };
+    }
+    else if (command === "thread.fork") {
+      // Fork is provenance, not history copy: the new thread inherits the
+      // workspace/provider/autonomy, records where it came from, and the
+      // active thread stays put — the fork only joins the list.
+      const sourceId = String(payload.threadId || agentTask.threadId || "");
+      const thread = threadManager.forkThread(sourceId, { title: payload.title });
+      appendAgentEvent("thread.forked", "accepted", { threadId: sourceId, forkedThreadId: thread.id, title: thread.title }, { reversible: true });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "forked", thread, threads: threadManager.snapshot().threads };
+    }
+    else if (command === "thread.checkpoint.restore") {
+      const threadId = String(payload.threadId || agentTask.threadId || "");
+      const restored = threadManager.restoreCheckpoint(threadId, String(payload.checkpointId || ""));
+      appendAgentEvent("thread.checkpoint.restored", "accepted", { threadId, checkpointId: restored.restoredCheckpoint?.id || null }, { reversible: true });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "checkpoint-restored", ...restored };
+    }
+    else if (command === "thread.delete") {
+      const outcome = threadManager.deleteThread(String(payload.threadId || ""), { force: payload.force === true });
+      appendAgentEvent("thread.deleted", "accepted", { threadId: outcome.threadId, removedFiles: outcome.removedFiles }, { reversible: false });
+      result = { schema: "hemlock.agent.thread.result.v1", status: "deleted", ...outcome, threads: threadManager.snapshot().threads };
+    }
     else if (command === "project.list") result = { schema: "hemlock.agent.project.result.v1", status: "ready", projects: threadManager.snapshot().projects };
     else if (command === "project.register") result = { schema: "hemlock.agent.project.result.v1", status: "registered", project: threadManager.registerProject(payload) };
     else if (command === "project.select") {
@@ -2791,6 +3851,7 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "training.prepare") result = prepareTrainingDataset(payload);
     else if (command === "training.start") result = await runDream(payload);
     else if (command === "maple.launch") result = await launchMapleRuntime({ resetCrashLoop: true });
+    else if (command === "maple.warm") result = await warmMaplePromptCache(String(payload.reason || "command"));
     else if (command === "status") result = await runSipsRuntime({ action: "status" });
     else if (command === "context.refresh") result = await contextBroker.refresh({ reason: payload.reason || "command" });
     else if (command === "context.search") result = contextBroker.search(payload.query || "");
@@ -2826,6 +3887,16 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "receipts.query") result = queryReceipts(payload);
     else if (command === "improve.propose") result = proposeImprovement(payload);
     else if (command === "agent.capabilities") result = agentCapabilities();
+    else if (command === "agent.self") result = agentSelfSnapshot();
+    else if (command === "world.state") result = worldStateSnapshot();
+    else if (command === "world.place") {
+      if (payload.__fromAgentAction && !approvedPlanAction) throw new Error("Placing a grove marker requires an approved Hemlock plan action.");
+      result = placeWorldMarker(payload);
+    }
+    else if (command === "deps.check") result = await checkDependencies();
+    else if (command === "settings.get") result = runtimeSettingsSnapshot();
+    else if (command === "settings.set") result = setRuntimeSettings(payload);
+    else if (command === "settings.clearPromptCache") result = clearPromptCacheFiles();
     else if (command === "artifact.create") result = artifactCommandReceipt(artifactRegistry.create({ ...payload, taskId: payload.taskId || agentTask.id }), command);
     else if (command === "artifact.author") result = artifactCommandReceipt(artifactRegistry.author({ ...payload, taskId: payload.taskId || agentTask.id }), command);
     else if (command === "artifact.update") result = artifactCommandReceipt(artifactRegistry.update({ ...payload, taskId: payload.taskId || agentTask.id }), command);
@@ -2880,6 +3951,7 @@ async function runAgentCommand(action, payload = {}) {
       appendAgentEvent("memory.recalled", "passed", { query: payload.query || "", count: result.records?.length || 0, records: result.records || [] }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")] });
     }
     else if (command === "verify") result = await runVerification(String(payload.profile || "app-build"), emitSipsProgress, { operationId: operation.id, workspaceRoot: payload.workspaceRoot || agentTask.workspaceRoot });
+    else if (command === "shell.exec") result = await runShellExec(payload, operation.id);
     else if (command === "change.prepare") result = await prepareChangeSet(payload);
     else if (command === "change.apply") {
       if (!approvedPlanAction) throw new Error("Applying a change set requires an approved Hemlock plan action.");
@@ -2903,11 +3975,50 @@ async function runAgentCommand(action, payload = {}) {
     else if (command === "experiment.run") result = await runWorldExperiment(payload);
     else if (command === "experiment.note") result = await recordExperimentFinding(payload);
     else if (command === "experiment.dataset") result = experimentDataset(payload);
+    else if (command === "experiment.suggest") result = experimentSuggest(payload);
     else if (command === "cycle") result = await runSipsCycle(payload);
     else if (command === "dream") result = await runDream(payload);
     else if (command === "dream.detach") result = await detachGraft();
     else if (command === "dream.fuse") result = await fuseGraft(payload);
     else if (command === "dream.grafts") result = { schema: "hemlock.dream.grafts.v1", ...readGrafts(), activeAdapter: serverState.adapterPath || null };
+    else if (command === "dream.dataset.preview") result = await runDreamDatasetPreview(payload);
+    else if (command === "dream.eval") {
+      const { runAdapterComparison } = require("./tool_use_live.cjs");
+      const adapterPath = String(payload.adapterPath || serverState.adapterPath || "");
+      const evalsDir = path.join(sipsDir, "evals");
+      try {
+        const result0 = await runAdapterComparison({ endpoint: serverUrl, adapterPath });
+        // The filename must end in *-receipt.json so receipts.query's
+        // walkFiles pattern (receipt\.json$) surfaces it on the receipts
+        // pane alongside the graft/training receipts.
+        const receiptPath = path.join(evalsDir, `dream-eval-${Date.now()}-receipt.json`);
+        writeJsonFile(receiptPath, { ...result0.comparison, candidateAdapterPath: adapterPath || null });
+        // A dead server fails every task in both lanes — recorded per-task,
+        // not thrown. That outcome is a degraded eval, never a verdict.
+        const responded = (result0.base?.respondedRate ?? 0) + (result0.candidate?.respondedRate ?? 0);
+        if (responded === 0) {
+          appendAgentEvent("dream.eval.degraded", "degraded", { reason: "No eval task produced a response in either lane; the inference server is likely unavailable.", adapterPath: adapterPath || null, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+          result = { ...result0, status: "degraded", receiptPath };
+        } else {
+          appendAgentEvent("dream.eval.completed", "passed", { verdict: result0.comparison?.verdict || null, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+          result = { ...result0, receiptPath };
+        }
+      } catch (evalError) {
+        // Even a hard failure (e.g. the benchmark file is unreadable)
+        // leaves a receipt-shaped record and event instead of crashing
+        // through the dispatch without an honest artifact.
+        const receiptPath = path.join(evalsDir, `dream-eval-${Date.now()}-failed-receipt.json`);
+        const claimBoundary = "The eval could not run; nothing is claimed about the adapter.";
+        try {
+          writeJsonFile(receiptPath, { schema: "hemlock.dream.eval.v1", status: "failed", error: evalError.message, candidateAdapterPath: adapterPath || null, claimBoundary });
+          appendAgentEvent("dream.eval.failed", "degraded", { error: evalError.message, adapterPath: adapterPath || null, receiptPath }, { evidenceRefs: [receiptPath], reversible: true });
+          result = { schema: "hemlock.dream.eval.v1", status: "degraded", error: evalError.message, receiptPath, claimBoundary };
+        } catch (receiptError) {
+          appendAgentEvent("dream.eval.failed", "failed", { error: evalError.message, receiptError: receiptError.message, adapterPath: adapterPath || null }, { reversible: true });
+          result = { schema: "hemlock.dream.eval.v1", status: "degraded", error: evalError.message, claimBoundary };
+        }
+      }
+    }
     else if (command === "selfloop" || command.startsWith("selfloop.")) result = await runSipsRuntime({ action: "selfloop", selfloopAction: command.startsWith("selfloop.") ? command.split(".")[1] : payload.selfloopAction, focus: payload.focus, outcome: payload.outcome, receiptPath: payload.receiptPath });
     else if (command === "remember") result = await recordAgentMemory(payload);
     else if (command === "memory.feedback") {
@@ -2925,6 +4036,61 @@ async function runAgentCommand(action, payload = {}) {
       result = { ...result, autoDemoted: autoDemote };
       appendAgentEvent("memory.feedback", "recorded", { recordId: payload.recordId, kind: payload.kind, query: payload.query || "", counts, autoDemoted: autoDemote }, { evidenceRefs: [result.feedbackPath], reversible: true });
     }
+    else if (command === "memory.select") {
+      result = await runSipsRuntime({ action: "memory-select", limit: payload.limit, minFitness: payload.minFitness, status: payload.status });
+      // Advisory rerank: when /v1/decide is live, the model re-rates the
+      // heuristic top slice against the task objective and the reorder is
+      // receipted on the event. Unsupported or failed decide → heuristic
+      // order stands.
+      let decideRanked = false;
+      const heuristicRecords = Array.isArray(result?.records) ? result.records : [];
+      if (heuristicRecords.length > 1 && decideAvailable()) {
+        try {
+          const reranked = await decideRerankMemoryRecords(heuristicRecords.slice(0, MEMORY_RERANK_LIMIT), agentTask);
+          if (Array.isArray(reranked) && reranked.length) {
+            result = { ...result, records: [...reranked, ...heuristicRecords.slice(MEMORY_RERANK_LIMIT)] };
+            decideRanked = true;
+          }
+        } catch { /* heuristic order stands */ }
+      }
+      appendAgentEvent("memory.select", "passed", { count: result.records?.length || 0, ...(decideRanked ? { decideRanked: true } : {}) }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")], reversible: true });
+    }
+    else if (command === "memory.list") {
+      // Read-only annotated inventory for the Memory window: every record
+      // carries effectiveStatus, feedback, fitness/rankScore, and the
+      // staleness/provenance fields (ageDays, lastUsedAt, sourceRefs) plus
+      // nearDuplicateOf/clusterSize dupe markers.
+      result = await runSipsRuntime({ action: "memory-list", includeDemoted: payload.includeDemoted, includeAudit: payload.includeAudit, threshold: payload.threshold });
+      appendAgentEvent("memory.listed", "passed", { count: result.records?.length || 0 }, { evidenceRefs: [path.join(sipsDir, "memory.jsonl")], reversible: true });
+    }
+    else if (command === "memory.consolidate") {
+      // Append-only near-dedup: the runtime clusters candidate+active records
+      // by word-set Jaccard, merges each cluster into its highest-fitness
+      // record via a "consolidate" overlay note, and demotes the absorbed
+      // records (reason "consolidated-into-<keptId>"). Undo = promote the
+      // absorbed ids + rollback the overlay note id — nothing is deleted.
+      result = await runSipsRuntime({ action: "memory-consolidate", threshold: payload.threshold, dryRun: payload.dryRun, note: payload.note, evidencePath: sessionEventsPath });
+      appendAgentEvent("memory.consolidated", "recorded", { clusters: result.clusters || [], merged: result.merged || 0, keptIds: result.keptIds || [], dryRun: result.status === "preview" }, { evidenceRefs: [result.memoryPath || path.join(sipsDir, "memory.jsonl")], reversible: true });
+    }
+    else if (command === "memory.note") {
+      // Plan-gated mint: the record is appended with status "candidate" —
+      // promotion still goes through memory.promote, so this stays inside the
+      // ledger's append-only semantics. The runtime owns the durable write;
+      // the host only clamps input and receipts the event.
+      if (payload.__fromAgentAction && !approvedPlanAction) throw new Error("Recording a memory note requires an approved Hemlock plan action.");
+      if (!String(payload.body || "").trim()) throw new Error("memory.note needs a non-empty body.");
+      const tags = Array.isArray(payload.tags) ? payload.tags.map((tag) => String(tag)).join(",") : payload.tags;
+      const record = await runSipsRuntime({
+        action: "record",
+        title: String(payload.title || "").trim() || "Hemlock memory note",
+        body: String(payload.body || "").slice(0, 4000),
+        tags: tags || "hemlock,note",
+        evidencePath: Array.isArray(payload.evidenceRefs) && payload.evidenceRefs.length ? String(payload.evidenceRefs[0]) : undefined,
+        provenance: `Hemlock memory.note command ${sessionId}`,
+      });
+      appendAgentEvent("memory.noted", "recorded", { recordId: record.record?.id || null, title: record.record?.title || null }, { evidenceRefs: [record.memoryPath || path.join(sipsDir, "memory.jsonl")], reversible: true });
+      result = { schema: "hemlock.sips.memory-note.v1", status: "recorded", record: record.record, memoryPath: record.memoryPath || null, evidenceRefs: [record.memoryPath || path.join(sipsDir, "memory.jsonl")] };
+    }
     else if (command.startsWith("memory.")) {
       result = await runSipsRuntime({ action: "memory-transition", transition: command.split(".")[1], targetId: payload.targetId, note: payload.note, evidencePath: sessionEventsPath, provenance: `Hemlock memory command ${command}` });
       appendAgentEvent(`memory.${command.split(".")[1]}`, "recorded", { targetId: payload.targetId, record: result.record }, { evidenceRefs: [result.memoryPath], reversible: true });
@@ -2937,6 +4103,7 @@ async function runAgentCommand(action, payload = {}) {
       result = await agentOrchestrator.approvePlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""));
     }
     else if (command === "plan.reject") result = agentOrchestrator.rejectPlan(String(payload.taskId || agentTask.id), String(payload.planId || agentTask.activePlanId || ""), String(payload.reason || "Rejected by user"));
+    else if (command === "plan.revise") result = agentOrchestrator.revisePlan(String(payload.taskId || agentTask.id), payload);
     else if (command === "task.pause") result = agentOrchestrator.pauseTask(String(payload.taskId || agentTask.id));
     else if (command === "task.resume") result = await agentOrchestrator.resumeTask(String(payload.taskId || agentTask.id));
     else if (command === "task.answer") {
@@ -2972,7 +4139,15 @@ async function runAgentCommand(action, payload = {}) {
 }
 
 async function inferStructuredAction(prompt) {
-  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  // Lane fallback (agent_orchestrator): a retried step may pin one configured
+  // external lane for exactly this call — it then runs the same
+  // selection.provider !== "maple" → runCliInference path any non-maple task
+  // uses, so executable resolution and the provider capacity lease still
+  // gate availability. Only the CLI provider set is honored; anything else
+  // falls through to the task's own lane. The Maple model path is dropped on
+  // a fallback lane so provider defaults apply instead of a bogus -m flag.
+  const laneOverride = ["codex", "claude"].includes(String(prompt?.fallbackProvider || "")) ? String(prompt.fallbackProvider) : null;
+  const selection = normalizeSelection({ provider: laneOverride || agentTask.provider, model: laneOverride ? undefined : agentTask.model, reasoning: agentTask.reasoning });
   if (!prompt.__providerLease) {
     return threadManager.withProvider(selection.provider, agentTask.threadId || agentTask.id, (lease) => inferStructuredAction({ ...prompt, __providerLease: true }).then((result) => {
       if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
@@ -2993,7 +4168,10 @@ async function inferStructuredAction(prompt) {
     projectId: task.projectId || null,
     workspaceRoot: task.workspaceRoot || null,
     autonomy: task.autonomy || "bounded-local",
-    steering: (task.steering || []).slice(-4).map((item) => String(item?.content || "").slice(0, 200)).filter(Boolean),
+    // Pending steering only — the orchestrator marks items "delivered" once
+    // a prompt carrying them secured a response, so stale steering does not
+    // ride every later action-step prompt forever.
+    steering: (task.steering || []).filter((item) => item && item.status !== "delivered").slice(-8).map((item) => String(item?.content || "").slice(0, 500)).filter(Boolean),
   };
   const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
   const actionRequest = {
@@ -3005,9 +4183,19 @@ async function inferStructuredAction(prompt) {
     completed: prompt.history || { actions: [], observations: [], operations: [] },
     repair: prompt.repair || null,
   };
+  // Continuous KV session: the orchestrator replays prior steps verbatim as
+  // chat turns so this prompt is a strict token-prefix extension of the
+  // server's committed cache entry — only the trailing delta prefills.
+  // sessionUserContent overrides the final user turn (used to follow a scored
+  // prefix winner with a fill-in instruction).
+  const sessionTurns = Array.isArray(prompt.sessionTurns) ? prompt.sessionTurns : [];
+  const userContent = typeof prompt.sessionUserContent === "string" && prompt.sessionUserContent
+    ? prompt.sessionUserContent
+    : JSON.stringify(actionRequest);
   const messages = [
     { role: "system", content: prompt.system },
-    { role: "user", content: JSON.stringify(actionRequest) },
+    ...sessionTurns,
+    { role: "user", content: userContent },
   ];
   appendAgentEvent("inference.started", "running", {
     mode: "structured-action",
@@ -3026,32 +4214,59 @@ async function inferStructuredAction(prompt) {
       error.rawModelOutputRef = external.rawOutputRef;
       throw error;
     }
-    return { content, channels: external.channels, rawOutputRef: external.rawOutputRef, provider: selection.provider };
+    return { content, channels: external.channels, rawOutputRef: external.rawOutputRef, provider: selection.provider, usage: external.payload?.usage || null };
   }
   const actionStream = startStream({ taskId: task.id, operationId: null, kind: "agent_action", provider: "maple" });
-  const response = await fetchMapleWithRecovery(`${endpoint}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({
-      model: resolveLocalModelPath(selection.model),
-      messages,
-      temperature: 0,
-      top_p: 1,
-      top_k: 0,
-      // Maple's reasoning channel is model output, not a discardable hidden
-      // preamble — it stays on by default; mapleMaxTokens is only the
-      // transport/server ceiling. Same contract as conversation: "off" skips
-      // CoT entirely (much faster action turns); unset leaves Maple's default
-      // channel on without paying the forced enable_thinking flag overhead.
-      max_tokens: mapleMaxTokens,
-      stream: true,
-      stream_options: { include_usage: true },
-      response_format: { type: "json_object" },
-      ...(selection.reasoning === "off" ? { chat_template_kwargs: { enable_thinking: false } } : {}),
-    }),
-  }, inferenceTimeoutMs);
+  // Transport option (set by the orchestrator's prompt object): a non-empty
+  // prompt.assistantPrefix is forwarded as snake_case `assistant_prefix` so
+  // the server can force/prefill the action turn's opening tokens. Older
+  // servers reject unknown request fields with a 400 — when the error body
+  // names the field, retry exactly once without it (one-shot fallback,
+  // logged) rather than failing the step.
+  const assistantPrefix = typeof prompt.assistantPrefix === "string" ? prompt.assistantPrefix : "";
+  const actionRequestBody = (withAssistantPrefix) => JSON.stringify({
+    model: resolveLocalModelPath(selection.model),
+    messages,
+    temperature: 0,
+    top_p: 1,
+    top_k: 0,
+    // Maple's reasoning channel is model output, not a discardable hidden
+    // preamble — it stays on by default; mapleMaxTokens is only the
+    // transport/server ceiling. Same contract as conversation: "off" skips
+    // CoT entirely (much faster action turns); unset leaves Maple's default
+    // channel on without paying the forced enable_thinking flag overhead.
+    max_tokens: mapleMaxTokens,
+    stream: true,
+    stream_options: { include_usage: true },
+    response_format: { type: "json_object" },
+    ...(selection.reasoning === "off" ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+    ...(withAssistantPrefix && assistantPrefix ? { assistant_prefix: assistantPrefix } : {}),
+  });
+  const sendActionRequest = async (withAssistantPrefix) => {
+    try {
+      return await fetchMapleWithRecovery(`${endpoint}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: actionRequestBody(withAssistantPrefix),
+      }, inferenceTimeoutMs);
+    } catch (error) {
+      finishStream(actionStream, { status: "failed", stopReason: "transport_error" });
+      throw error;
+    }
+  };
+  let response = await sendActionRequest(true);
+  let failedPayload = null;
   if (!response.ok) {
-    const payload = await readResponse(response);
+    failedPayload = await readResponse(response);
+    const detail = failedPayload?.error?.message || failedPayload?.error || failedPayload?.raw || "";
+    if (response.status === 400 && assistantPrefix && String(detail).includes("assistant_prefix")) {
+      appendAgentEvent("inference.fallback", "degraded", { mode: "structured-action", field: "assistant_prefix", reason: "server rejected assistant_prefix; retrying once without it" }, { reversible: true });
+      response = await sendActionRequest(false);
+      failedPayload = response.ok ? null : await readResponse(response);
+    }
+  }
+  if (!response.ok) {
+    const payload = failedPayload || await readResponse(response);
     finishStream(actionStream, { status: "failed", stopReason: "http_error" });
     const detail = payload?.error?.message || payload?.error || payload?.raw || response.statusText || `HTTP ${response.status}`;
     const error = new Error(`Structured Maple action inference returned HTTP ${response.status}: ${detail}`);
@@ -3086,7 +4301,13 @@ async function inferStructuredAction(prompt) {
     const reader = response.body.getReader();
     let done = false;
     while (!done) {
-      const result = await reader.read();
+      let result;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        finishStream(actionStream, { status: "failed", stopReason: "stream_error" });
+        throw error;
+      }
       const events = parser.push(result.value || new Uint8Array(), { final: result.done === true });
       for (const event of events) {
         const parsed = parseSsePayload(event);
@@ -3150,7 +4371,7 @@ async function inferStructuredAction(prompt) {
       modelChannels: channels.map((channel) => ({ name: channel.name, digest: digestText(channel.text) })),
     },
   });
-  return { content, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef, streamId: actionStream.streamId, actionChannel: selectedActionText.channel, reasoning: message.reasoning || message.reasoning_content || message.thought || "" };
+  return { content, channels: modelChannelRecords(Object.fromEntries(channels.map((channel) => [channel.name, channel.text]))), rawOutputRef, streamId: actionStream.streamId, actionChannel: selectedActionText.channel, reasoning: message.reasoning || message.reasoning_content || message.thought || "", requestContent: userContent, usage: payload.usage || null, promptTokens: payload.usage?.prompt_tokens ?? null, completionTokens: payload.usage?.completion_tokens ?? null, cachedTokens: payload.usage?.prompt_tokens_details?.cached_tokens ?? payload.usage?.cached_tokens ?? null };
 }
 
 // Scored-choice transport: same messages as inferStructuredAction, but the
@@ -3172,6 +4393,7 @@ async function scoreStructuredAction(prompt, candidates) {
   const endpoint = agentInferenceEndpoint || serverUrl;
   const task = agentTask;
   const startedAt = Date.now();
+  const { SCORED_REASONING_PREFIX } = require("./agent_contracts.cjs");
   bumpAgentMetrics({ inferenceCalls: 1 });
   const compactTask = {
     id: task.id,
@@ -3182,7 +4404,10 @@ async function scoreStructuredAction(prompt, candidates) {
     projectId: task.projectId || null,
     workspaceRoot: task.workspaceRoot || null,
     autonomy: task.autonomy || "bounded-local",
-    steering: (task.steering || []).slice(-4).map((item) => String(item?.content || "").slice(0, 200)).filter(Boolean),
+    // Pending steering only — the orchestrator marks items "delivered" once
+    // a prompt carrying them secured a response, so stale steering does not
+    // ride every later action-step prompt forever.
+    steering: (task.steering || []).filter((item) => item && item.status !== "delivered").slice(-8).map((item) => String(item?.content || "").slice(0, 500)).filter(Boolean),
   };
   const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
   const actionRequest = {
@@ -3194,6 +4419,8 @@ async function scoreStructuredAction(prompt, candidates) {
     completed: prompt.history || { actions: [], observations: [], operations: [] },
     repair: prompt.repair || null,
   };
+  const sessionTurns = Array.isArray(prompt.sessionTurns) ? prompt.sessionTurns : [];
+  const userContent = JSON.stringify(actionRequest);
   appendAgentEvent("inference.started", "running", {
     mode: "scored-choice",
     taskId: task.id,
@@ -3209,12 +4436,18 @@ async function scoreStructuredAction(prompt, candidates) {
       model: resolveLocalModelPath(selection.model),
       messages: [
         { role: "system", content: prompt.system },
-        { role: "user", content: JSON.stringify(actionRequest) },
+        ...sessionTurns,
+        { role: "user", content: userContent },
       ],
-      // Close the template's forced think block so candidate continuations
-      // are scored as the action JSON itself.
-      prompt_suffix: "</think>\n\n",
+      // One fixed reasoning line, then close the think block: candidates are
+      // scored as the action JSON itself, and the whole step replays verbatim
+      // as {reasoning_content, content} on the next request. `commit` makes
+      // the server store prompt+suffix+winner+eos in the prompt cache so the
+      // next step (and this step's generative fill-in) starts from a strict
+      // prefix hit instead of re-prefilling.
+      prompt_suffix: `${SCORED_REASONING_PREFIX}\n</think>\n\n`,
       candidates,
+      commit: true,
     }),
   }, inferenceTimeoutMs);
   const payload = await readResponse(response);
@@ -3240,7 +4473,184 @@ async function scoreStructuredAction(prompt, candidates) {
       candidateCount: Array.isArray(payload.candidates) ? payload.candidates.length : 0,
     },
   });
+  return { ...payload, requestContent: userContent };
+}
+
+// /v1/decide transport: one request answers every question as a constrained
+// choice/score over host-supplied criteria — the action-selection fast path
+// uses it instead of N per-candidate /v1/score continuations, and
+// memory.select uses it to rerank heuristic recall. Same prompt_suffix
+// contract as scoring so a committed winner replays identically in the KV
+// session. A 404 marks the endpoint unsupported for the session (older
+// servers) and HEMLOCK_NO_DECIDE=1 disables it entirely; callers fall back.
+let decideEndpointUnsupported = false;
+function decideAvailable() {
+  return !decideEndpointUnsupported && process.env.HEMLOCK_NO_DECIDE !== "1";
+}
+async function postDecideRequest({ mode, messages, questions, promptSuffix = "", state = null, commit = false, commitQuestion = null, telemetry = {} }) {
+  if (!decideAvailable()) return null;
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  if (selection.provider !== "maple") return null;
+  const endpoint = agentInferenceEndpoint || serverUrl;
+  const startedAt = Date.now();
+  bumpAgentMetrics({ inferenceCalls: 1 });
+  appendAgentEvent("inference.started", "running", {
+    mode,
+    taskId: agentTask.id,
+    provider: "maple",
+    model: selection.model || null,
+    questionCount: Object.keys(questions || {}).length,
+    ...telemetry,
+  });
+  const response = await fetchMapleWithRecovery(`${endpoint}/v1/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: resolveLocalModelPath(selection.model),
+      messages,
+      prompt_suffix: promptSuffix,
+      ...(state ? { state } : {}),
+      questions,
+      commit: Boolean(commit),
+      ...(commitQuestion ? { commitQuestion } : {}),
+    }),
+  }, inferenceTimeoutMs);
+  const payload = await readResponse(response);
+  if (!response.ok) {
+    if (response.status === 404) {
+      decideEndpointUnsupported = true;
+      return null;
+    }
+    const detail = payload?.error || payload?.raw || response.statusText || `HTTP ${response.status}`;
+    const error = new Error(`Maple decide returned HTTP ${response.status}: ${detail}`);
+    error.code = response.status >= 500 ? "RUNTIME_UNAVAILABLE" : "ACTION_DECIDE_FAILED";
+    appendAgentEvent("inference.failed", "failed", { mode, error: error.message, elapsedMs: Date.now() - startedAt });
+    throw error;
+  }
+  bumpAgentMetrics({ inferenceLatencyMs: Date.now() - startedAt });
+  appendAgentEvent("inference.completed", "passed", {
+    mode,
+    telemetry: {
+      elapsedMs: Date.now() - startedAt,
+      promptTokens: payload?.usage?.promptTokens ?? null,
+      cachedTokens: payload?.usage?.cachedTokens ?? null,
+      cacheHitRatio: cacheStats({ promptTokens: payload?.usage?.promptTokens ?? null, cachedTokens: payload?.usage?.cachedTokens ?? null }).hitRatio,
+      answerCount: Object.keys(payload?.answers || {}).length,
+    },
+  });
   return payload;
+}
+
+async function decideStructuredAction(prompt, candidates) {
+  if (!decideAvailable()) return null;
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  if (selection.provider !== "maple") return null;
+  if (!prompt.__providerLease) {
+    return threadManager.withProvider(selection.provider, agentTask.threadId || agentTask.id, (lease) => decideStructuredAction({ ...prompt, __providerLease: true }, candidates).then((result) => {
+      if (lease.queuedMs) bumpAgentMetrics({ providerWaitMs: lease.queuedMs });
+      return result;
+    }));
+  }
+  const task = agentTask;
+  const { SCORED_REASONING_PREFIX } = require("./agent_contracts.cjs");
+  const compactTask = {
+    id: task.id,
+    objective: task.objective,
+    intent: task.intent,
+    interactionMode: task.interactionMode,
+    threadId: task.threadId || null,
+    projectId: task.projectId || null,
+    workspaceRoot: task.workspaceRoot || null,
+    autonomy: task.autonomy || "bounded-local",
+    // Pending steering only — the orchestrator marks items "delivered" once
+    // a prompt carrying them secured a response, so stale steering does not
+    // ride every later action-step prompt forever.
+    steering: (task.steering || []).filter((item) => item && item.status !== "delivered").slice(-8).map((item) => String(item?.content || "").slice(0, 500)).filter(Boolean),
+  };
+  const compactContext = compileThreadContext(task.threadId || agentTask.threadId, { compact: true });
+  const actionRequest = {
+    task: compactTask,
+    context: compactContext,
+    nextStep: prompt.nextPlannedStep || null,
+    allowedNextCommands: prompt.allowedNextCommands || null,
+    progress: prompt.progress || null,
+    completed: prompt.history || { actions: [], observations: [], operations: [] },
+    repair: prompt.repair || null,
+  };
+  const sessionTurns = Array.isArray(prompt.sessionTurns) ? prompt.sessionTurns : [];
+  const userContent = JSON.stringify(actionRequest);
+  const list = Array.isArray(candidates) ? candidates : [];
+  // The model scores each candidate's label; the continuation is what the
+  // server teacher-forces into the KV cache when that key wins.
+  const criteria = {};
+  list.forEach((candidate, index) => {
+    const text = typeof candidate === "string" ? candidate : String(candidate?.text ?? "");
+    criteria[`cand-${index}`] = {
+      description: String(candidate?.commandId || candidate?.kind || `candidate ${index}`),
+      label: text,
+      continuation: text,
+    };
+  });
+  const payload = await postDecideRequest({
+    mode: "decide-choice",
+    messages: [
+      { role: "system", content: prompt.system },
+      ...sessionTurns,
+      { role: "user", content: userContent },
+    ],
+    promptSuffix: `${SCORED_REASONING_PREFIX}\n</think>\n\n`,
+    questions: {
+      "next-action": {
+        type: "choice",
+        instructions: "Pick the single best next-action continuation for this task step.",
+        criteria,
+      },
+    },
+    commit: true,
+    commitQuestion: "next-action",
+    telemetry: { step: prompt.history?.actions?.length + 1 || 1, candidateCount: list.length },
+  });
+  // Usage is flattened onto the payload so the orchestrator's cache-miss
+  // detector sees cachedTokens exactly like a /v1/score result.
+  return payload ? { ...payload, requestContent: userContent, promptTokens: payload?.usage?.promptTokens ?? null, cachedTokens: payload?.usage?.cachedTokens ?? null } : null;
+}
+
+// memory.select advisory rerank: the heuristic select orders by fitness; when
+// /v1/decide is live the model re-rates the top slice against the task
+// objective and the records are reordered by expected usefulness level.
+// commit stays off — this is off-transcript and must not touch the action
+// session's committed cache key.
+const MEMORY_RERANK_LEVELS = ["not useful", "somewhat", "very useful"];
+const MEMORY_RERANK_LIMIT = 12;
+async function decideRerankMemoryRecords(records, task) {
+  if (!decideAvailable()) return null;
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  if (selection.provider !== "maple") return null;
+  const { rerankByExpectedScore } = require("./agent_contracts.cjs");
+  return threadManager.withProvider(selection.provider, agentTask.threadId || agentTask.id, async () => {
+    const objective = String(task?.objective || "Hemlock task").slice(0, 300);
+    const questions = {};
+    records.forEach((record, index) => {
+      const lesson = `${String(record?.title || record?.id || `record ${index}`)}: ${String(record?.body || record?.summary || "")}`.slice(0, 1200);
+      questions[`mem-${index}`] = {
+        type: "score",
+        instructions: `How useful is this saved lesson as training data for the current objective "${objective}"? Lesson: ${lesson}`,
+        criteria: [...MEMORY_RERANK_LEVELS],
+      };
+    });
+    const payload = await postDecideRequest({
+      mode: "memory-rerank",
+      messages: [
+        { role: "system", content: "You are Maple-Preview inside Hemlock rating saved lessons for Dream training-data selection. Answer every score question; no prose." },
+        { role: "user", content: JSON.stringify({ task: { id: task?.id || null, objective, intent: task?.intent || null }, recordCount: records.length }) },
+      ],
+      state: { kind: "memory-select", taskId: task?.id || null },
+      questions,
+      commit: false,
+    });
+    if (!payload) return null;
+    return rerankByExpectedScore(records, payload.answers, { prefix: "mem-", levels: MEMORY_RERANK_LEVELS });
+  });
 }
 
 let codingAutopilot = null;
@@ -3251,14 +4661,27 @@ agentOrchestrator = new AgentOrchestrator({
   setTask: (patch) => updateAgentTask(patch),
   emit: (type, status, payload, options) => {
     appendAgentEvent(type, status, payload, options);
-    // Queue drain on terminal only — a user-initiated cancel holds the queue
-    // (stopping the run shouldn't silently launch the next queued intent), and
-    // a blocked task waits for a human decision.
-    if (type === "task.completed") void agentIntentQueue?.notifyTaskSettled();
+    // Queue drain on settled tasks: completed, cancelled (terminal — cannot be
+    // resumed), and blocked (the model declared a terminal kind). Parked states
+    // — waiting_for_approval, waiting_for_user, paused — still hold the queue
+    // because those tasks can legitimately continue. A displaced blocked task
+    // keeps its checkpoint; resuming it later goes through a fresh intent.
+    // plan.rejected / action.rejected also park the task blocked without a
+    // task.* event — without them queued intents stranded forever.
+    if (["task.completed", "task.cancelled", "task.blocked", "plan.rejected", "action.rejected"].includes(type)) {
+      if (type !== "task.completed" && agentIntentQueue?.pending?.length) {
+        appendAgentEvent("queue.drained_after_settle", "degraded", { settledBy: type, pending: agentIntentQueue.pending.length }, { reversible: true });
+      }
+      void agentIntentQueue?.notifyTaskSettled();
+      // Idle-Dream proposer: if the queue just emptied and no new task
+      // started, a grown findings dataset can surface a reviewable Dream
+      // candidate. Propose-only — training still requires explicit approval.
+      try { maybeProposeIdleDream("task-settled"); } catch { /* advisory */ }
+    }
   },
   executeCommand: (command, payload) => runAgentCommand(command, payload),
   inferAction: inferStructuredAction,
-  scoreActions: scoreStructuredAction,
+  scoreActions: { decide: decideStructuredAction, score: scoreStructuredAction },
   repairCoding: (input) => codingAutopilot?.run({
     threadId: agentTask.threadId,
     taskId: agentTask.id,
@@ -3277,16 +4700,16 @@ agentOrchestrator = new AgentOrchestrator({
   // Recent world findings for the action prompt — compact, evidence-backed,
   // and read fresh each step so Maple sees what it just learned.
   worldContext: () => experimentDatasetSummary().count
-    ? readExperimentRows(3).rows.map((row) => ({
+    ? readExperimentRows(8).rows.map((row) => ({
       experiment: row.experiment,
-      claim: String(row.claim || "").slice(0, 160),
+      claim: String(row.claim || "").slice(0, 200),
       divergence: Number.isFinite(row.divergence?.worst) ? Math.round(row.divergence.worst * 10000) / 100 : null,
     }))
     : null,
 });
 
 codingAutopilot = new CodingAutopilot({
-  maxAttempts: 2,
+  maxAttempts: 4,
   inferRepair: (repair) => agentOrchestrator.inferCodingRepair(
     agentTask,
     agentKernel.getProjection().plans.find((item) => item.id === agentTask.activePlanId) || { steps: [] },
@@ -3306,10 +4729,26 @@ agentIntentQueue = new AgentIntentQueue({
   execute: (payload) => runAgentCommand("intent.submit", { ...payload, __bypassQueue: true }),
   onChange: (queue) => {
     agentKernel?.setQueueState(queue);
+    // The pending list rides session state.json so queued intents survive a
+    // restart; write on every queue mutation rather than only on task updates.
+    writeAgentState();
     appendAgentEvent("task.queue.updated", "observed", { queue }, { reversible: true });
   },
   emit: (type, status, payload) => appendAgentEvent(type, status, payload, { reversible: true }),
 });
+
+// Pending intents persisted in the previous session's state.json come back
+// as "queued" — never auto-executed on boot — and each stays individually
+// cancellable through agent:queue-cancel. restorePending dedupes by
+// objective and syncs the projection itself.
+const restoredIntents = agentIntentQueue.restorePending(previousPendingIntents, { restoredFromSessionId: previousSessionId || null });
+if (restoredIntents.length) {
+  appendAgentEvent("queue.restored", "queued", {
+    count: restoredIntents.length,
+    restoredFromSessionId: previousSessionId || null,
+    entries: restoredIntents.map((entry) => ({ id: entry.id, requestId: entry.requestId, objective: safePayload(entry.payload).objective || safePayload(entry.payload).text || "" })),
+  }, { reversible: true });
+}
 
 writeAgentState();
 appendAgentEvent("session.started", "ready", { sessionId, taskId: agentTask.id });
@@ -3317,6 +4756,13 @@ void contextBroker.refresh({ reason: shouldResumeTask ? "session-resume" : "sess
   appendAgentEvent("context.refresh.failed", "failed", { error: error.message }, { reversible: true });
 });
 if (shouldResumeTask) {
+  appendAgentEvent("task.restored", "blocked", {
+    taskId: previousTask.id,
+    restoredFromSessionId: previousSessionId || null,
+    snapshotSessionId: previousTask.sessionId || null,
+    status: agentTask.status,
+    reason: agentTask.blockedReason,
+  }, { evidenceRefs: [previousStatePath, ...(previousEventsPath ? [previousEventsPath] : [])].filter(Boolean), reversible: true });
   appendAgentEvent("session.resumed", "blocked", {
     previousSessionId,
     previousTaskId: previousTask.id,
@@ -3324,9 +4770,38 @@ if (shouldResumeTask) {
   }, { evidenceRefs: previousEventsPath ? [previousEventsPath] : [], reversible: true });
 }
 
+if (parkedBootThreadIds.length) {
+  appendAgentEvent("thread.parked_on_boot", "paused", {
+    threadIds: parkedBootThreadIds,
+    restoredFromSessionId: previousSessionId || null,
+    reason: "The previous session was interrupted; inspect and resume the task.",
+  }, { evidenceRefs: [threadManager.registryPath], reversible: true });
+}
+
+// Preview sessions are in-memory only (PreviewSessionManager owns no durable
+// state); a session the previous journal opened without a matching stop died
+// with that process. Emit a reaped marker so the replayed journal cannot
+// advertise a live preview. Verification receipts under artifact roots are
+// durable evidence and stay.
+const orphanedPreviewSessions = [...new Set(
+  agentEvents
+    .filter((event) => event.type === "artifact.preview.ready")
+    .map((event) => event.payload?.session?.id)
+    .filter(Boolean)
+    .filter((id) => !agentEvents.some((event) => event.type === "artifact.preview.stopped" && event.payload?.session?.id === id)),
+)];
+if (orphanedPreviewSessions.length) {
+  appendAgentEvent("preview.sessions.reaped", "completed", {
+    count: orphanedPreviewSessions.length,
+    sessionIds: orphanedPreviewSessions,
+    restoredFromSessionId: previousSessionId || null,
+  }, { evidenceRefs: previousEventsPath ? [previousEventsPath] : [], reversible: true });
+}
+
 function closeAgentSession() {
   if (sessionClosed) return;
   sessionClosed = true;
+  mapleHealthMonitor?.dispose();
   for (const stream of [...activeStreams.values()]) {
     stream.abortReason = "interrupted";
     stream.controller?.abort("interrupted");
@@ -3357,7 +4832,10 @@ function appendOutput(current, chunk, limit = 14000) {
   return next.length > limit ? next.slice(next.length - limit) : next;
 }
 
-function runChild(command, args, { cwd = repoRoot, timeoutMs = 120000, operationId = null } = {}) {
+// outputLimit caps each captured stream (default 14000 chars; shell.exec
+// passes 32KB). appendOutput keeps the tail, so stdoutTruncated flags when
+// more output arrived than the cap could hold.
+function runChild(command, args, { cwd = repoRoot, timeoutMs = 120000, operationId = null, outputLimit = 14000 } = {}) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     const invocation = resolveChildInvocation(command, args);
@@ -3369,6 +4847,8 @@ function runChild(command, args, { cwd = repoRoot, timeoutMs = 120000, operation
     activeChildren.add(child);
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     const stdoutStream = operationId ? startStream({ taskId: agentTask.id, operationId, kind: "stdout" }) : null;
     const stderrStream = operationId ? startStream({ taskId: agentTask.id, operationId, kind: "stderr" }) : null;
     let timedOut = false;
@@ -3379,27 +4859,27 @@ function runChild(command, args, { cwd = repoRoot, timeoutMs = 120000, operation
         if (!child.killed) child.kill("SIGKILL");
       }, 1500);
     }, timeoutMs);
-    child.stdout.on("data", (chunk) => { stdout = appendOutput(stdout, chunk); if (stdoutStream) { publishStreamFrame(stdoutStream, { delta: String(chunk) }); checkpointStream(stdoutStream); } });
-    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); if (stderrStream) { publishStreamFrame(stderrStream, { delta: String(chunk) }); checkpointStream(stderrStream); } });
+    child.stdout.on("data", (chunk) => { if (stdout.length + String(chunk).length > outputLimit) stdoutTruncated = true; stdout = appendOutput(stdout, chunk, outputLimit); if (stdoutStream) { publishStreamFrame(stdoutStream, { delta: String(chunk) }); checkpointStream(stdoutStream); } });
+    child.stderr.on("data", (chunk) => { if (stderr.length + String(chunk).length > outputLimit) stderrTruncated = true; stderr = appendOutput(stderr, chunk, outputLimit); if (stderrStream) { publishStreamFrame(stderrStream, { delta: String(chunk) }); checkpointStream(stderrStream); } });
     child.on("error", (error) => {
       clearTimeout(timer);
       activeChildren.delete(child);
       finishStream(stdoutStream, { status: "failed", stopReason: error.message });
       finishStream(stderrStream, { status: "failed", stopReason: error.message });
-      resolve({ command: [command, ...args], cwd, exitCode: null, signal: null, timedOut, stdout, stderr: appendOutput(stderr, error.message), elapsed: Math.round((Date.now() - startedAt) / 1000) });
+      resolve({ command: [command, ...args], cwd, exitCode: null, signal: null, timedOut, stdout, stderr: appendOutput(stderr, error.message, outputLimit), stdoutTruncated, stderrTruncated: stderrTruncated || stderr.length + String(error.message).length > outputLimit, elapsed: Math.round((Date.now() - startedAt) / 1000) });
     });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timer);
       activeChildren.delete(child);
       finishStream(stdoutStream, { status: exitCode === 0 ? "completed" : "failed", stopReason: signal || (exitCode === 0 ? "exit_0" : `exit_${exitCode}`) });
       finishStream(stderrStream, { status: exitCode === 0 ? "completed" : "failed", stopReason: signal || (exitCode === 0 ? "exit_0" : `exit_${exitCode}`) });
-      resolve({ command: [command, ...args], cwd, exitCode, signal, timedOut, stdout, stderr, elapsed: Math.round((Date.now() - startedAt) / 1000) });
+      resolve({ command: [command, ...args], cwd, exitCode, signal, timedOut, stdout, stderr, stdoutTruncated, stderrTruncated, elapsed: Math.round((Date.now() - startedAt) / 1000) });
     });
   });
 }
 
 async function runSipsRuntime(payload) {
-  const result = await runChild(python, [...pythonFlags, sipsRuntimeScript, JSON.stringify({ root: repoRoot, sipsDir, ...payload })], { cwd: repoRoot, timeoutMs: 30000 });
+  const result = await runChild(python, [...pythonFlags, sipsRuntimeScript, JSON.stringify({ root: repoRoot, sipsDir, ...payload })], { cwd: repoRoot, timeoutMs: 60000 });
   const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
   let parsed = null;
   try { parsed = lines.length ? JSON.parse(lines[lines.length - 1]) : null; } catch { parsed = null; }
@@ -3416,7 +4896,7 @@ const verificationProfiles = {
     executable: "npm",
     args: ["run", "build"],
     cwd: path.join(repoRoot, "dream-chat"),
-    timeoutMs: 180000,
+    timeoutMs: 300000,
   },
   "diff-check": {
     label: "Git diff check",
@@ -3434,11 +4914,50 @@ const verificationProfiles = {
     cwd: repoRoot,
     timeoutMs: 300000,
   },
+  "lint": {
+    label: "Workspace lint",
+    command: "npm run lint --if-present",
+    executable: "npm",
+    args: ["run", "lint", "--if-present"],
+    cwd: path.join(repoRoot, "dream-chat"),
+    timeoutMs: 120000,
+  },
+  "typecheck": {
+    label: "TypeScript typecheck",
+    command: "npx tsc --noEmit",
+    executable: "npx",
+    args: ["tsc", "--noEmit"],
+    // Honest precondition: tsc only makes sense where a tsconfig.json exists.
+    // runVerification records a skipped receipt instead of a bogus failure.
+    requires: ["tsconfig.json"],
+    cwd: path.join(repoRoot, "dream-chat"),
+    timeoutMs: 120000,
+  },
+  "npm-test": {
+    label: "Workspace npm test",
+    command: "npm test",
+    executable: "npm",
+    args: ["test"],
+    cwd: path.join(repoRoot, "dream-chat"),
+    timeoutMs: 300000,
+  },
 };
 
 async function runVerification(profileId, emit = null, options = {}) {
   const profile = verificationProfiles[profileId] || verificationProfiles["app-build"];
   const workspaceRoot = options.workspaceRoot && fs.existsSync(path.join(options.workspaceRoot, "package.json")) ? path.resolve(options.workspaceRoot) : profile.cwd;
+  // Profile preconditions (e.g. typecheck needs tsconfig.json): an unmet
+  // precondition is a skipped receipt with evidence, not a failed run.
+  const missingPreconditions = (profile.requires || []).filter((relative) => !fs.existsSync(path.join(workspaceRoot, relative)));
+  if (missingPreconditions.length) {
+    const receipt = { schema: "hemlock.agent.verification.v1", profile: profileId in verificationProfiles ? profileId : "app-build", label: profile.label, workspaceRoot, command: profile.command, status: "skipped", reason: `profile precondition unmet: ${missingPreconditions.join(", ")} not present under ${workspaceRoot}`, exitCode: null, signal: null, timedOut: false, stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false, elapsed: 0 };
+    const receiptPath = path.join(runtimeDataRoot, "receipts", "verification", `${agentTask.id}-${options.operationId || Date.now()}.json`);
+    writeJsonFile(receiptPath, receipt);
+    receipt.receiptPath = receiptPath;
+    receipt.evidenceRefs = [receiptPath];
+    appendAgentEvent("verification.completed", "skipped", { profile: receipt.profile, label: receipt.label, reason: receipt.reason, receiptPath }, { evidenceRefs: receipt.evidenceRefs });
+    return receipt;
+  }
   appendAgentEvent("verification.started", "running", { profile: profileId, label: profile.label, command: profile.command });
   emit?.({ stage: `verifying · ${profile.label}`, progress: 24, log: profile.command });
   try {
@@ -3454,6 +4973,43 @@ async function runVerification(profileId, emit = null, options = {}) {
     appendAgentEvent("verification.completed", "failed", { profile: profileId, label: profile.label, error: error.message });
     throw error;
   }
+}
+
+// shell.exec: bounded argv-form subprocess against the thread's workspaceRoot.
+// resolveExec (shell_exec.cjs) is the allowlist gate — no shell strings, cwd
+// pinned inside the workspace, timeout capped at 60s. runChild caps each
+// captured stream at EXEC_OUTPUT_LIMIT (32KB) and flags the truncation; the
+// receipt is filed under receipts/exec/ like verification receipts.
+async function runShellExec(payload = {}, operationId = null) {
+  const workspaceRoot = path.resolve(agentTask.workspaceRoot || repoRoot);
+  const resolved = resolveExec(payload, { workspaceRoot });
+  const argvDisplay = [resolved.executable, ...resolved.args].map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(" ");
+  const startedAt = Date.now();
+  const result = await runChild(resolved.executable, resolved.args, { cwd: resolved.cwd, timeoutMs: resolved.timeoutMs, operationId, outputLimit: EXEC_OUTPUT_LIMIT });
+  const receipt = {
+    schema: "hemlock.agent.exec.v1",
+    status: result.exitCode === 0 && !result.timedOut ? "passed" : "failed",
+    argv: argvDisplay,
+    executable: resolved.executable,
+    args: resolved.args,
+    cwd: resolved.cwd,
+    workspaceRoot,
+    exitCode: result.exitCode,
+    signal: result.signal || null,
+    timedOut: result.timedOut === true,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    stdoutTruncated: result.stdoutTruncated === true,
+    stderrTruncated: result.stderrTruncated === true,
+    truncated: result.stdoutTruncated === true || result.stderrTruncated === true,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  };
+  const receiptPath = path.join(runtimeDataRoot, "receipts", "exec", `${agentTask.id}-${operationId || Date.now()}.json`);
+  writeJsonFile(receiptPath, receipt);
+  receipt.receiptPath = receiptPath;
+  receipt.evidenceRefs = [receiptPath];
+  appendAgentEvent("shell.exec.completed", receipt.status, { argv: argvDisplay, cwd: resolved.cwd, exitCode: result.exitCode, timedOut: receipt.timedOut, truncated: receipt.truncated, receiptPath }, { evidenceRefs: receipt.evidenceRefs });
+  return receipt;
 }
 
 // Conversational Build flow (T6-V1): after an approved code.apply lands a
@@ -3513,7 +5069,7 @@ async function repoMap(payload = {}) {
     branch: branch.stdout.trim(),
     dirty: Boolean(status.stdout.trim()),
     statusShort: status.stdout.trim(),
-    files: fileList.slice(0, 160),
+    files: fileList.slice(0, 320),
     fileCount: fileList.length,
     fileSource,
     topDirs,
@@ -3573,13 +5129,15 @@ async function startServer(adapterPath = "", modelOverride = "") {
   try {
     const probe = await fetchWithTimeout(`${serverUrl}/health`, {}, 1500);
     if (probe.ok) {
-      serverState = { processReady: true, inferenceReady: false, adapterPath };
-      console.log(`[hemlock] adopted existing Maple-Preview server on ${serverUrl}`);
-      // Health already answered OK above; mark the process ready so the UI
+      // `adopted` marks a server we did not spawn: serverProcess stays null,
+      // so waitForServer's "our child exited" fail-fast must not apply to it.
+      // Health already answered OK; mark the process ready so the UI
       // heartbeat reflects reality instead of showing DOWN until the first
       // inference completes.
-      serverState = { processReady: true, inferenceReady: false, adapterPath };
+      serverState = { processReady: true, inferenceReady: false, adapterPath, adopted: true };
+      console.log(`[hemlock] adopted existing Maple-Preview server on ${serverUrl}`);
       appendAgentEvent("maple.server.ready", "passed", { adopted: true, processReady: true, inferenceReady: false }, { reversible: true });
+      void warmMaplePromptCache("server-ready");
       return;
     }
   } catch {
@@ -3592,7 +5150,7 @@ async function startServer(adapterPath = "", modelOverride = "") {
   }
   if (adapterPath) args.push("--adapter-path", adapterPath);
   serverProcessError = null;
-  serverState = { processReady: false, inferenceReady: false, adapterPath, modelPath: servingModelPath };
+  serverState = { processReady: false, inferenceReady: false, adapterPath, modelPath: servingModelPath, adopted: false };
   console.log(`[hemlock] Maple launch python=${python} architecture=${pythonArchitecture || process.arch}`);
   const child = spawnPython([...pythonFlags, serverScript, ...args], {
     cwd: repoRoot,
@@ -3631,6 +5189,15 @@ async function startServer(adapterPath = "", modelOverride = "") {
 // use). Over budget, stop respawning and surface an honest degraded state.
 function handleUnexpectedMapleExit() {
   mapleCrashTimestamps = recordCrash(mapleCrashTimestamps, Date.now());
+  persistMapleRuntimeState();
+  // A mid-loop task gets one bounded auto-resume after the respawn warms
+  // (settleMapleRespawnResume); a second unexpected exit under the same task
+  // blocks it instead of resuming forever.
+  if (["running", "verifying"].includes(agentTask?.status)) {
+    taskMapleExitCounts.set(agentTask.id, (taskMapleExitCounts.get(agentTask.id) || 0) + 1);
+    if (taskMapleExitCounts.size > 16) taskMapleExitCounts.delete(taskMapleExitCounts.keys().next().value);
+    mapleRespawnPendingResume = true;
+  }
   const verdict = shouldRespawn({ crashTimestamps: mapleCrashTimestamps });
   if (verdict.respawn) return { processReady: false, inferenceReady: false, adapterPath: "" };
   serverState = { processReady: false, inferenceReady: false, adapterPath: "", crashLooped: true, crashLoopReason: verdict.reason };
@@ -3663,6 +5230,88 @@ function stopServer() {
   });
 }
 
+// ── maple.warm: bounded prompt-cache warm prefill ─────────────────────────
+// Server boot and thread switches evict or strand the KV prefix cache, so
+// the next agent step pays a full prefill. A 1-token request carrying the
+// SAME static system block the structured-action path sends re-seeds the
+// shared prefix region so the first real step is cache-hot. The system block
+// is registry-derived only (buildActionSystemPrompt in
+// agent_orchestrator.cjs — the same builder proposeNextAction uses); the
+// volatile plan/action tail lives in the user turn and is deliberately not
+// warmed. Bounded: one warm in flight, >=60s between warms, and never while
+// a task, stream, Dream, or SIPS run is active. Failures emit a degraded
+// maple.warm.prefill event instead of throwing into the boot/switch path.
+const MAPLE_WARM_COOLDOWN_MS = Math.max(60000, Number(process.env.HEMLOCK_WARM_COOLDOWN_MS || 60000));
+let mapleWarmState = { lastWarmAt: 0, warmCachedTokens: null, inFlight: null };
+
+function mapleWarmSkipReason() {
+  if (serverState.processReady !== true) return "server-not-ready";
+  if (activeStreams.size) return "stream-active";
+  if (isActiveTask(agentTask)) return "task-active";
+  if (dreamProcess || sipsCycleActive) return "dream-sips-active";
+  if (agentIntentQueue?.active) return "intent-active";
+  if (mapleWarmState.inFlight) return "in-flight";
+  if (Date.now() - mapleWarmState.lastWarmAt < MAPLE_WARM_COOLDOWN_MS) return "cooldown";
+  return null;
+}
+
+async function warmMaplePromptCache(reason = "manual") {
+  const skipped = mapleWarmSkipReason();
+  if (skipped) {
+    appendAgentEvent("maple.warm.prefill", "skipped", { reason, skipped }, { reversible: true });
+    return { schema: "hemlock.maple.warm.v1", status: "skipped", reason, skipped };
+  }
+  const selection = normalizeSelection({ provider: agentTask.provider, model: agentTask.model, reasoning: agentTask.reasoning });
+  const { buildActionSystemPrompt } = require("./agent_orchestrator.cjs");
+  const startedAt = Date.now();
+  const run = (async () => {
+    try {
+      const response = await fetchWithTimeout(`${serverUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: resolveLocalModelPath(selection.model),
+          // The warm mirrors the structured-action message shape minus the
+          // plan/action tail: same system block, minimal user turn.
+          messages: [
+            { role: "system", content: buildActionSystemPrompt(agentCommands) },
+            { role: "user", content: "Reply with exactly OK." },
+          ],
+          temperature: 0,
+          top_p: 1,
+          top_k: 0,
+          max_tokens: 1,
+          stream: false,
+        }),
+      }, Math.min(120000, inferenceTimeoutMs));
+      const payload = await readResponse(response);
+      // Every completed HTTP attempt starts the cooldown — a warming loop
+      // that hammers a sick server is worse than one extra cold prefill.
+      mapleWarmState.lastWarmAt = Date.now();
+      const elapsedMs = Date.now() - startedAt;
+      if (!response.ok) {
+        const detail = payload?.error?.message || payload?.error || payload?.raw || response.statusText || `HTTP ${response.status}`;
+        throw new Error(`warm prefill returned HTTP ${response.status}: ${detail}`);
+      }
+      const usage = {
+        prompt_tokens: payload?.usage?.prompt_tokens ?? null,
+        cached_tokens: payload?.usage?.prompt_tokens_details?.cached_tokens ?? payload?.usage?.cached_tokens ?? null,
+      };
+      mapleWarmState.warmCachedTokens = usage.cached_tokens;
+      serverState = { ...serverState, lastWarmAt: mapleWarmState.lastWarmAt, warmCachedTokens: usage.cached_tokens };
+      appendAgentEvent("maple.warm.prefill", "passed", { reason, elapsedMs, usage }, { reversible: true });
+      return { schema: "hemlock.maple.warm.v1", status: "warmed", reason, elapsedMs, usage };
+    } catch (error) {
+      appendAgentEvent("maple.warm.prefill", "degraded", { reason, elapsedMs: Date.now() - startedAt, error: error.message }, { reversible: true });
+      return { schema: "hemlock.maple.warm.v1", status: "degraded", reason, error: error.message };
+    } finally {
+      mapleWarmState.inFlight = null;
+    }
+  })();
+  mapleWarmState.inFlight = run;
+  return run;
+}
+
 async function waitForServer(timeoutMs = 180000, { preserveInference = false } = {}) {
   const startedAt = Date.now();
   let lastError = null;
@@ -3674,13 +5323,19 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
     serverProcess.once("exit", (code, signal) => resolve({ code, signal }));
   });
   while (true) {
-    if (serverProcessError) {
-      const error = new Error(`The local Maple-Preview server failed before becoming ready: ${serverProcessError.message}`);
-      Object.assign(error, serverProcessError);
-      throw error;
-    }
-    if (!serverProcess || serverProcess.killed) {
-      throw new Error("The local Maple-Preview server process exited before becoming ready.");
+    // serverProcessError and the live-child checks describe only a child we
+    // spawned. An adopted server has no child handle, so for it the health
+    // poll below alone decides readiness — and the deadline error still
+    // names the last failure classification if it goes dark.
+    if (serverState.adopted !== true) {
+      if (serverProcessError) {
+        const error = new Error(`The local Maple-Preview server failed before becoming ready: ${serverProcessError.message}`);
+        Object.assign(error, serverProcessError);
+        throw error;
+      }
+      if (!serverProcess || serverProcess.killed) {
+        throw new Error("The local Maple-Preview server process exited before becoming ready.");
+      }
     }
     try {
       const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
@@ -3688,6 +5343,9 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
         const wasReady = serverState.processReady === true;
         serverState = { ...serverState, processReady: true, inferenceReady: preserveInference ? serverState.inferenceReady === true : false };
         if (!wasReady) appendAgentEvent("maple.server.ready", "passed", { processReady: true, inferenceReady: serverState.inferenceReady === true }, { reversible: true });
+        // Warm the shared action prefix once the server first answers; the
+        // guard inside skips while a task/stream/Dream/SIPS run is in flight.
+        if (!wasReady) void warmMaplePromptCache("server-ready");
         return { processReady: true, inferenceReady: serverState.inferenceReady };
       }
       lastError = new Error(`Maple-Preview health returned HTTP ${response.status}`);
@@ -3704,10 +5362,11 @@ async function waitForServer(timeoutMs = 180000, { preserveInference = false } =
     // T9-H1(a): capped exponential backoff via the pure helper.
     const step = nextReadinessDelay({ attempt: attempt++, startedAt, timeoutMs });
     if (step.done) break;
-    await Promise.race([
-      new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt))))),
-      exited,
-    ]);
+    const delay = new Promise((resolve) => setTimeout(resolve, Math.min(step.delayMs, Math.max(0, timeoutMs - (Date.now() - startedAt)))));
+    // The child-exit wake only exists for a child we spawned; an adopted
+    // server has no handle to exit, so racing `exited` would busy-poll a
+    // dead port for the whole timeout.
+    await (serverState.adopted === true ? delay : Promise.race([delay, exited]));
   }
   // T9-H1(c): the deadline error names the last failure classification.
   throw new Error(`The local Maple-Preview server process did not become ready (last: ${classifyHealthFailure(lastError)}): ${lastError?.message || "timeout"}.`);
@@ -3721,6 +5380,7 @@ async function launchMapleRuntime({ resetCrashLoop = false } = {}) {
   // accumulating toward the loop verdict.
   if (resetCrashLoop) {
     mapleCrashTimestamps = [];
+    persistMapleRuntimeState();
     const { crashLooped: _clearedLooped, crashLoopReason: _clearedReason, ...rest } = serverState;
     serverState = rest;
   }
@@ -3735,8 +5395,23 @@ async function launchMapleRuntime({ resetCrashLoop = false } = {}) {
       // Metal shaders before the first user message arrives. This makes the
       // first real inference ~2-5s faster. The probe is best-effort — if it
       // fails (e.g. the server is loading safetensors), the user's first
-      // inference pays the normal compile cost.
-      probeInference("").catch(() => { /* warmup is best-effort */ });
+      // inference pays the normal compile cost. Probe with the adapter the
+      // server is actually serving so the write into serverState keeps the
+      // launch adapter instead of stomping it to "".
+      const warmupAdapter = serverState.adapterPath || "";
+      mapleWarmupPromise = probeInference(warmupAdapter)
+        .then(() => {
+          if (serverState.inferenceReady === true) {
+            appendAgentEvent("maple.inference.ready", "passed", { adapterPath: warmupAdapter || null, warmed: true }, { reversible: true });
+          }
+        })
+        .catch(() => { /* warmup is best-effort */ });
+      // Bounded auto-resume: an unexpected exit while a task was mid-loop
+      // gets exactly one resume attempt after the respawn is warm.
+      if (mapleRespawnPendingResume) {
+        mapleRespawnPendingResume = false;
+        void mapleWarmupPromise.then(() => settleMapleRespawnResume());
+      }
       return result;
     } catch (error) {
       serverState = { ...serverState, processReady: false, inferenceReady: false };
@@ -3760,6 +5435,15 @@ async function ensureMapleRuntime() {
       // A process can remain in the child table after MLX has lost its HTTP
       // listener. The recovery path below gives it a clean restart.
     }
+  } else if (serverState.adopted === true && serverState.processReady) {
+    // An adopted server has no child handle; verify it by health instead of
+    // treating the missing child as a reason to spawn over it.
+    try {
+      const response = await fetchWithTimeout(`${serverUrl}/health`, {}, 5000);
+      if (response.ok) return { processReady: true, inferenceReady: serverState.inferenceReady === true };
+    } catch {
+      // Adopted server went dark; the recovery path below gives a clean restart.
+    }
   }
   return restartMapleRuntime("Maple health check failed before inference.");
 }
@@ -3781,6 +5465,65 @@ async function restartMapleRuntime(reason = "Maple runtime recovery requested.")
   const result = await launchMapleRuntime();
   appendAgentEvent("maple.runtime.restarted", "passed", { reason, processReady: result.processReady, inferenceReady: result.inferenceReady }, { reversible: true });
   return result;
+}
+
+// Bounded auto-resume after an unexpected maple exit + respawn. Deferred
+// past the respawn warmup so the in-flight action loop's own recovery or
+// failure lands first — a loop still driving itself is never double-driven.
+// The first unexpected exit under a task resumes it once; the second blocks
+// the task honestly instead of resuming forever.
+async function settleMapleRespawnResume() {
+  await new Promise((resolve) => {
+    const settle = setTimeout(resolve, 1500);
+    settle.unref?.();
+  });
+  const task = agentTask;
+  if (!agentOrchestrator || !task?.id || !["running", "verifying"].includes(task.status)) return;
+  const exits = taskMapleExitCounts.get(task.id) || 0;
+  if (exits >= 2) {
+    agentOrchestrator.blockTask(task.id, "server restarted twice");
+    return;
+  }
+  const projection = agentKernel.getProjection();
+  const plan = projection.plans.find((item) => item.id === task.activePlanId && item.taskId === task.id);
+  const history = agentKernel.getTaskHistory(task.id);
+  if (!plan || plan.status !== "approved" || !history.actions.length) return;
+  if (projection.operations.some((op) => op.taskId === task.id && op.status === "running")) return;
+  if ([...activeStreams.values()].some((stream) => stream.taskId === task.id && !stream.terminal)) return;
+  appendAgentEvent("task.resumed_after_restart", "running", { taskId: task.id, unexpectedExits: exits }, { reversible: true });
+  try {
+    await agentOrchestrator.resumeTask(task.id);
+  } catch (error) {
+    appendAgentEvent("task.resume_after_restart.failed", "degraded", { taskId: task.id, error: error.message }, { reversible: true });
+  }
+}
+
+// /health polling is scoped to mid-loop tasks with a server expected to
+// answer — idle sessions are never woken for health checks. A wedged-but-
+// alive server is recorded against the same crash budget as a real exit and
+// goes through the bounded restart path, so monitor-driven restarts are
+// capped by the crash-loop verdict too.
+function mapleHealthMonitorActive() {
+  return ["running", "verifying"].includes(agentTask?.status)
+    && (Boolean(serverProcess && !serverProcess.killed) || serverState.processReady === true);
+}
+
+function syncMapleHealthMonitor() {
+  const active = mapleHealthMonitorActive();
+  if (!mapleHealthMonitor) {
+    if (!active) return;
+    mapleHealthMonitor = createHealthMonitor({
+      healthUrl: `${serverUrl}/health`,
+      isActive: mapleHealthMonitorActive,
+      emit: (type, status, payload) => appendAgentEvent(type, status, payload, { reversible: true }),
+      onOutage: async ({ error }) => {
+        mapleCrashTimestamps = recordCrash(mapleCrashTimestamps, Date.now());
+        persistMapleRuntimeState();
+        await restartMapleRuntime(`Maple health monitor detected an outage (${error}).`);
+      },
+    });
+  }
+  if (active) mapleHealthMonitor.start(); else mapleHealthMonitor.stop();
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
@@ -3910,6 +5653,103 @@ function recoveryDescription(recovery) {
   return `Base Maple-Preview recovery: server process ${process}; inference ${inference}${detail}. Existing adapter files and base weights were preserved.`;
 }
 
+// Durable agent spine → Dream input. Collects the durable journals the
+// kernel + session loops already write (workspaces/*/projection.jsonl,
+// sessions/*/events.jsonl) and hands them to dream_train.py together with
+// the live command registry and the real structured-action system prompt.
+// Python rebuilds each step's host request at its own timestamp, so the
+// SFT user turn is what the model actually saw. Only executed actions with
+// passed observations become rows — dream_train.py enforces that filter.
+function collectAgenticSpine({ maxWorkspaces = 8, maxSessions = 24, maxSteps = 96 } = {}) {
+  const journalPaths = [];
+  const collect = (dir, filename, cap) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(dir, e.name, filename))
+      .filter((file) => { try { return fs.existsSync(file); } catch { return false; } })
+      .map((file) => { try { return { file, mtime: fs.statSync(file).mtimeMs }; } catch { return { file, mtime: 0 }; } })
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, Math.max(1, cap))
+      .forEach(({ file }) => journalPaths.push(file));
+  };
+  collect(path.join(runtimeDataRoot, "workspaces"), "projection.jsonl", maxWorkspaces);
+  collect(path.join(sipsDir, "sessions"), "events.jsonl", maxSessions);
+  let systemPrompt = "";
+  try {
+    systemPrompt = require("./agent_orchestrator.cjs").buildActionSystemPrompt(agentCommands);
+  } catch {
+    systemPrompt = "";
+  }
+  return {
+    schema: "hemlock.dream.agentic-spine.v1",
+    journalPaths,
+    registry: agentCommands,
+    systemPrompt,
+    maxSteps,
+  };
+}
+
+// Read-only dataset audit: same payload shape as a Dream run plus
+// datasetOnly:true so dream_train.py composes the dataset and returns the
+// manifest + samples without touching a checkpoint or the running server.
+async function runDreamDatasetPreview(payload = {}) {
+  if (dreamProcess) throw new Error("A Dream run is already in progress; try the preview again after it finishes.");
+  const runId = `preview-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const trainingRoot = path.join(sipsDir, "dream-runs");
+  const runDir = path.join(trainingRoot, runId);
+  if (runDir === runtimeDataRoot || !runDir.startsWith(`${runtimeDataRoot}${path.sep}`)) {
+    throw new Error("Dream preview output must stay inside Hemlock's local application-data directory.");
+  }
+  assertDreamStorage(runDir);
+  fs.mkdirSync(runDir, { recursive: true });
+  const input = {
+    model: fs.existsSync(modelPath) ? modelPath : undefined,
+    runDir,
+    facts: Array.isArray(payload?.facts) ? payload.facts : [],
+    conversation: Array.isArray(payload?.conversation) ? payload.conversation : [],
+    examples: [...(Array.isArray(payload?.examples) ? payload.examples : []), ...experimentDatasetExamples()],
+    agentic: collectAgenticSpine(),
+    datasetOnly: true,
+    previewSamples: Number.isFinite(payload?.samples) ? payload.samples : 8,
+  };
+  const output = await new Promise((resolve, reject) => {
+    const child = spawnPython([...pythonFlags, path.join(__dirname, "dream_train.py"), JSON.stringify(input)], {
+      env: { ...pythonEnvironment(), PYTHONUNBUFFERED: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let lastEvent = null;
+    let stderrTail = "";
+    let rlBuffer = "";
+    child.stdout.on("data", (chunk) => {
+      rlBuffer += chunk.toString();
+      const lines = rlBuffer.split("\n");
+      rlBuffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { lastEvent = JSON.parse(line); } catch { /* progress noise */ }
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderrTail = (stderrTail + chunk.toString()).slice(-4000); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0 && lastEvent?.preview) resolve(lastEvent.preview);
+      else reject(new Error(stderrTail.trim() || `dream dataset preview exited with code ${code}`));
+    });
+  });
+  try {
+    const previewPath = path.join(runDir, "dataset-preview.json");
+    return { ...output, previewPath: fs.existsSync(previewPath) ? previewPath : undefined };
+  } catch {
+    return output;
+  }
+}
+
 async function runDream(payload) {
   if (dreamProcess) throw new Error("A Dream run is already in progress.");
   if (!fs.existsSync(modelPath)) {
@@ -3933,9 +5773,14 @@ async function runDream(payload) {
     facts: Array.isArray(payload?.facts) ? payload.facts : [],
     conversation: Array.isArray(payload?.conversation) ? payload.conversation : [],
     examples: [...(Array.isArray(payload?.examples) ? payload.examples : []), ...experimentDatasetExamples()],
+    agentic: collectAgenticSpine(),
     profile,
     iters: Number.isFinite(payload?.iters) ? payload.iters : profileIters,
     numLayers: Number.isFinite(payload?.numLayers) ? payload.numLayers : 1,
+    resume: payload?.resume === true,
+    resumeFrom: typeof payload?.resumeFrom === "string" ? payload.resumeFrom : undefined,
+    divergenceGuard: payload?.divergenceGuard !== false,
+    maxLossMultiple: Number.isFinite(payload?.maxLossMultiple) ? payload.maxLossMultiple : undefined,
   };
 
   appendAgentEvent("dream.started", "running", {
@@ -3945,6 +5790,10 @@ async function runDream(payload) {
     datasetRows: input.examples.length + input.facts.length + input.conversation.length,
     baseModel: modelPath,
   });
+  // Idle-Dream watermark: findings appended after this run count as "new"
+  // toward the next dream.proposal candidate. Recorded at run start so a
+  // failed run still consumes the rows it trained on.
+  writeIdleDreamState({ datasetCountAtLastDream: experimentDatasetSummary().count, lastDreamAt: Date.now() });
   // Work-notification boundary (a): standalone Dream runs announce completion.
   // When this run is nested inside a SIPS cycle (sipsCycleActive), it stays
   // silent here — the enclosing SIPS cycle emits the single user-facing
@@ -4042,8 +5891,10 @@ async function runDream(payload) {
               const inferenceStatus = await waitForInference(adapterPath, inferenceProbeTimeoutMs);
               emitDreamProgress({ stage: "Dream complete — adapter inference verified", progress: 100, elapsed: Math.round((Date.now() - startedAt) / 1000), log: "the base Maple-Preview weights remain unchanged", serverProcessReady: true, inferenceReady: true });
               settled = true;
-              const result = { adapterPath, runDir, elapsed: Math.round((Date.now() - startedAt) / 1000), processReady: processStatus.processReady, inferenceReady: inferenceStatus.inferenceReady, trainingReceipt, trainingReceiptPath };
-              appendAgentEvent("dream.completed", "passed", { runId, ...result, baseWeightsUnchanged: trainingReceipt.baseWeightsUnchanged === true }, { evidenceRefs: [trainingReceiptPath || runDir], reversible: false });
+              const receiptSummary = summarizeTrainingReceipt(trainingReceipt, adapterPath);
+              const result = { adapterPath, runDir, elapsed: Math.round((Date.now() - startedAt) / 1000), processReady: processStatus.processReady, inferenceReady: inferenceStatus.inferenceReady, trainingReceipt, trainingReceiptPath, receiptSummary };
+              const evidenceRefs = [trainingReceiptPath || runDir, receiptSummary.evalReceiptPath].filter(Boolean);
+              appendAgentEvent("dream.completed", "passed", { runId, ...result, baseWeightsUnchanged: trainingReceipt.baseWeightsUnchanged === true }, { evidenceRefs, reversible: false });
               notifyDreamFinished(true, adapterPath);
               resolve(result);
             } catch (adapterError) {
@@ -4156,7 +6007,7 @@ async function runSipsCycle(payload) {
       claimBoundary: "This receipt proves an isolated local adapter was trained, its base weights stayed unchanged, its candidate inference was compared, and the selected command was checked. It does not claim a general model-quality gain or source-code patch.",
     };
     const receiptPath = path.join(runDir, "receipt.json");
-    fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf-8");
+    writeJsonAtomic(receiptPath, receipt);
     await runSipsRuntime({
       action: "record",
       title: `SIPS cycle candidate · ${objective.slice(0, 72)}`,
@@ -4192,7 +6043,7 @@ async function runSipsCycle(payload) {
       claimBoundary: "This failure receipt records the observed local failure; it is not a proof of improvement.",
     };
     const receiptPath = path.join(runDir, "receipt.json");
-    fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf-8");
+    writeJsonAtomic(receiptPath, receipt);
     try {
       await runSipsRuntime({ action: "record", title: `SIPS cycle failed · ${objective.slice(0, 72)}`, body: `SIPS cycle failed: ${error.message}`, tags: "sips,cycle,failure", status: "candidate", verifyBeforeUse: true, evidencePath: receiptPath, provenance: `Hemlock local SIPS failure receipt ${runId}` });
     } catch (recordError) {
@@ -4205,6 +6056,169 @@ async function runSipsCycle(payload) {
   } finally {
     sipsCycleActive = false;
   }
+}
+
+// --- Dream receipt surfacing + idle Dream proposer (propose-only) ---------
+//
+// The honest subset of training-receipt.json that the Dream window and
+// activity ledger render — iters actually run, the loss trajectory, dataset
+// size, and the eval verdict when a dream.eval comparison exists for this
+// adapter. Everything below is derived from receipts the trainer/evaluator
+// wrote; nothing is synthesized.
+function latestDreamEval(adapterPath = "") {
+  const evalsDir = path.join(sipsDir, "evals");
+  let names = [];
+  try {
+    names = fs.readdirSync(evalsDir).filter((name) => /^dream-eval-.*\.json$/.test(name)).sort();
+  } catch {
+    return null;
+  }
+  for (const name of [...names].reverse()) {
+    const receipt = readJsonFile(path.join(evalsDir, name), null, { label: "dream-eval-receipt" });
+    if (!receipt || typeof receipt !== "object") continue;
+    if (adapterPath && receipt.candidateAdapterPath && receipt.candidateAdapterPath !== adapterPath) continue;
+    return {
+      verdict: receipt.verdict || null,
+      deltas: receipt.deltas || null,
+      improvedTasks: Array.isArray(receipt.improvedTasks) ? receipt.improvedTasks.length : null,
+      regressedTasks: Array.isArray(receipt.regressedTasks) ? receipt.regressedTasks.length : null,
+      receiptPath: path.join(evalsDir, name),
+    };
+  }
+  return null;
+}
+
+function summarizeTrainingReceipt(trainingReceipt, adapterPath = "") {
+  const metrics = Array.isArray(trainingReceipt?.metrics) ? trainingReceipt.metrics : [];
+  const summary = trainingReceipt?.metricsSummary || {};
+  const losses = metrics.map((item) => item?.loss).filter((value) => Number.isFinite(value));
+  const firstLoss = summary.firstLoss ?? losses[0] ?? null;
+  const finalLoss = summary.finalLoss ?? losses.at(-1) ?? null;
+  const evalRecord = latestDreamEval(adapterPath);
+  return {
+    profile: trainingReceipt?.profile || null,
+    iters: Number.isFinite(trainingReceipt?.iters) ? trainingReceipt.iters : (metrics.at(-1)?.step ?? null),
+    numLayers: trainingReceipt?.numLayers ?? null,
+    stepsObserved: summary.stepsObserved ?? metrics.length,
+    firstLoss,
+    finalLoss,
+    bestLoss: summary.bestLoss ?? (losses.length ? Math.min(...losses) : null),
+    finalValLoss: summary.finalValLoss ?? (metrics.at(-1)?.valLoss ?? null),
+    lossTrend: Number.isFinite(firstLoss) && Number.isFinite(finalLoss)
+      ? (finalLoss < firstLoss ? "improving" : finalLoss > firstLoss ? "regressing" : "flat")
+      : null,
+    nonFiniteSteps: summary.nonFiniteSteps ?? 0,
+    datasetRows: trainingReceipt?.dataset?.sourceRows ?? null,
+    trainRows: trainingReceipt?.dataset?.trainRows ?? null,
+    validRows: trainingReceipt?.dataset?.validRows ?? null,
+    validationHoldout: trainingReceipt?.dataset?.validationHoldout === true,
+    adapterPath: adapterPath || trainingReceipt?.adapterPath || null,
+    adapterVersion: trainingReceipt?.adapterVersion || null,
+    checkpoints: Array.isArray(trainingReceipt?.checkpoints) ? trainingReceipt.checkpoints : [],
+    evalVerdict: evalRecord?.verdict || null,
+    evalReceiptPath: evalRecord?.receiptPath || null,
+    baseWeightsUnchanged: trainingReceipt?.baseWeightsUnchanged === true,
+    elapsed: trainingReceipt?.elapsed ?? null,
+  };
+}
+
+// When the workspace goes quiet and the findings dataset has grown past the
+// last Dream run's watermark, file ONE reviewable candidate in the ambient
+// inbox. This proposer never starts training: accepting the candidate still
+// routes through the normal explicit train-approval path. Cooldowns are
+// durable (sips/dream-scheduler.json plus the candidates ledger for
+// dismissals) so restarts cannot re-propose immediately.
+// HEMLOCK_NO_IDLE_DREAM=1 disables the proposer entirely.
+const IDLE_DREAM_MIN_NEW_ROWS = Math.max(1, Number(process.env.HEMLOCK_IDLE_DREAM_MIN_ROWS) || 8);
+const IDLE_DREAM_COOLDOWN_MS = Math.max(60000, Number(process.env.HEMLOCK_IDLE_DREAM_COOLDOWN_MS) || 1800000);
+const IDLE_DREAM_CHECK_MS = Math.max(30000, Number(process.env.HEMLOCK_IDLE_DREAM_CHECK_MS) || 300000);
+const idleDreamStatePath = path.join(sipsDir, "dream-scheduler.json");
+
+function readIdleDreamState() {
+  const stored = readJsonFile(idleDreamStatePath, null, { label: "dream-scheduler-state" });
+  return {
+    schema: "hemlock.dream.scheduler.v1",
+    datasetCountAtLastDream: Math.max(0, Number(stored?.datasetCountAtLastDream) || 0),
+    lastProposalAt: Number(stored?.lastProposalAt) || 0,
+    lastDreamAt: Number(stored?.lastDreamAt) || 0,
+  };
+}
+
+function writeIdleDreamState(patch = {}) {
+  const next = { ...readIdleDreamState(), ...patch };
+  try {
+    writeJsonFile(idleDreamStatePath, next);
+  } catch (error) {
+    console.warn(`[dream-scheduler] state write failed: ${error.message}`);
+  }
+  return next;
+}
+
+function openDreamProposal() {
+  const candidates = agentKernel?.getProjection?.().candidates || [];
+  return candidates.find((item) => item.kind === "dream-proposal" && item.status === "candidate") || null;
+}
+
+function lastDreamProposalDismissalAt() {
+  const candidates = agentKernel?.getProjection?.().candidates || [];
+  return candidates
+    .filter((item) => item.kind === "dream-proposal" && item.status === "dismissed")
+    .reduce((latest, item) => Math.max(latest, Date.parse(item.dismissedAt || item.updatedAt || 0) || 0), 0);
+}
+
+function maybeProposeIdleDream(trigger = "idle-check") {
+  if (process.env.HEMLOCK_NO_IDLE_DREAM === "1") return null;
+  // Every guard must hold: empty queue (no active entry and nothing
+  // pending), no live task, no Dream run, no SIPS cycle, no streaming
+  // inference — proposing while work is in flight would be noise.
+  const quiet = !dreamProcess
+    && !sipsCycleActive
+    && !activeStreams.size
+    && !isActiveTask(agentTask)
+    && !agentIntentQueue?.active
+    && !(agentIntentQueue?.pending?.length);
+  if (!quiet) return null;
+  const state = readIdleDreamState();
+  const newRows = Math.max(0, experimentDatasetSummary().count - state.datasetCountAtLastDream);
+  if (newRows < IDLE_DREAM_MIN_NEW_ROWS) return null;
+  const cooldownAnchor = Math.max(state.lastProposalAt, lastDreamProposalDismissalAt());
+  if (Date.now() - cooldownAnchor < IDLE_DREAM_COOLDOWN_MS) return null;
+  if (openDreamProposal()) return null; // one unreviewed proposal at a time
+  try {
+    const candidate = agentKernel.createCandidate({
+      kind: "dream-proposal",
+      title: `Dream cycle ready — ${newRows} new finding${newRows === 1 ? "" : "s"} since last dream`,
+      summary: `${newRows} new experiment findings were recorded since the last local Dream run. Accept to review a bounded Dream training plan; training still requires explicit approval.`,
+      sourceId: "local-project",
+      sourceRefs: [experimentDatasetPath],
+      reason: `Idle Dream proposer (${trigger})`,
+      confidence: 0.6,
+    });
+    writeIdleDreamState({ lastProposalAt: Date.now() });
+    appendAgentEvent("dream.proposal.created", "candidate", {
+      candidateId: candidate.id,
+      title: candidate.title,
+      newRows,
+      datasetCount: experimentDatasetSummary().count,
+      trigger,
+    }, { evidenceRefs: [experimentDatasetPath], reversible: true });
+    return candidate;
+  } catch (error) {
+    appendAgentEvent("dream.proposal.failed", "degraded", { error: error.message, trigger }, { reversible: true });
+    return null;
+  }
+}
+
+// Bounded idle check: the interval only ever calls the proposer (which
+// re-checks every guard), and unref keeps it from holding the process open.
+if (process.env.HEMLOCK_NO_IDLE_DREAM !== "1") {
+  const idleDreamTimer = setInterval(() => {
+    try { maybeProposeIdleDream("idle-timer"); } catch { /* advisory */ }
+  }, IDLE_DREAM_CHECK_MS);
+  idleDreamTimer.unref?.();
+  setTimeout(() => {
+    try { maybeProposeIdleDream("boot"); } catch { /* advisory */ }
+  }, 60000).unref?.();
 }
 
 // --- Host UX (Lane B): confirm dialog, notifications, window inventory ------
@@ -4413,6 +6427,32 @@ ipcMain.handle("agent:event", (_event, payload = {}) => {
   if (!allowedTypes.has(type)) throw new Error(`Renderer event is not allowlisted: ${type}`);
   return appendAgentEvent(type, String(payload.status || "observed"), payload.payload || {}, { source: "renderer", evidenceRefs: payload.evidenceRefs || [] });
 });
+// Renderer error → receipt: WindowBoundary reports render crashes through this
+// channel so they land on the event spine instead of dying in the console.
+// The payload is bounded and identical reports within 60s dedupe.
+const rendererErrorSeen = new Map();
+function recordRendererError(payload = {}) {
+  const component = String(payload.component || "unknown").slice(0, 120);
+  const message = String(payload.message || "renderer error").slice(0, 1000);
+  const stack = String(payload.stack || "").slice(0, 2048) || null;
+  const windowId = String(payload.windowId || "").slice(0, 80) || null;
+  const key = `${component}|${message}`;
+  const now = Date.now();
+  const last = rendererErrorSeen.get(key);
+  if (last && now - last < 60000) return { schema: "hemlock.renderer.error.v1", status: "deduped", component, windowId };
+  rendererErrorSeen.set(key, now);
+  if (rendererErrorSeen.size > 64) rendererErrorSeen.delete(rendererErrorSeen.keys().next().value);
+  const event = appendAgentEvent("renderer.error", "failed", { component, message, stack, windowId }, { source: "renderer", reversible: true });
+  return { schema: "hemlock.renderer.error.v1", status: "recorded", eventId: event.id, component, windowId };
+}
+
+ipcMain.handle("hemlock:renderer-error", (_event, payload = {}) => {
+  try {
+    return recordRendererError(payload);
+  } catch (error) {
+    return { schema: "hemlock.renderer.error.v1", status: "dropped", error: String(error.message || error).slice(0, 200) };
+  }
+});
 ipcMain.handle("agent:command", (_event, payload = {}) => runAgentCommand(payload.action, payload));
 ipcMain.handle("agent:artifacts", (_event, payload = {}) => {
   const action = String(payload.action || "inspect");
@@ -4484,6 +6524,20 @@ ipcMain.handle("sips:command", async (_event, payload) => {
 
 if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
+    // Fatal runtime errors get a durable receipt before the process dies.
+    // The handlers only observe — the default semantics (print to stderr,
+    // then exit) are preserved explicitly so installing them changes nothing
+    // about when or how the process ends.
+    process.on("uncaughtException", (error) => {
+      recordRuntimeError("uncaughtException", error);
+      console.error(error);
+      process.exit(1);
+    });
+    process.on("unhandledRejection", (reason) => {
+      recordRuntimeError("unhandledRejection", reason);
+      console.error(reason);
+      process.exit(1);
+    });
     if (app.isPackaged || process.env.MAPLE_AUTOSTART_SERVER === "1") {
       try {
         await startServer();
@@ -4529,4 +6583,11 @@ module.exports = {
   // job boundaries without launching Electron.
   showHostNotification,
   workNotifier,
+  // maple.warm seam (maple_warm.test.cjs): hold a stream open and inspect
+  // warm state without standing up a real MLX server.
+  __mapleWarm: {
+    startStream,
+    finishStream,
+    state: () => mapleWarmState,
+  },
 };

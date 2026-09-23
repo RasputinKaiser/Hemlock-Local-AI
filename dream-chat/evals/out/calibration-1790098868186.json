@@ -1,0 +1,61 @@
+{
+  "schema": "hemlock.agent.tool-use.calibration.v1",
+  "lane": "tool-use-eval",
+  "generatedAt": "2026-09-22T17:41:08.185Z",
+  "benchmark": {
+    "version": "2026-09-23",
+    "taskCount": 27,
+    "fixtureTaskCount": 16
+  },
+  "taskCompletionRate": 0,
+  "validActionRate": 1,
+  "expectedCoverageRate": 0,
+  "orderedSequenceRate": 0,
+  "evidenceCoverage": 0.2222222222222222,
+  "falseSuccessCount": 0,
+  "forbiddenCommandCount": 0,
+  "decisionEventCount": 4,
+  "permutationInvariantRate": 1,
+  "fixtureChecks": {
+    "decision": {
+      "checked": 4,
+      "passed": 4
+    },
+    "envelope": {
+      "checked": 12,
+      "passed": 12
+    }
+  },
+  "fixturePassRate": 1,
+  "confidenceCalibration": {
+    "0-0.5": {
+      "count": 1,
+      "wins": 1,
+      "meanConfidence": 0.3,
+      "empiricalWinRate": 1,
+      "calibrationGap": -0.7
+    },
+    "0.5-0.7": {
+      "count": 1,
+      "wins": 1,
+      "meanConfidence": 0.6,
+      "empiricalWinRate": 1,
+      "calibrationGap": -0.4
+    },
+    "0.7-0.9": {
+      "count": 1,
+      "wins": 1,
+      "meanConfidence": 0.83,
+      "empiricalWinRate": 1,
+      "calibrationGap": -0.17000000000000004
+    },
+    "0.9-1.0": {
+      "count": 1,
+      "wins": 1,
+      "meanConfidence": 0.9,
+      "empiricalWinRate": 1,
+      "calibrationGap": -0.09999999999999998
+    }
+  },
+  "claimBoundary": "Calibration metrics describe recorded decide/score receipts and replayed fixtures on this benchmark; they are a baseline for comparing future prompt/model changes, not a proof of general quality."
+}

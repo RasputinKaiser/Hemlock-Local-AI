@@ -33,11 +33,18 @@ function buildDigest(droppedMessages) {
   const dropped = (Array.isArray(droppedMessages) ? droppedMessages : [])
     .map(normalizeInferenceMessage)
     .filter(Boolean);
+  // Walk newest-first so the livest context wins, skip exact duplicate lines
+  // (repeated refusals, echoed prompts), and backfill from older drops so a
+  // duplicated newest window does not shrink the digest below its cap.
   const lines = [];
-  for (const message of dropped.slice(-DIGEST_MAX_LINES)) {
-    const sentence = firstSentence(message.content);
+  const seen = new Set();
+  for (let index = dropped.length - 1; index >= 0 && lines.length < DIGEST_MAX_LINES; index -= 1) {
+    const sentence = firstSentence(dropped[index].content);
     if (!sentence) continue;
-    lines.push(`${message.role === "user" ? "user" : "assistant"}: ${sentence}`);
+    const line = `${dropped[index].role}: ${sentence}`;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    lines.unshift(line);
   }
   return { summaryLines: lines, chars: lines.reduce((sum, line) => sum + line.length, 0) };
 }

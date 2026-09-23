@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const source = readFileSync(new URL("./main.jsx", import.meta.url), "utf8");
+// Window renderers now live in windows/*.jsx and take App state through a
+// ctx bag; strip the ctx. prefix so markup contracts stay file-agnostic.
+const source = ["./main.jsx", "./windows/shared.jsx", "./windows/ChatWindow.jsx", "./windows/ArtifactStudio.jsx", "./windows/CommandCenter.jsx", "./windows/UtilityWindows.jsx"]
+  .map((file) => readFileSync(new URL(file, import.meta.url), "utf8"))
+  .join("\n")
+  .replaceAll("ctx.", "");
 
 test("conditional window renderers do not declare React hooks", () => {
   const renderers = [...source.matchAll(/^  function (render\w+)\(/gm)];
@@ -42,7 +47,9 @@ test("palette captures its opener before moving focus and handles Escape without
 test("window close and minimize share focus handoff and confirmed close", () => {
   assert.match(source, /async function closeWindow\(id\)[\s\S]+?const confirmed = await confirmDialog/);
   assert.match(source, /if \(confirmed\) dismissWindow\(id, "closed"\)/);
-  assert.match(source, /function minimizeWindow\(id\)\s*\{\s*dismissWindow\(id, "minimized"\)/);
+  // Minimize may morph to the dock first, but it always settles through
+  // dismissWindow(id, "minimized") — the shared focus-handoff path.
+  assert.match(source, /function minimizeWindow\(id\)[\s\S]+?dismissWindow\(id, "minimized"\)/);
   assert.match(source, /if \(activeWindowId === id\) setActiveWindowId\(nextId\)/);
   assert.match(source, /current\[id\]\?\.state !== "closed"\s*\? focusWindowState/);
 });

@@ -2,6 +2,7 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { appendJsonlLine, readJsonFile: readJsonDurable, writeJsonAtomic } = require("./durable_io.cjs");
 
 const DEFAULT_HISTORY_ROOT = path.join(
   os.homedir(),
@@ -17,25 +18,6 @@ const DEFAULT_HISTORY_ROOT = path.join(
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function safeJson(filePath, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function readLines(filePath, limit = 80) {
-  try {
-    const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/).filter(Boolean);
-    return lines.slice(-limit).flatMap((line) => {
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
-  } catch {
-    return [];
-  }
 }
 
 function displayValue(value) {
@@ -82,16 +64,81 @@ function runLocal(command, args, { cwd, timeoutMs = 4000 } = {}) {
   });
 }
 
-function latestSegment(root) {
+// The computer-history root is a third-party TCC group container whose
+// open()/scandir can block in-kernel indefinitely on a wedged host — a
+// synchronous read there freezes the whole main process at boot; an
+// fs.promises op pins the event loop forever (AbortSignal does not fire once
+// the syscall is dispatched); a worker_threads Worker can't be stopped while
+// its syscall is wedged, which still blocks process exit. The scan therefore
+// runs in a detached child process whose only job is to answer: raced
+// against a bound, killed on timeout, and unref'd so a wedged child can
+// never pin the loop or block exit.
+const HISTORY_SCAN_TIMEOUT_MS = 3000;
+const HISTORY_UNAVAILABLE_TTL_MS = 5 * 60 * 1000;
+const HISTORY_SCAN_TIMEOUT = Symbol("history-scan-timeout");
+
+const HISTORY_SCAN_SCRIPT = `
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const root = process.argv[1];
+  const readJson = (file, fallback) => {
+    try { return JSON.parse(fs.readFileSync(file, "utf-8")) || fallback; }
+    catch { return fallback; }
+  };
   try {
-    return fs.readdirSync(root, { withFileTypes: true })
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    const segment = entries
       .filter((entry) => entry.isDirectory())
       .map((entry) => path.join(root, entry.name))
       .sort()
       .at(-1) || "";
-  } catch {
-    return "";
+    if (!segment) {
+      process.stdout.write(JSON.stringify({ segment: "", metadata: {}, rawEvents: [] }));
+    } else {
+      const metadata = readJson(path.join(segment, "metadata.json"), {});
+      const eventsPath = metadata.eventsPath || path.join(segment, "events.jsonl");
+      let rawEvents = [];
+      try {
+        rawEvents = fs.readFileSync(eventsPath, "utf-8")
+          .split(/\\r?\\n/)
+          .filter(Boolean)
+          .slice(-160)
+          .flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+      } catch { rawEvents = []; }
+      process.stdout.write(JSON.stringify({ segment, metadata, rawEvents }));
+    }
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ error: String((error && error.message) || error) }));
   }
+`;
+
+function startComputerHistoryScan(historyRoot) {
+  const child = spawn(process.execPath, ["-e", HISTORY_SCAN_SCRIPT, historyRoot], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  let out = "";
+  child.stdout.on("data", (chunk) => { out += String(chunk); });
+  const promise = new Promise((resolve) => {
+    child.once("error", (error) => resolve({ error: String(error?.message || error) }));
+    child.once("close", () => {
+      try {
+        resolve(JSON.parse(out.trim().split("\n").at(-1) || "{}"));
+      } catch {
+        resolve({});
+      }
+    });
+  });
+  return {
+    promise,
+    // On timeout: kill the probe (SIGKILL survives even a wedged syscall on
+    // this platform), drop the stdout pipe, and unref — a child that cannot
+    // die still cannot pin the loop or block exit.
+    stop() {
+      try { child.stdout.destroy(); } catch { /* pipe already closed */ }
+      try { child.kill("SIGKILL"); } catch { /* best effort */ }
+      try { child.unref(); } catch { /* best effort */ }
+    },
+  };
 }
 
 function normalizeHistoryEvent(event) {
@@ -125,7 +172,20 @@ class ContextBroker {
     this.historyRoot = process.env.HEMLOCK_COMPUTER_HISTORY_ROOT || DEFAULT_HISTORY_ROOT;
     this.openChronicle = process.env.HEMLOCK_OPENCHRONICLE || path.join(os.homedir(), ".local", "bin", "openchronicle");
     fs.mkdirSync(this.contextDir, { recursive: true });
-    this.state = safeJson(this.statePath, this.defaultState());
+    // Validate-on-read for OUR durable state: a corrupt context state is
+    // quarantined + journaled, then rebuilt from defaults. (safeJson stays
+    // for foreign files — quarantining another app's data is not ours to do.)
+    this.state = readJsonDurable(this.statePath, this.defaultState(), {
+      label: "context-state",
+      onIntegrity: (recovery) => {
+        try {
+          this.emit?.("integrity.recovered", "degraded", {
+            ...recovery,
+            claimBoundary: "The corrupt file was quarantined (never deleted) and rebuilt from defaults; the listed content was lost.",
+          }, { evidenceRefs: [recovery.file, recovery.quarantinePath].filter(Boolean), reversible: false });
+        } catch { /* reporting never breaks recovery */ }
+      },
+    });
   }
 
   defaultState() {
@@ -177,30 +237,40 @@ class ContextBroker {
       ? this.state.sources.map((item) => item.sourceId === sourceId ? next : item)
       : [...this.state.sources, next];
     this.state.updatedAt = nowIso();
-    fs.writeFileSync(this.statePath, `${JSON.stringify(this.state, null, 2)}\n`, "utf-8");
+    writeJsonAtomic(this.statePath, this.state);
     return next;
   }
 
   appendJournal(entry) {
     const record = { schema: "hemlock.context.journal.v1", id: `ctxevt-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, createdAt: nowIso(), ...entry };
-    fs.appendFileSync(this.journalPath, `${JSON.stringify(record)}\n`, "utf-8");
+    // fsync'd append: a journal line is durable before the call returns.
+    appendJsonlLine(this.journalPath, record);
     this.state.journalEntries += 1;
     return record;
   }
 
-  async inspectComputerHistory() {
-    if (!this.sourceEnabled("computer-history")) {
-      return { id: "computer-history", status: "disabled", reason: "Computer History is disabled for this workspace.", confidence: 0, observations: [] };
+  // Detached-probe scan of the Skysight segments dir. Never awaited without
+  // the HISTORY_SCAN_TIMEOUT race — see the constants above.
+  async _scanComputerHistory() {
+    const scan = startComputerHistoryScan(this.historyRoot);
+    this._historyScanStop = scan.stop;
+    let scanned;
+    try {
+      scanned = await scan.promise;
+    } finally {
+      this._historyScanStop = null;
     }
-    const segment = latestSegment(this.historyRoot);
+    if (scanned?.error) {
+      return { id: "computer-history", status: "unavailable", reason: `Computer-history scan failed: ${String(scanned.error).slice(0, 300)}`, confidence: 0, observations: [] };
+    }
+    const segment = String(scanned?.segment || "");
     if (!segment) {
       return { id: "computer-history", status: "unavailable", reason: "No local Skysight segment was discovered.", confidence: 0, observations: [] };
     }
-    const metadata = safeJson(path.join(segment, "metadata.json"), {});
-    const eventsPath = metadata.eventsPath || path.join(segment, "events.jsonl");
-    const rawEvents = readLines(eventsPath, 80);
+    const metadata = scanned?.metadata && typeof scanned.metadata === "object" ? scanned.metadata : {};
+    const rawEvents = Array.isArray(scanned?.rawEvents) ? scanned.rawEvents : [];
     const segmentEvidence = `computer-history://${path.basename(segment)}`;
-    const observations = rawEvents.map(normalizeHistoryEvent).slice(-24).map((observation) => ({
+    const observations = rawEvents.map(normalizeHistoryEvent).slice(-48).map((observation) => ({
       ...observation,
       evidenceRefs: observation.evidenceRefs?.length ? observation.evidenceRefs : [segmentEvidence],
     }));
@@ -218,6 +288,33 @@ class ContextBroker {
       evidenceRefs: [segmentEvidence],
       observations,
     };
+  }
+
+  async inspectComputerHistory() {
+    if (!this.sourceEnabled("computer-history")) {
+      return { id: "computer-history", status: "disabled", reason: "Computer History is disabled for this workspace.", confidence: 0, observations: [] };
+    }
+    if (this._historyUnavailableUntil > Date.now()) {
+      return { id: "computer-history", status: "unavailable", reason: "The computer-history directory did not answer the last scan within the bound; backing off before retrying.", confidence: 0, observations: [] };
+    }
+    if (!this._historyScan) this._historyScan = this._scanComputerHistory();
+    const outcome = await Promise.race([
+      this._historyScan,
+      new Promise((resolve) => setTimeout(() => resolve(HISTORY_SCAN_TIMEOUT), HISTORY_SCAN_TIMEOUT_MS)),
+    ]);
+    if (outcome === HISTORY_SCAN_TIMEOUT) {
+      // Kill the probe, drop the dead scan, and back off — the wedged child
+      // cannot pin the loop or block exit, and the TTL keeps probes from
+      // stampeding a directory the host refuses to answer.
+      this._historyScanStop?.();
+      this._historyScan = null;
+      this._historyScanStop = null;
+      this._historyUnavailableUntil = Date.now() + HISTORY_UNAVAILABLE_TTL_MS;
+      return { id: "computer-history", status: "unavailable", reason: "The computer-history directory did not answer within the scan bound.", confidence: 0, observations: [] };
+    }
+    this._historyScan = null;
+    this._historyUnavailableUntil = 0;
+    return outcome;
   }
 
   async inspectOpenChronicle() {
@@ -295,7 +392,7 @@ class ContextBroker {
     this.state = nextState;
     this.appendJournal({ type: "context.snapshot", reason, quality: nextState.quality, providerStatuses: providers.map((provider) => ({ id: provider.id, status: provider.status, confidence: provider.confidence })), focus: focusHypotheses.slice(0, 3) });
     this.state.journalEntries = this.state.journalEntries;
-    fs.writeFileSync(this.statePath, `${JSON.stringify(this.state, null, 2)}\n`, "utf-8");
+    writeJsonAtomic(this.statePath, this.state);
     const ambientObservation = observations.at(-1);
     if (ambientObservation && ambientObservation.confidence >= 0.65 && ambientObservation.source === "computer-history") {
       this.onCandidate?.({

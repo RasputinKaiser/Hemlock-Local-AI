@@ -1,0 +1,43 @@
+{
+  "agent": "perf2",
+  "server": "mlx_lm.server :8081 maple-2bit-mlx --flash-head --temp 0.7 --top-p 0.95 --top-k 20 --prefill-step-size 1024",
+  "ts": "2026-09-22T01:14:30",
+  "note": "measured on current code before perf2 changes; :8080 app server had exited, 16GB box still swap-pressured",
+  "decode": {
+    "mode": "decode",
+    "ttft_ms": 144.84,
+    "decode_tps": 72.12,
+    "completion_tokens": 128,
+    "prompt_tokens": 25,
+    "cached_tokens": 24,
+    "context_tokens": 0,
+    "reps": 4
+  },
+  "decode_ctx3000": {
+    "mode": "decode",
+    "ttft_ms": 189.27,
+    "decode_tps": 58.44,
+    "completion_tokens": 96,
+    "prompt_tokens": 3665,
+    "cached_tokens": 3664,
+    "context_tokens": 3000,
+    "reps": 3
+  },
+  "score": {
+    "mode": "score",
+    "total_ms": 910.29,
+    "per_candidate_ms": 113.79,
+    "prompt_tokens": 40,
+    "cached_tokens": 38,
+    "candidates": 8,
+    "reps": 4
+  },
+  "prefill": {
+    "mode": "prefill",
+    "ttft_ms": 7401.11,
+    "prefill_tps": 427.64,
+    "prompt_tokens": 3165,
+    "cached_tokens": 0,
+    "reps": 3
+  }
+}

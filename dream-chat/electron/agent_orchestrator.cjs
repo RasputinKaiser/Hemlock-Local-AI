@@ -1,7 +1,9 @@
 const crypto = require("node:crypto");
 
 const {
+  ACTION_SCHEMA,
   DEFAULT_BUDGET,
+  DEFAULT_CONTEXT_MAX_TOKENS,
   TERMINAL_TASK_STATUSES,
   classifyFailure,
   compactObservation,
@@ -12,22 +14,171 @@ const {
   clampBudgetOverrides,
   coerceActionPayload,
   normalizeCompactChoice,
+  parseBatchActions,
   buildScoreCandidates,
   pickScoredCandidate,
+  pickDecidedCandidate,
+  SCORED_REASONING_PREFIX,
   extractActionEnvelope,
   mergeBudget,
   normalizeExpectedEvidence,
+  normalizePlanStep,
+  requiredInputFields,
   TERMINAL_ACTION_STATUSES,
   validateAction,
 } = require("./agent_contracts.cjs");
+// Context-ceiling resolution helpers (kv-aware default, model clamp) live in
+// contracts; kept on a separate require line so the shared destructure above
+// stays untouched.
+const { defaultContextMaxTokens, modelMaxContextTokens, envKvBits, CONTEXT_GENERATION_HEADROOM_TOKENS } = require("./agent_contracts.cjs");
+const { classifyInferenceError } = require("./error_taxonomy.cjs");
 
 const MODEL_TERMINAL_KINDS = new Set(["ask_user", "blocked", "answer"]);
-const SAFE_ADAPTIVE_CAPABILITIES = new Set(["read", "context", "verify", "artifact", "preview", "write"]);
+// "task"/"memory" admit only their auto:true members under supervised/guided
+// (thread.search, task.ask, remember, memory.feedback/select, plan.propose…);
+// lifecycle/explicit members still need autonomyOpens or a plan step.
+const SAFE_ADAPTIVE_CAPABILITIES = new Set(["read", "context", "verify", "artifact", "preview", "write", "task", "memory"]);
 const FORBIDDEN_ADAPTIVE_CAPABILITIES = new Set(["train", "runtime", "external", "network", "secret"]);
 const HOST_DETERMINISTIC_COMMANDS = new Set([
   "artifact.preview.open",
   "artifact.preview.inspect",
 ]);
+// Continuous KV session bounds: past this, a rebuilt standalone request
+// (one cold prefill) beats replaying an ever-growing transcript.
+const SESSION_MAX_TURNS = 80;
+const SESSION_MAX_CHARS = 400000;
+// Bounded recovery: invalid/unusable model turns get this many corrective
+// re-inferences (on top of the initial attempt) before the host falls back to
+// the approved plan step.
+const MAX_ACTION_REPAIR_ATTEMPTS = 2;
+// A deterministic-input failure (the compact choice cannot express nested
+// required args — {"commandId":"improve.propose","input":{}} blocked a task
+// outright on evt-1789959126534) gets exactly one corrective re-inference
+// with the command's input contract echoed back, then a single retry action.
+const MAX_INPUT_REPAIR_ATTEMPTS = 1;
+// Decide acceptance gates. Confidence alone admitted a real high-confidence
+// `blocked` pick (~0.83-0.99) that contradicted the approved plan; a separable
+// top-2 probability margin is required alongside the confidence floor.
+const DECIDE_MIN_CONFIDENCE = 0.35;
+const DECIDE_MIN_MARGIN = 0.1;
+
+// Context budget guard. The pre-flight projection is a chars/4 heuristic —
+// it only ever surfaces as `estimatedTokens`; the authoritative count is
+// written back from server usage after each call. When the projection
+// exceeds the task's contextMaxTokens the volatile prompt region compacts
+// instead of failing: detail fields of older history entries first, then
+// stale observation text, then the oldest replayed session turns, then the
+// history tail. The byte-static system block is never touched.
+const TOKEN_ESTIMATE_CHARS = 4;
+const CONTEXT_BUDGET_ERROR_CODE = "CONTEXT_BUDGET_EXHAUSTED";
+// Compaction keeps this many replayed turns and whole-detail history rows.
+const CONTEXT_COMPACTION_MIN_TURNS = 4;
+const CONTEXT_COMPACTION_DETAILED_ACTIONS = 2;
+const CONTEXT_COMPACTION_DETAILED_OBSERVATIONS = 1;
+
+// The practical context ceiling is a budget, not the model's advertised
+// position count: KV memory on the full-attention layers is the binding
+// constraint. mergeBudget resolves a stored task pin; an unpinned
+// contextMaxTokens falls back to the live env/kv-aware default (HEMLOCK_KV_BITS
+// > 0 raises the default from 24000 to 61440 — quantized full-attention KV is
+// ~2x/~4x smaller). The resolved value is then clamped to the model ceiling
+// minus generation headroom — an over-ceiling request is adjusted AND
+// reported (console + context.ceiling.clamped + contextUsage fields), never
+// silently trusted.
+const CONTEXT_CLAMP_WARNED = new Set();
+function resolveContextMaxTokens(task = {}) {
+  const merged = mergeBudget(task?.budget);
+  const stored = Number(merged.contextMaxTokens);
+  const requested = Number.isFinite(stored) && stored > 0 ? Math.round(stored) : defaultContextMaxTokens();
+  const modelMaxTokens = modelMaxContextTokens();
+  const ceiling = Math.max(1, modelMaxTokens - CONTEXT_GENERATION_HEADROOM_TOKENS);
+  const maxTokens = Math.min(requested, ceiling);
+  const clamped = maxTokens !== requested;
+  if (clamped) {
+    const key = `${requested}->${maxTokens}@${modelMaxTokens}`;
+    if (!CONTEXT_CLAMP_WARNED.has(key)) {
+      CONTEXT_CLAMP_WARNED.add(key);
+      console.warn(`[hemlock] contextMaxTokens ${requested} exceeds the model ceiling ${modelMaxTokens} minus ${CONTEXT_GENERATION_HEADROOM_TOKENS}-token generation headroom; enforcing ${maxTokens}.`);
+    }
+  }
+  return { maxTokens, requestedMaxTokens: requested, clamped, modelMaxTokens, kvBits: envKvBits() };
+}
+
+function contextMaxTokensFor(task = {}) {
+  return resolveContextMaxTokens(task).maxTokens;
+}
+
+// Pre-flight request-size projection for the budget guard ONLY. The
+// transport remaps task→compactTask and adds a compact thread context of
+// similar order, so serializing the prompt's own volatile fields lands in
+// the same band. Anything this produces is labeled estimatedTokens — never
+// usedTokens, which comes from server usage.
+function estimateActionPromptTokens(actionPrompt = {}) {
+  try {
+    const turnChars = (Array.isArray(actionPrompt.sessionTurns) ? actionPrompt.sessionTurns : [])
+      .reduce((total, turn) => total + String(turn?.content || "").length + String(turn?.reasoning_content || "").length, 0);
+    const requestChars = JSON.stringify({
+      task: actionPrompt.task,
+      nextStep: actionPrompt.nextPlannedStep || null,
+      allowedNextCommands: actionPrompt.allowedNextCommands || null,
+      progress: actionPrompt.progress || null,
+      completed: actionPrompt.history || null,
+      repair: actionPrompt.repair || null,
+    }).length;
+    const chars = String(actionPrompt.system || "").length
+      + turnChars
+      + requestChars
+      + String(actionPrompt.sessionUserContent || "").length;
+    return Math.ceil(chars / TOKEN_ESTIMATE_CHARS);
+  } catch {
+    return null;
+  }
+}
+
+// Lane fallback for structured-action inference. A transport-class Maple
+// death — dropped connection or unreachable host (both classify as
+// "transport-death"), or a GPU-server fault — may retry the step ONCE on a
+// configured external lane. Parse/envelope failures never qualify: those are
+// the model's problem and stay with the in-lane repair loops. Configuration:
+// HEMLOCK_FALLBACK_LANE (codex|claude|none, default none) is the global
+// default; task.fallbackLane (set on the intent payload) is the per-task
+// override — "none" disables the fallback for that task explicitly. With no
+// configured lane the behavior is identical to before: the repair loop runs
+// and the deterministic plan-step fallback owns the final degradation.
+const LANE_FALLBACK_ERROR_KINDS = new Set(["transport-death", "gpu-server-error"]);
+const LANE_FALLBACK_PROVIDERS = new Set(["codex", "claude"]);
+
+function envFallbackLane() {
+  const lane = String(process.env.HEMLOCK_FALLBACK_LANE || "").trim().toLowerCase();
+  return LANE_FALLBACK_PROVIDERS.has(lane) ? lane : null;
+}
+
+function fallbackLaneForTask(task = {}) {
+  const taskLane = String(task?.fallbackLane || "").trim().toLowerCase();
+  if (taskLane === "none") return null;
+  if (LANE_FALLBACK_PROVIDERS.has(taskLane)) return taskLane;
+  return envFallbackLane();
+}
+
+// Lane honesty for receipts: when the durable action was produced by a
+// provider other than the task's own lane (a lane fallback), the observation
+// must carry the same provenance so no record claims Maple did the work.
+function tagObservationLane(observation, action) {
+  if (typeof action?.provider === "string" && action.provider && action.provider !== "maple") {
+    observation.provider = action.provider;
+    if (action.fallbackFrom) observation.fallbackFrom = action.fallbackFrom;
+  }
+  return observation;
+}
+
+// Forced prefix for action-proposal inference: the assistant turn is
+// prefilled inside the JSON envelope — generation starts at {"command": and
+// the unbounded-reasoning/no-content failure class dies. Two channels carry
+// it: `prompt.assistantPrefix` (forwarded as snake_case `assistant_prefix` by
+// inferStructuredAction in main.cjs, with a 400-retry fallback if the server
+// rejects it) and a second options argument for transports that declare one.
+const ACTION_PROPOSAL_PREFIX = "{\"command\":";
+const ACTION_PROPOSAL_OPTIONS = Object.freeze({ assistantPrefix: ACTION_PROPOSAL_PREFIX });
 
 const COMMAND_EVIDENCE = Object.freeze({
   "context.refresh": ["context://current"],
@@ -58,6 +209,13 @@ const COMMAND_EVIDENCE = Object.freeze({
   "experiment.run": ["experiment://receipt"],
   "experiment.note": ["experiment://finding"],
   "experiment.dataset": ["experiment://dataset"],
+  "experiment.suggest": ["experiment://coverage"],
+  "world.state": ["world://state"],
+  "memory.list": ["memory://records"],
+  "memory.note": ["memory://note"],
+  "dream.dataset.preview": ["experiment://dataset-preview"],
+  "agent.capabilities": ["agent://capabilities"],
+  "agent.self": ["agent://self"],
 });
 
 function expectedEvidenceForCommand(commandId, fallback = []) {
@@ -117,8 +275,11 @@ function modelMaySelectCommand(commandId, descriptor = {}, plan = { steps: [] },
   // A command already present in the user-approved plan is available even if
   // its descriptor is normally explicit (artifact authoring is the important
   // example). New model-selected commands must be host-marked auto-safe —
-  // unless the task's autonomy level opens that capability.
-  if (!planned && !autonomyOpens && descriptor.auto !== true) return false;
+  // unless the task's autonomy level opens that capability, or the command's
+  // approval is "plan": an approved plan is already the capability boundary,
+  // so plan-approved commands (e.g. change.apply) run under the same gate as
+  // planned steps rather than being hidden from selection entirely.
+  if (!planned && !autonomyOpens && descriptor.auto !== true && descriptor.approval !== "plan") return false;
   if (!planned && !autonomyOpens && descriptor.approval === "explicit") return false;
   return true;
 }
@@ -143,7 +304,7 @@ function allowedNextCommands(commandRegistry = {}, plan = { steps: [] }, history
     if (seen.has(item.commandId)) return false;
     seen.add(item.commandId);
     return true;
-  }).slice(0, 32);
+  }).slice(0, 64);
 }
 
 // T12 anti-repeat guard: a completed command's receipt is already durable.
@@ -185,12 +346,65 @@ function completedWorkKeys(history = {}) {
     .map((action) => `${action.commandId}::${stableDigest(action.input || {})}`));
 }
 
-function resolveProgressCommand(proposal, completedIds, completedWork, planSteps = []) {
+// Capabilities whose completion can change what a repeat would observe —
+// after one of these lands, re-running a read/inspect/verify command is new
+// evidence, not a loop.
+const MUTATING_CAPABILITIES = new Set(["write", "artifact", "train", "memory"]);
+
+// Write-capable commands that never consume the mutation-set budget: rollback
+// restores a prior state and experiment.note only journals a finding.
+const MUTATION_EXEMPT_COMMANDS = new Set(["code.rollback", "experiment.note"]);
+
+// Candidate pruning for the scored/decide selection. Every candidate costs a
+// teacher-forced pass — measured on Maple: ~36s median/step at ~37 candidates,
+// up to ~117s at 69. Rank allowed commands and cap them before expansion:
+// approved-plan steps always keep their slot, then adaptive commands by
+// capability value, diversity, and repeat-likelihood. Pruned commands stay
+// available to the generative path — this narrows what gets scored, never what
+// may be chosen.
+const SCORE_RANKED_MAX_COMMANDS = Number.isInteger(Number(process.env.HEMLOCK_SCORE_MAX_COMMANDS))
+  ? Math.max(4, Math.min(48, Number(process.env.HEMLOCK_SCORE_MAX_COMMANDS)))
+  : 14;
+
+const CAPABILITY_SCORE_ORDER = { verify: 50, artifact: 46, write: 42, read: 40, context: 38, preview: 34, memory: 32, task: 30, inference: 20 };
+
+function rankScoringCommands(allowedCommands = [], history = {}, { maxCommands = SCORE_RANKED_MAX_COMMANDS } = {}) {
+  const completedIds = completedTaskCommands(history);
+  const capabilityCounts = new Map();
+  const ranked = allowedCommands.map((entry, index) => {
+    const capability = entry.capability || "read";
+    const seen = capabilityCounts.get(capability) || 0;
+    capabilityCounts.set(capability, seen + 1);
+    let score = entry.source === "approved-plan" ? 100 : (CAPABILITY_SCORE_ORDER[capability] ?? 25);
+    if (completedIds.has(entry.commandId)) score -= 45;
+    if (seen >= 3) score -= 15;
+    return { entry, score, index };
+  });
+  ranked.sort((a, b) => b.score - a.score || a.index - b.index);
+  return ranked.slice(0, maxCommands).map((item) => item.entry);
+}
+
+// True when a mutating command completed after the requested command's last
+// completion — a post-write re-inspection is legitimate and must not be
+// redirected away by the anti-repeat guard.
+function mutationIntervened(history = {}, commandId, commandRegistry = {}) {
+  const actions = history.actions || [];
+  let lastCompletion = -1;
+  actions.forEach((action, index) => {
+    if (action.commandId === commandId && TERMINAL_ACTION_STATUSES.has(action.status)) lastCompletion = index;
+  });
+  return actions.some((action, index) => index > lastCompletion
+    && TERMINAL_ACTION_STATUSES.has(action.status)
+    && action.commandId
+    && MUTATING_CAPABILITIES.has(commandRegistry?.[action.commandId]?.capability));
+}
+
+function resolveProgressCommand(proposal, completedIds, completedWork, planSteps = [], stateChanged = false) {
   const requested = String(proposal?.commandId || "").trim();
   if (!requested) return { commandId: null, redirected: false };
-  const repeated = PARAMETERIZED_REPEAT_COMMANDS.has(requested)
+  const repeated = !stateChanged && (PARAMETERIZED_REPEAT_COMMANDS.has(requested)
     ? completedWork?.has(`${requested}::${stableDigest(proposal?.input || {})}`)
-    : completedIds?.has(requested);
+    : completedIds?.has(requested));
   if (!repeated) return { commandId: requested || null, redirected: false };
   const nextIndex = planSteps.findIndex((step) => step?.commandId && !completedIds.has(step.commandId));
   const redirect = nextIndex >= 0 ? planSteps[nextIndex] : null;
@@ -221,6 +435,18 @@ function actionInputContract(commandId) {
       return "input should contain experimentId (defaults to the latest run receipt) and claim — your interpretation of what the measured result showed. The host attaches the real measurements verbatim.";
     case "experiment.dataset":
       return "input may contain only limit (max 400).";
+    case "improve.propose":
+      return "input must contain summary and rationale for the bounded change; files and change are optional. A {} input fails deterministic input validation.";
+    case "memory.note":
+      return "input must contain title and body; tags and evidenceRefs are optional. Record only a lesson worth keeping.";
+    case "world.place":
+      return "input must contain kind (marker|monument|sign) and label; note and position are optional.";
+    case "shell.exec":
+      return "input must contain command (an allowlisted executable such as git, rg, node, npm, python3) and may contain args and cwd. No paths, wrappers, or shell syntax.";
+    case "plan.revise":
+      return "input must contain steps — the full replacement list for the remaining plan, each {commandId,label,input?} or a terminal {kind,label}.";
+    case "task.ask":
+      return "input must contain question — the decision you need from the user; context is optional.";
     default:
       return "input should be {}. The host supplies task identity, command identity, approval, and evidence.";
   }
@@ -228,8 +454,14 @@ function actionInputContract(commandId) {
 
 function defaultPlanSteps(intent, objective = "") {
   if (intent === "verify") return [{ commandId: "verification.list", label: "Select an allowlisted verification", expectedEvidence: ["verification://profiles"] }, { commandId: "verify", label: "Run the selected verification", expectedEvidence: ["receipt://verification"] }];
-  if (intent === "memory") return [{ commandId: "recall", label: "Recall scoped project lessons", expectedEvidence: ["memory://scoped"] }];
+  if (intent === "memory") return [
+    { commandId: "memory.list", label: "List memory records with staleness and provenance", expectedEvidence: ["memory://records"] },
+    { commandId: "recall", label: "Recall scoped project lessons", expectedEvidence: ["memory://scoped"] },
+    { commandId: "memory.note", label: "Record a memory note worth keeping", expectedEvidence: ["memory://note"] },
+  ];
   if (intent === "experiment") return [
+    { commandId: "world.state", label: "Read the understory world state before experimenting", expectedEvidence: ["world://state"] },
+    { commandId: "experiment.suggest", label: "Read experiment coverage before choosing", expectedEvidence: ["world://suggest"] },
     { commandId: "experiment.run", label: "Run a bounded physics experiment in the world", expectedEvidence: ["experiment://receipt"] },
     { commandId: "experiment.note", label: "Record the finding into the Dream dataset", expectedEvidence: ["experiment://finding"] },
     { kind: "answer", label: "Interpret what the world showed" },
@@ -244,19 +476,67 @@ function defaultPlanSteps(intent, objective = "") {
       { commandId: "artifact.preview.open", label: "Open the isolated artifact preview", expectedEvidence: ["preview://session"] },
       { commandId: "artifact.preview.inspect", label: "Inspect the rendered artifact and capture evidence", expectedEvidence: ["preview://inspection"] },
     ];
+    const execRequest = /\b(test|tests|lint|build|run|check|exec|script)\b/i.test(String(objective));
     return [
       { commandId: "context.refresh", label: "Refresh scoped project context", expectedEvidence: ["context://current"] },
       { commandId: "repo-map", label: "Map the current repository", expectedEvidence: ["repo://current-worktree"] },
       { commandId: "repo.inspect", label: "Inspect relevant files before editing", expectedEvidence: ["repo://inspection"] },
       { commandId: "git.status", label: "Check worktree scope before a change", expectedEvidence: ["git://status"] },
+      ...(execRequest ? [{ commandId: "shell.exec", label: "Run the requested bounded workspace command", input: { command: "npm", args: ["test"] }, expectedEvidence: ["receipt://exec"] }] : []),
       { commandId: "code.apply", label: "Apply the requested scoped coding edit", expectedEvidence: ["changeset://applied"] },
       { commandId: "verify", label: "Run the selected verification profile", expectedEvidence: ["receipt://verification"] },
       { commandId: "git.diff", label: "Record the final scoped diff", expectedEvidence: ["git://diff"] },
     ];
   }
-  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Recall recent local evidence before proposing", expectedEvidence: ["receipt://recent"] }, { commandId: "improve.propose", label: "Propose a bounded local improvement from the evidence", expectedEvidence: ["receipt://proposed-improvement"] }, { kind: "answer", label: "Summarize the proposed improvement for approval" }];
+  if (intent === "improve") return [{ commandId: "repo-map", label: "Map the current project", expectedEvidence: ["repo://current-worktree"] }, { commandId: "receipts.query", label: "Recall recent local evidence before proposing", expectedEvidence: ["receipt://recent"] }, { commandId: "dream.dataset.preview", label: "Preview the Dream dataset composition before proposing", expectedEvidence: ["experiment://dataset-preview"] }, { commandId: "improve.propose", label: "Propose a bounded local improvement from the evidence", expectedEvidence: ["receipt://proposed-improvement"] }, { kind: "answer", label: "Summarize the proposed improvement for approval" }];
   if (intent === "conversation") return [{ kind: "answer", label: "Answer from the scoped context and evidence" }];
-  return [{ commandId: "repo-map", label: "Inspect the local project", expectedEvidence: ["repo://current-worktree"] }];
+  return [{ commandId: "agent.capabilities", label: "Read the available command surface", expectedEvidence: ["agent://capabilities"] }, { commandId: "repo-map", label: "Inspect the local project", expectedEvidence: ["repo://current-worktree"] }];
+}
+
+// INPUT CONTRACTS stays registry-derived (not allowedCommands-derived) so
+// the system prompt remains byte-static across steps and the Maple prompt
+// cache still holds — it is a superset of whatever is currently allowed.
+// Priority order is fixed (failure-prone commands first): registry order
+// would push artifact.author/code.apply/experiment.run past the cap.
+const INPUT_CONTRACT_PRIORITY = [
+  "artifact.author", "artifact.update", "artifact.create", "code.apply",
+  "experiment.run", "experiment.note", "improve.propose", "verify",
+  "file.read", "file.search", "context.search", "context.query",
+  "artifact.preview.open", "repo.inspect", "repo-map", "remember",
+];
+
+// The full structured-action system prompt. Registry-derived only — no
+// task/plan/history inputs — so it is byte-static across steps (the Maple
+// prompt cache holds) and the host's maple.warm prefill can rebuild the
+// identical prefix without a live task; the volatile plan/action tail lives
+// in the user turn and is deliberately not part of this prefix.
+function buildActionSystemPrompt(commandRegistry = {}) {
+  const hintEntries = Object.entries(commandRegistry)
+    .map(([commandId, descriptor]) => [commandId, String(descriptor?.inputHint || "").trim()])
+    .filter(([, hint]) => hint);
+  const inputContracts = [
+    ...INPUT_CONTRACT_PRIORITY
+      .map((commandId) => hintEntries.find(([id]) => id === commandId))
+      .filter(Boolean),
+    ...hintEntries.filter(([commandId]) => !INPUT_CONTRACT_PRIORITY.includes(commandId)),
+  ].slice(0, 24);
+  return [
+    "You are Maple-Preview operating inside Hemlock.",
+    "Return exactly one compact JSON choice in the content channel — no prose, no markdown, nothing else:",
+    '{"kind":"tool","commandId":"<one allowedNextCommands entry>","input":{},"shortRationale":"one-line reason"}',
+    "Emit the whole JSON object in the content channel alone — the reasoning channel is not parsed for actions.",
+    "kind may instead be answer, ask_user, or blocked: terminal choices with no commandId.",
+    "The host assigns id, taskId, step, approval, expectedEvidence, and status. Never emit them.",
+    "The approved plan is a user-approved capability boundary and a starting direction, not a rigid script. Choose the next best command from request.allowedNextCommands when more inspection, verification, or artifact work is useful; the host validates and records the adaptation.",
+    "request.progress.completedCommands are finished — never re-propose them; a re-proposal is redirected to the plan.",
+    ...(inputContracts.length ? [
+      "INPUT CONTRACTS (commandId → input shape):",
+      ...inputContracts.map(([commandId, hint]) => `${commandId} → ${hint}`),
+      "Prefer a tool call over answer when evidence is missing; keep input minimal but complete — free text goes in the named field, not nested objects.",
+    ] : []),
+    "Never put HTML, source code, or a large payload in artifact.create. Use the later artifact.author step for complete source.",
+    "If evidence is insufficient, return kind ask_user or blocked. Do not claim completion without a host observation or receipt.",
+  ].join("\n");
 }
 
 function fallbackAnimationSource(objective = "Eastern Hemlock night garden") {
@@ -282,7 +562,7 @@ function fallbackAnimationSource(objective = "Eastern Hemlock night garden") {
 }
 
 class AgentOrchestrator {
-  constructor({ kernel, commandRegistry, getTask, setTask, emit, executeCommand, inferAction, scoreActions, repairCoding, createSuggestion, worldContext }) {
+  constructor({ kernel, commandRegistry, getTask, setTask, emit, executeCommand, inferAction, scoreActions, repairCoding, createSuggestion, worldContext, buildCandidates }) {
     this.kernel = kernel;
     this.commandRegistry = commandRegistry || {};
     this.getTask = getTask;
@@ -290,10 +570,21 @@ class AgentOrchestrator {
     this.emit = emit || (() => {});
     this.executeCommand = executeCommand;
     this.inferAction = inferAction || null;
-    this.scoreActions = scoreActions || null;
+    // scoreActions may be a bare function (legacy shape = /v1/score only) or
+    // {decide?, score?}; normalize once so the fast path can prefer decide.
+    this.scoreActions = typeof scoreActions === "function"
+      ? { score: scoreActions }
+      : scoreActions && typeof scoreActions === "object" ? scoreActions : null;
+    // Candidate enumerator for the scored/decide fast path — injectable so
+    // degenerate enumerations (single candidate) are exercisable.
+    this.buildCandidates = typeof buildCandidates === "function" ? buildCandidates : buildScoreCandidates;
     this.repairCoding = repairCoding || null;
     this.createSuggestion = createSuggestion || null;
     this.worldContext = worldContext || null;
+    this._sessionTurns = new Map();
+    // Last scored/decide winner for the in-flight step, consumed by
+    // proposeNextAction to receipt decide↔execute divergence.
+    this._scoredDecision = null;
   }
 
   task() {
@@ -362,6 +653,69 @@ class AgentOrchestrator {
     return { schema: "hemlock.agent.plan.result.v1", status: "blocked", plan: this.kernel.getProjection().plans.find((item) => item.id === planId), task: this.task() };
   }
 
+  // plan.revise (plan-gated command): the model proposes a revised
+  // remaining-step list for the CURRENT approved plan while a task is
+  // running or blocked — replace/insert/remove of everything past the
+  // already-executed prefix. Each proposed tool step is validated against
+  // the registry and the current allowedNextCommands boundary; any invalid
+  // entry rejects the whole revision and the durable plan stays untouched.
+  //
+  // Dispatch wiring (main.cjs runAgentCommand, registry entry owned by the
+  // registry workstream):
+  //   else if (command === "plan.revise") result = agentOrchestrator.revisePlan(String(payload.taskId || agentTask.id), payload);
+  // Expected payload: { taskId?, planId?, steps: [{ commandId, label, input? } | { kind: "answer"|"ask_user", label }], rationale? }
+  revisePlan(taskId = this.task()?.id, { planId, steps, rationale } = {}) {
+    const task = this.task();
+    if (!task || task.id !== taskId) throw new Error("Hemlock cannot revise a plan for an unknown task.");
+    const plan = this.kernel.getProjection().plans.find((item) => item.id === (planId || task.activePlanId) && item.taskId === taskId);
+    if (!plan) throw new Error(`Hemlock plan was not found for task: ${planId || task.activePlanId || "none"}`);
+    const reject = (reason) => {
+      this.emit("plan.revision.rejected", "rejected", { taskId, planId: plan.id, reason }, { evidenceRefs: plan.evidenceRefs || [], reversible: true });
+      return { schema: "hemlock.agent.plan.result.v1", status: "rejected", reason, plan, task: this.task(), claimBoundary: "No revision was applied; the durable plan is unchanged." };
+    };
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return reject(`The task is already terminal: ${task.status}.`);
+    if (plan.status !== "approved") return reject(`Only an approved in-flight plan can be revised; current status is ${plan.status}.`);
+    if (!Array.isArray(steps) || !steps.length) return reject("A plan revision needs at least one proposed step.");
+    const history = this.kernel.getTaskHistory(taskId);
+    const currentIndex = history.actions.length;
+    const allowed = new Set(this.allowedNextCommands(task, plan, history).map((entry) => entry.commandId));
+    const revision = [];
+    for (const [index, step] of steps.entries()) {
+      const kind = step?.kind || "tool";
+      if (kind === "tool") {
+        const commandId = String(step?.commandId || "").trim();
+        if (!commandId || !this.commandRegistry[commandId]) return reject(`Revision step ${index + 1} names an unknown commandId: ${commandId || "none"}.`);
+        if (!allowed.has(commandId)) return reject(`Revision step ${index + 1} command is outside the current capability boundary: ${commandId}.`);
+        const descriptor = this.commandRegistry[commandId];
+        revision.push({
+          ...normalizePlanStep({ ...step, commandId, label: step.label || descriptor.label || commandId, expectedEvidence: Array.isArray(step.expectedEvidence) ? step.expectedEvidence : expectedEvidenceForCommand(commandId) }, index),
+          approval: step.approval === "plan" || step.approval === "explicit" ? step.approval : descriptor.approval === "plan" ? "plan" : "none",
+        });
+      } else if (kind === "answer" || kind === "ask_user") {
+        revision.push(normalizePlanStep({ ...step, kind, commandId: null }, index));
+      } else {
+        return reject(`Revision step ${index + 1} has an unsupported kind: ${kind}.`);
+      }
+    }
+    // The executed prefix is immutable — history indexing assumes one durable
+    // action per step, so revisions only ever replace the remaining suffix.
+    const kept = plan.steps.slice(0, currentIndex).map((step) => ({ ...step, status: "completed" }));
+    const removed = plan.steps.slice(currentIndex);
+    const nextSteps = [...kept, ...revision].map((step, index) => ({ ...step, step: index + 1 }));
+    const diff = {
+      keptCount: kept.length,
+      removed: removed.map((step) => ({ step: step.step, commandId: step.commandId || null, kind: step.kind || "tool", label: step.label })),
+      added: revision.map((step) => ({ commandId: step.commandId || null, kind: step.kind, label: step.label })),
+    };
+    const revisionRecord = { revisedAt: new Date().toISOString(), rationale: String(rationale || "").trim() || null, diff };
+    const revisions = [...(plan.revisions || []), revisionRecord].slice(-24);
+    Object.assign(plan, { steps: nextSteps, revisions, lastRevision: revisionRecord });
+    this.kernel.updatePlan(plan.id, { steps: nextSteps, revisions, lastRevision: revisionRecord });
+    this.updateTask({ foregroundStep: `Plan revised: ${diff.added.map((step) => step.commandId || step.kind).join(" → ") || "no remaining steps"}` });
+    this.emit("plan.revised", "revised", { taskId, planId: plan.id, rationale: revisionRecord.rationale, diff, plan }, { evidenceRefs: plan.evidenceRefs || [], reversible: true });
+    return { schema: "hemlock.agent.plan.result.v1", status: "revised", plan, diff, task: this.task() };
+  }
+
   async resumeTask(taskId = this.task()?.id) {
     const task = this.task();
     if (!task || task.id !== taskId) throw new Error("Hemlock cannot resume an unknown task.");
@@ -422,7 +776,7 @@ class AgentOrchestrator {
     if (!step) {
       const completedIds = completedTaskCommands(history);
       const openPlannedWork = plan.steps.some((item, index) => index >= currentIndex && item?.commandId && !completedIds.has(item.commandId));
-      if (completedIds.has(decision.commandId) && openPlannedWork) return plan.steps[currentIndex] || null;
+      if (completedIds.has(decision.commandId) && openPlannedWork && !mutationIntervened(history, decision.commandId, this.commandRegistry)) return plan.steps[currentIndex] || null;
     }
     const descriptor = this.commandRegistry[decision.commandId] || {};
     if (!step) {
@@ -447,7 +801,7 @@ class AgentOrchestrator {
       commandId: decision.commandId,
       reason: decision.reason,
       createdAt: new Date().toISOString(),
-    }].slice(-24);
+    }].slice(-48);
     Object.assign(plan, { steps, adaptiveDecisions, lastAdaptiveDecision: adaptiveDecisions.at(-1) });
     this.kernel.updatePlan(plan.id, { steps, adaptiveDecisions, lastAdaptiveDecision: plan.lastAdaptiveDecision });
     this.emit("plan.adapted", "running", {
@@ -459,15 +813,151 @@ class AgentOrchestrator {
     return plan.steps[currentIndex];
   }
 
+  // Action-proposal inference with the forced JSON prefix. The prefix rides
+  // the prompt as `assistantPrefix` — the live channel inferStructuredAction
+  // already forwards as `assistant_prefix` — and additionally as a second
+  // options argument when the transport declares one (arity >= 2).
+  // Chat/free-text inference never routes through here.
+  inferProposal(prompt) {
+    const prefixed = { ...prompt, assistantPrefix: ACTION_PROPOSAL_PREFIX };
+    return this.inferAction.length >= 2
+      ? this.inferAction(prefixed, ACTION_PROPOSAL_OPTIONS)
+      : this.inferAction(prefixed);
+  }
+
+  // Bounded context compaction for the volatile request region. Order:
+  // detail fields of older history entries (ids + statuses survive), then
+  // stale observation text, then the oldest replayed session turns (dropped
+  // from the front in pairs so a user turn stays first), then the history
+  // tail itself, and finally the whole replayed transcript — after which the
+  // slim history re-expands because the transcript had been carrying it.
+  // The byte-static system block is never touched. Every pass is receipted
+  // with context.compacted (what dropped, counts, reason); the prompt's
+  // progress notes "N earlier steps compacted" so Maple knows. Throws
+  // CONTEXT_BUDGET_EXHAUSTED when even a fully compacted request cannot fit.
+  compactActionContext(task, actionPrompt, sessionNext, compactHistory, maxTokens, contextCeiling = null) {
+    const dropped = { actionDetails: 0, observationDetails: 0, operationDetails: 0, historyEntries: 0, sessionTurns: 0 };
+    const slimAction = (entry) => ({ id: entry.id, step: entry.step, kind: entry.kind, commandId: entry.commandId, status: entry.status });
+    const slimObservation = (entry) => ({ id: entry.id, operationId: entry.operationId ?? null, status: entry.status, outputDigest: entry.outputDigest ?? null });
+    const slimOperation = (entry) => ({ id: entry.id, command: entry.command, status: entry.status });
+    const slimList = (items, keepWhole, slim, counterKey) => (Array.isArray(items) ? items : []).map((entry, index, list) => {
+      if (index >= list.length - keepWhole) return entry;
+      const slimmed = slim(entry);
+      if (JSON.stringify(slimmed).length >= JSON.stringify(entry).length) return entry;
+      dropped[counterKey] += 1;
+      return slimmed;
+    });
+    const measure = () => estimateActionPromptTokens(actionPrompt);
+    const history = actionPrompt.history || {};
+    // Phase 1: strip progress details from older history entries; the
+    // freshest rows stay whole so the current step keeps full fidelity.
+    actionPrompt.history = {
+      actions: slimList(history.actions, CONTEXT_COMPACTION_DETAILED_ACTIONS, slimAction, "actionDetails"),
+      observations: slimList(history.observations, CONTEXT_COMPACTION_DETAILED_OBSERVATIONS, slimObservation, "observationDetails"),
+      operations: slimList(history.operations, CONTEXT_COMPACTION_DETAILED_OBSERVATIONS, slimOperation, "operationDetails"),
+    };
+    let estimatedTokens = measure();
+    // Phase 2: drop the oldest replayed session turns. The next committed
+    // call re-keys the prompt cache on the shorter transcript — a rebase,
+    // not silent loss, and the event below records the counts.
+    if (estimatedTokens > maxTokens && sessionNext.length > CONTEXT_COMPACTION_MIN_TURNS) {
+      let removable = sessionNext.length - CONTEXT_COMPACTION_MIN_TURNS;
+      if (removable % 2) removable -= 1;
+      const removed = sessionNext.splice(0, removable);
+      dropped.sessionTurns += removed.length;
+      actionPrompt.sessionTurns = [...sessionNext];
+      estimatedTokens = measure();
+    }
+    // Phase 3: shrink the history tail itself to the freshest entries.
+    if (estimatedTokens > maxTokens) {
+      const before = actionPrompt.history;
+      actionPrompt.history = {
+        actions: before.actions.slice(-CONTEXT_COMPACTION_DETAILED_ACTIONS),
+        observations: before.observations.slice(-CONTEXT_COMPACTION_DETAILED_OBSERVATIONS),
+        operations: before.operations.slice(-CONTEXT_COMPACTION_DETAILED_OBSERVATIONS),
+      };
+      dropped.historyEntries = Math.max(0, before.actions.length - actionPrompt.history.actions.length)
+        + Math.max(0, before.observations.length - actionPrompt.history.observations.length)
+        + Math.max(0, before.operations.length - actionPrompt.history.operations.length);
+      estimatedTokens = measure();
+    }
+    // Phase 4: still over → drop the replayed transcript entirely and
+    // re-expand slim history to compensate (the transcript had been carrying
+    // that context). The session rebases on the next committed call. With no
+    // transcript to drop, the phase-3 minimum already stands — re-expanding
+    // would only grow the request.
+    if (estimatedTokens > maxTokens && sessionNext.length) {
+      dropped.sessionTurns += sessionNext.length;
+      sessionNext.length = 0;
+      actionPrompt.sessionTurns = [];
+      const full = compactHistory || actionPrompt.history;
+      actionPrompt.history = {
+        actions: slimList((full.actions || []).slice(-8), CONTEXT_COMPACTION_DETAILED_ACTIONS, slimAction, "actionDetails"),
+        observations: (full.observations || []).slice(-2).map(slimObservation),
+        operations: (full.operations || []).slice(-2).map(slimOperation),
+      };
+      estimatedTokens = measure();
+    }
+    const compactedSteps = dropped.actionDetails + dropped.observationDetails + dropped.operationDetails + dropped.historyEntries;
+    this.emit("context.compacted", "degraded", {
+      taskId: task?.id || null,
+      reason: "projected-request-over-budget",
+      outcome: estimatedTokens > maxTokens ? "exhausted" : "compacted",
+      estimatedTokens,
+      estimated: true,
+      maxTokens,
+      dropped,
+      compactedSteps,
+    }, { reversible: true });
+    if (estimatedTokens > maxTokens) {
+      const error = new Error(`Context budget exhausted: a fully compacted request is still ~${estimatedTokens} estimated tokens against a ${maxTokens}-token budget.`);
+      error.code = CONTEXT_BUDGET_ERROR_CODE;
+      error.contextUsage = {
+        taskId: task?.id || null,
+        estimatedTokens,
+        maxTokens,
+        dropped,
+        // If the configured ceiling exceeded the model clamp, the enforced
+        // maxTokens is lower than requested — carry both.
+        requestedMaxTokens: contextCeiling?.requestedMaxTokens ?? null,
+        maxTokensClamped: contextCeiling?.clamped === true,
+      };
+      throw error;
+    }
+    actionPrompt.progress = {
+      ...(actionPrompt.progress || {}),
+      contextCompaction: {
+        compactedSteps,
+        sessionTurnsDropped: dropped.sessionTurns,
+        estimatedTokens,
+        estimated: true,
+        maxTokens,
+        note: `${compactedSteps} earlier steps compacted${dropped.sessionTurns ? ` and ${dropped.sessionTurns} replayed transcript turns dropped` : ""} to fit the ${maxTokens}-token context budget; older progress now lists ids and statuses only.`,
+      },
+    };
+    return { actionPrompt, dropped, estimatedTokens, maxTokens };
+  }
+
   async infer(task, plan, history) {
     if (!this.inferAction) return null;
+    this._scoredDecision = null;
     const asModelResult = (value) => {
       if (typeof value === "string") return { content: value, channels: [], rawOutputRef: null };
       if (value && typeof value === "object" && typeof value.content === "string") {
         return {
           content: value.content,
+          // Kept for the split-channel salvage in parseModelResult: the forced
+          // `{"command":` prefix occasionally lands alone in content with the
+          // JSON tail in reasoning — one bounded rejoin attempt, never merge-
+          // by-default (a reasoning tail that does not re-parse is ignored).
+          reasoning: typeof value.reasoning === "string" ? value.reasoning : "",
           channels: Array.isArray(value.channels) ? value.channels : [],
           rawOutputRef: value.rawOutputRef || null,
+          // Lane provenance: the non-maple structured-action transport tags
+          // its result with the provider that produced it; Maple's transport
+          // leaves it unset. Propagated so a fallback-lane action can never
+          // be receipted as Maple output.
+          provider: typeof value.provider === "string" && value.provider ? value.provider : null,
         };
       }
       return { content: "", channels: [], rawOutputRef: null };
@@ -478,6 +968,12 @@ class AgentOrchestrator {
       for (const key of ["schema", "status", "id", "artifactId", "taskId", "workspaceId", "revision", "digest", "session", "sessionId", "claimBoundary", "summary", "root", "dirty", "exitCode", "error"]) {
         if (Object.prototype.hasOwnProperty.call(value, key)) summary[key] = value[key];
       }
+      // The model must see WHY verification/repair failed — issues and the
+      // nested verification verdict are diagnostic payload, not noise.
+      if (Array.isArray(value.issues)) summary.issues = value.issues.slice(0, 16).map((item) => typeof item === "string" ? item : { code: item?.code, message: item?.message });
+      if (value.verification && typeof value.verification === "object") {
+        summary.verification = { status: value.verification.status, issues: Array.isArray(value.verification.issues) ? value.verification.issues.slice(0, 12).map((item) => typeof item === "string" ? item : { code: item?.code, message: item?.message }) : [] };
+      }
       if (Array.isArray(value.evidenceRefs)) summary.evidenceRefs = value.evidenceRefs.slice(0, 12);
       if (Array.isArray(value.files)) summary.fileCount = value.files.length;
       if (Array.isArray(value.revisions)) summary.revisionCount = value.revisions.length;
@@ -486,32 +982,12 @@ class AgentOrchestrator {
       return summary;
     };
     const compactHistory = {
-      actions: history.actions.slice(-8).map(({ id, step, kind, commandId, status, shortRationale, observationId }) => ({ id, step, kind, commandId, status, shortRationale, observationId })),
-      observations: history.observations.slice(-8).map((observation) => ({ id: observation.id, operationId: observation.operationId, status: observation.status, summary: observation.summary, outputDigest: observation.outputDigest, evidenceRefs: (observation.evidenceRefs || []).slice(0, 12), structuredOutput: summarizeOutput(observation.structuredOutput) })),
-      operations: history.operations.slice(-8).map(({ id, command, status, evidenceRefs, error }) => ({ id, command, status, evidenceRefs: (evidenceRefs || []).slice(0, 12), error })),
+      actions: history.actions.slice(-16).map(({ id, step, kind, commandId, status, shortRationale, observationId }) => ({ id, step, kind, commandId, status, shortRationale, observationId })),
+      observations: history.observations.slice(-16).map((observation) => ({ id: observation.id, operationId: observation.operationId, status: observation.status, summary: observation.summary, outputDigest: observation.outputDigest, evidenceRefs: (observation.evidenceRefs || []).slice(0, 12), structuredOutput: summarizeOutput(observation.structuredOutput) })),
+      operations: history.operations.slice(-16).map(({ id, command, status, evidenceRefs, error }) => ({ id, command, status, evidenceRefs: (evidenceRefs || []).slice(0, 12), error })),
     };
     const nextPlannedStep = plan.steps[history.actions.length] || null;
     const allowedCommands = this.allowedNextCommands(task, plan, history);
-    // INPUT CONTRACTS stays registry-derived (not allowedCommands-derived) so
-    // the system prompt remains byte-static across steps and the Maple prompt
-    // cache still holds — it is a superset of whatever is currently allowed.
-    // Priority order is fixed (failure-prone commands first): registry order
-    // would push artifact.author/code.apply/experiment.run past the cap.
-    const INPUT_CONTRACT_PRIORITY = [
-      "artifact.author", "artifact.update", "artifact.create", "code.apply",
-      "experiment.run", "experiment.note", "improve.propose", "verify",
-      "file.read", "file.search", "context.search", "context.query",
-      "artifact.preview.open", "repo.inspect", "repo-map", "remember",
-    ];
-    const hintEntries = Object.entries(this.commandRegistry)
-      .map(([commandId, descriptor]) => [commandId, String(descriptor?.inputHint || "").trim()])
-      .filter(([, hint]) => hint);
-    const inputContracts = [
-      ...INPUT_CONTRACT_PRIORITY
-        .map((commandId) => hintEntries.find(([id]) => id === commandId))
-        .filter(Boolean),
-      ...hintEntries.filter(([commandId]) => !INPUT_CONTRACT_PRIORITY.includes(commandId)),
-    ].slice(0, 16);
     // T12 next-action clarity: Maple's failed-session reasoning showed genuine
     // confusion about what had already finished ("plan.approve is running but
     // not yet completed... suggests the plan has been approved"). Make the
@@ -519,34 +995,69 @@ class AgentOrchestrator {
     const completedIds = completedTaskCommands(history);
     const totalSteps = plan.steps.filter((step) => step?.commandId).length;
     const doneSteps = plan.steps.filter((step) => step?.commandId && completedIds.has(step.commandId)).length;
+    // Continuous KV session: replay prior steps verbatim as chat turns so the
+    // rendered prompt is a strict token-prefix extension of the server's
+    // committed cache entry — each step prefills only the trailing delta.
+    // Turns are recorded verbatim from each transport's requestContent, so
+    // the transcript is exactly what was sent; a replay that fails to match
+    // the committed key degrades to a normal (partial) cache hit, never a
+    // wrong result.
+    const sessionKey = task?.id ? String(task.id) : null;
+    const sessionDisabled = !sessionKey || process.env.HEMLOCK_NO_PREFIX_CACHE === "1";
+    const sessionTurns = sessionDisabled ? [] : [...(this._sessionTurns.get(sessionKey) || [])];
+    if (sessionTurns.length > SESSION_MAX_TURNS || sessionTurns.reduce((n, turn) => n + String(turn?.content || "").length, 0) > SESSION_MAX_CHARS) sessionTurns.length = 0;
+    // Older history already lives in the transcript turns; once a session is
+    // established the delta turn only needs the freshest entries.
+    const requestHistory = sessionTurns.length
+      ? {
+          actions: compactHistory.actions.slice(-1),
+          observations: compactHistory.observations.slice(-1),
+          operations: compactHistory.operations.slice(-1),
+        }
+      : compactHistory;
+    const sessionNext = [...sessionTurns];
+    let sessionBroken = false;
+    const persistSession = () => {
+      if (sessionDisabled) return;
+      const chars = sessionNext.reduce((n, turn) => n + String(turn?.content || "").length, 0);
+      if (sessionBroken || sessionNext.length > SESSION_MAX_TURNS || chars > SESSION_MAX_CHARS) this._sessionTurns.delete(sessionKey);
+      else this._sessionTurns.set(sessionKey, sessionNext);
+      if (this._sessionTurns.size > 16) this._sessionTurns.clear();
+    };
+    const noteCacheMiss = (result) => {
+      // An established session that suddenly gets zero cached tokens means the
+      // server's committed key was evicted (restart, LRU pressure, adapter
+      // swap). Rebase next step instead of paying growing dead transcript.
+      if (sessionTurns.length && result && typeof result === "object" && result.cachedTokens === 0) sessionBroken = true;
+    };
+    const recordGenerativeTurn = (result) => {
+      if (!result || typeof result !== "object") return;
+      if (typeof result.requestContent === "string") sessionNext.push({ role: "user", content: result.requestContent });
+      const content = typeof result.content === "string" ? result.content : "";
+      if (!content) { persistSession(); return; }
+      const reasoning = typeof result.reasoning === "string" ? result.reasoning.trim() : "";
+      // The generation prompt ends with the template's forced `<think>\n`
+      // opener, so a reasoning-free emission replays as literal content
+      // beginning with `<think>` — matching what the server committed.
+      sessionNext.push(reasoning
+        ? { role: "assistant", content, reasoning_content: reasoning }
+        : { role: "assistant", content: `<think>\n${content}` });
+      persistSession();
+    };
     // T13 compact-choice contract: the system prompt is fully static so the
     // Maple prompt cache holds across steps (cacheHitRatio telemetry records
     // the win), and the model only emits the fields it actually decides — the
     // host assigns id/taskId/step/approval/status/expectedEvidence anyway, so
     // asking for them was pure hallucination surface. Volatile progress moved
     // into the request body.
-    const actionPrompt = {
-      system: [
-        "You are Maple-Preview operating inside Hemlock.",
-        "Return exactly one compact JSON choice in the content channel — no prose, no markdown, nothing else:",
-        '{"kind":"tool","commandId":"<one allowedNextCommands entry>","input":{},"shortRationale":"one-line reason"}',
-        "kind may instead be answer, ask_user, or blocked: terminal choices with no commandId.",
-        "The host assigns id, taskId, step, approval, expectedEvidence, and status. Never emit them.",
-        "The approved plan is a user-approved capability boundary and a starting direction, not a rigid script. Choose the next best command from request.allowedNextCommands when more inspection, verification, or artifact work is useful; the host validates and records the adaptation.",
-        "request.progress.completedCommands are finished — never re-propose them; a re-proposal is redirected to the plan.",
-        ...(inputContracts.length ? [
-          "INPUT CONTRACTS (commandId → input shape):",
-          ...inputContracts.map(([commandId, hint]) => `${commandId} → ${hint}`),
-          "Prefer a tool call over answer when evidence is missing; keep input minimal but complete — free text goes in the named field, not nested objects.",
-        ] : []),
-        "Never put HTML, source code, or a large payload in artifact.create. Use the later artifact.author step for complete source.",
-        "If evidence is insufficient, return kind ask_user or blocked. Do not claim completion without a host observation or receipt.",
-      ].join("\n"),
+    let actionPrompt = {
+      system: buildActionSystemPrompt(this.commandRegistry),
       task,
       plan,
       nextPlannedStep,
       allowedNextCommands: allowedCommands,
-      history: compactHistory,
+      history: requestHistory,
+      sessionTurns,
       progress: {
         plannedCommand: nextPlannedStep?.commandId || null,
         completedCommands: [...completedIds],
@@ -556,6 +1067,86 @@ class AgentOrchestrator {
         // experiments build on prior findings instead of repeating blindly.
         worldFindings: (() => { try { return this.worldContext?.() || null; } catch { return null; } })(),
       },
+    };
+    // Context budget guard: project the request BEFORE spending the call.
+    // The estimate is the chars/4 heuristic and only ever surfaces as
+    // estimatedTokens; the authoritative count is written back from server
+    // usage after each transport returns. Over budget → compact the volatile
+    // region (context.compacted receipts every pass); still over →
+    // CONTEXT_BUDGET_EXHAUSTED, which proposeNextAction turns into an honest
+    // context-exhausted block instead of a crash or a silent degrade.
+    const contextCeiling = resolveContextMaxTokens(task);
+    const contextMaxTokens = contextCeiling.maxTokens;
+    if (contextCeiling.clamped) {
+      // Durable note for the spine — once per task per clamped pair.
+      const clampKey = `${task?.id || "task"}:${contextCeiling.requestedMaxTokens}->${contextCeiling.maxTokens}`;
+      this._contextClampNotified = this._contextClampNotified || new Set();
+      if (!this._contextClampNotified.has(clampKey)) {
+        this._contextClampNotified.add(clampKey);
+        this.emit("context.ceiling.clamped", "degraded", {
+          taskId: task?.id || null,
+          requestedMaxTokens: contextCeiling.requestedMaxTokens,
+          maxTokens: contextCeiling.maxTokens,
+          modelMaxTokens: contextCeiling.modelMaxTokens,
+          generationHeadroom: CONTEXT_GENERATION_HEADROOM_TOKENS,
+          kvBits: contextCeiling.kvBits,
+          note: "Configured contextMaxTokens exceeds the model ceiling minus generation headroom; the clamped value is enforced.",
+        }, { reversible: true });
+      }
+    }
+    let promptEstimate = estimateActionPromptTokens(actionPrompt);
+    if (Number.isFinite(promptEstimate) && promptEstimate > contextMaxTokens) {
+      const compacted = this.compactActionContext(task, actionPrompt, sessionNext, compactHistory, contextMaxTokens, contextCeiling);
+      actionPrompt = compacted.actionPrompt;
+      promptEstimate = compacted.estimatedTokens;
+    }
+    // Real token accounting: usage flows back on every transport result and
+    // lands on the task — per-step prompt/completion tokens accumulate into
+    // metrics, and the rolling contextUsed estimate (last step's
+    // prompt+completion ≈ the committed context) lives on task.contextUsage.
+    const recordContextUsage = (result, mode) => {
+      if (!result || typeof result !== "object") return;
+      const usage = result.usage && typeof result.usage === "object" ? result.usage : result;
+      const pick = (...keys) => {
+        for (const key of keys) {
+          const value = Number(usage?.[key]);
+          if (Number.isFinite(value)) return value;
+        }
+        return null;
+      };
+      const promptTokens = pick("promptTokens", "prompt_tokens");
+      const completionTokens = pick("completionTokens", "completion_tokens");
+      const cachedTokens = pick("cachedTokens", "cached_tokens")
+        ?? (Number.isFinite(Number(usage?.prompt_tokens_details?.cached_tokens)) ? Number(usage.prompt_tokens_details.cached_tokens) : null);
+      if (promptTokens == null && cachedTokens == null) return;
+      const current = this.task() || {};
+      const previous = current.contextUsage && typeof current.contextUsage === "object" ? current.contextUsage : {};
+      const contextUsage = {
+        taskId: task?.id || null,
+        // Last step's prompt+completion ≈ committed context.
+        usedTokens: promptTokens != null ? promptTokens + (completionTokens || 0) : previous.usedTokens ?? null,
+        promptTokens: promptTokens ?? previous.promptTokens ?? null,
+        completionTokens: completionTokens ?? previous.completionTokens ?? null,
+        cachedTokens: cachedTokens ?? previous.cachedTokens ?? null,
+        estimatedTokens: Number.isFinite(promptEstimate) ? promptEstimate : null,
+        maxTokens: contextMaxTokens,
+        // Honest clamp note: when the configured ceiling exceeded the model
+        // clamp, requestedMaxTokens keeps the configured value — the lower
+        // enforced ceiling is never silent.
+        requestedMaxTokens: contextCeiling.requestedMaxTokens,
+        maxTokensClamped: contextCeiling.clamped === true,
+        kvBits: contextCeiling.kvBits,
+        source: "server-usage",
+        mode,
+        samples: Number(previous.samples || 0) + 1,
+        updatedAt: new Date().toISOString(),
+      };
+      const metrics = { ...(current.metrics || {}) };
+      if (promptTokens != null) metrics.promptTokens = Number(metrics.promptTokens || 0) + promptTokens;
+      if (completionTokens != null) metrics.completionTokens = Number(metrics.completionTokens || 0) + completionTokens;
+      if (cachedTokens != null) metrics.cachedTokens = Number(metrics.cachedTokens || 0) + cachedTokens;
+      if (contextUsage.usedTokens != null) metrics.contextPeakTokens = Math.max(Number(metrics.contextPeakTokens || 0), contextUsage.usedTokens);
+      this.updateTask({ contextUsage, metrics });
     };
     // Scored-choice fast path (parallel constrained decoding): enumerate the
     // closed command set as minimal candidate continuations and let the model
@@ -567,30 +1158,166 @@ class AgentOrchestrator {
     let response = null;
     if (this.scoreActions) {
       try {
-        const candidates = buildScoreCandidates(allowedCommands.map((entry) => entry.commandId));
+        const candidates = this.buildCandidates(rankScoringCommands(allowedCommands, history).map((entry) => entry.commandId), { maxCandidates: 24 });
         const startedAt = Date.now();
-        const scored = await this.scoreActions(actionPrompt, candidates.map((candidate) => candidate.text));
-        const decision = pickScoredCandidate(candidates, scored);
-        if (decision) {
+        // Prefer one batched /v1/decide choice over per-candidate /v1/score
+        // continuations. A missing endpoint (null), an unusable answer, or a
+        // transport failure falls back to the score path rather than skipping
+        // the fast path entirely.
+        let decision = null;
+        let decisionMode = null;
+        let scored = null;
+        let skippedReason = null;
+        if (candidates.length <= 1) {
+          // Single-candidate fast path: with at most one continuation there is
+          // nothing to rank, so /v1/decide and /v1/score would burn a full
+          // inference to "choose" it. Take the candidate directly.
+          decisionMode = "single-candidate";
+          skippedReason = candidates.length === 1 ? "single-candidate" : "no-candidates";
+          const winner = candidates[0] || null;
+          if (winner) decision = { winner, margin: null, runnerUp: null, candidateCount: candidates.length, probability: null, confidence: null, promptTokens: null, cachedTokens: null };
+        } else if (typeof this.scoreActions.decide === "function") {
+          try {
+            const decided = await this.scoreActions.decide(actionPrompt, candidates);
+            if (decided) {
+              noteCacheMiss(decided);
+              recordContextUsage(decided, "decide");
+              const picked = pickDecidedCandidate(candidates, decided);
+              if (picked) { decision = picked; decisionMode = "decide"; scored = decided; }
+            }
+          } catch (decideError) {
+            this.emit("action.scored", "degraded", { taskId: task.id, mode: "decide", error: decideError.message }, { reversible: true });
+          }
+        }
+        if (!decision && candidates.length > 1 && typeof this.scoreActions.score === "function") {
+          const scoreResult = await this.scoreActions.score(actionPrompt, candidates.map((candidate) => candidate.text));
+          noteCacheMiss(scoreResult);
+          recordContextUsage(scoreResult, "score");
+          const picked = pickScoredCandidate(candidates, scoreResult);
+          if (picked) { decision = picked; decisionMode = "score"; scored = scoreResult; }
+        }
+        if (skippedReason && !decision) {
           this.emit("action.scored", "passed", {
             taskId: task.id,
+            mode: decisionMode,
+            skipped: true,
+            reason: skippedReason,
+            winner: null,
+            candidateCount: candidates.length,
+            elapsedMs: Date.now() - startedAt,
+          }, { reversible: true });
+        }
+        if (decision) {
+          // Only join the transcript on a decision: otherwise the scored
+          // request is an orphan turn that would diverge the replay from the
+          // infer request's committed cache key.
+          if (typeof scored?.requestContent === "string") sessionNext.push({ role: "user", content: scored.requestContent });
+          const confidence = Number(decision.confidence);
+          // A low-confidence decide winner means the model was genuinely
+          // split — record the decision but let the generative path resolve
+          // it rather than committing a zero-token action on a coin flip.
+          // Confidence alone was not enough in production (a ~0.9 winner once
+          // argued for `blocked` while planned work remained), so the winner
+          // must also clear a minimum top1-top2 probability margin when the
+          // decide payload carries a real probability map.
+          const margin = Number(decision.margin);
+          const indecisive = decisionMode === "decide" && !(
+            confidence >= DECIDE_MIN_CONFIDENCE
+            && (!Number.isFinite(margin) || margin >= DECIDE_MIN_MARGIN)
+          );
+          // Stash the winner for the divergence receipt in
+          // proposeNextAction: decide picks are advisory — the host still
+          // executes the planned/selected step, and executed ≠ decided must
+          // be durable, not silent.
+          this._scoredDecision = {
+            taskId: task.id,
+            mode: decisionMode,
+            winner: { kind: decision.winner.kind, commandId: decision.winner.commandId ?? null },
+            probability: decision.probability ?? null,
+            confidence: Number.isFinite(confidence) ? confidence : null,
+            margin: decision.margin ?? null,
+          };
+          // Per-option scores ride the receipt so offline evaluation can
+          // re-run winner selection under permuted option order (the kev
+          // permutation-invariance check) instead of trusting the recorded
+          // winner blindly.
+          const scoredOptions = (() => {
+            if (decisionMode === "decide") {
+              const answer = Object.values(scored?.answers || {}).find((item) => item?.type === "choice");
+              const probabilities = answer?.probabilities && typeof answer.probabilities === "object" ? answer.probabilities : {};
+              return candidates.map((candidate, index) => ({ kind: candidate.kind, commandId: candidate.commandId ?? null, probability: Number.isFinite(Number(probabilities[`cand-${index}`])) ? Number(probabilities[`cand-${index}`]) : null }));
+            }
+            if (decisionMode === "score") {
+              const byIndex = new Map((Array.isArray(scored?.candidates) ? scored.candidates : []).map((entry) => [entry?.index, entry?.avgLogprob]));
+              return candidates.map((candidate, index) => ({ kind: candidate.kind, commandId: candidate.commandId ?? null, avgLogprob: Number.isFinite(byIndex.get(index)) ? Number(byIndex.get(index)) : null }));
+            }
+            return candidates.map((candidate) => ({ kind: candidate.kind, commandId: candidate.commandId ?? null }));
+          })();
+          this.emit("action.scored", "passed", {
+            taskId: task.id,
+            mode: decisionMode,
+            ...(skippedReason ? { skipped: true, reason: skippedReason } : {}),
             winner: { kind: decision.winner.kind, commandId: decision.winner.commandId },
+            options: scoredOptions,
             complete: decision.winner.complete,
-            avgLogprob: decision.winner.avgLogprob,
+            avgLogprob: decision.winner.avgLogprob ?? null,
+            probability: decision.probability ?? null,
+            confidence: Number.isFinite(confidence) ? confidence : null,
             margin: decision.margin,
+            indecisive,
             runnerUp: decision.runnerUp,
             candidateCount: decision.candidateCount,
             cachedTokens: decision.cachedTokens,
             elapsedMs: Date.now() - startedAt,
           }, { reversible: true });
-          if (decision.winner.complete) {
+          // The server committed prompt+suffix+winner+eos (or at least
+          // prompt+suffix); replaying the winner as an assistant turn with the
+          // fixed reasoning prefix renders a strict token-prefix extension.
+          // A skipped single-candidate pick never hit the server, so nothing
+          // was committed — replaying a fabricated turn would only diverge the
+          // transcript from the committed cache key without benefit.
+          const scoredTurn = { role: "assistant", content: scored?.committedText || decision.winner.text, reasoning_content: SCORED_REASONING_PREFIX };
+          const replayScoredTurn = decisionMode !== "single-candidate";
+          if (decision.winner.complete && !indecisive) {
+            if (replayScoredTurn) sessionNext.push(scoredTurn);
+            persistSession();
             response = { content: decision.winner.text, channels: [], rawOutputRef: null };
           } else {
             actionPrompt.progress.scoredDecision = {
               kind: decision.winner.kind,
               commandId: decision.winner.commandId,
               margin: decision.margin,
+              advisory: true,
+              ...(decisionMode === "decide" ? { probability: decision.probability ?? null, confidence: Number.isFinite(confidence) ? confidence : null, indecisive } : {}),
             };
+            // Prefix winner (or an indecisive decide): the generative fill-in
+            // re-enters the session one turn later — replay the scored turn,
+            // then ask for the rest. The fill-in must name the ACTUAL action
+            // being executed — the host-selected planned step — never the
+            // ignored decide winner. Telling the model to "continue the
+            // scored command choice" made it parrot the winner's text
+            // ("Blocked due to insufficient evidence") into the executed
+            // envelope and once emit {"kind":"blocked"} outright, killing a
+            // receipt-backed task in one step.
+            const executingAction = nextPlannedStep?.commandId
+              ? { commandId: nextPlannedStep.commandId, label: nextPlannedStep.label || null, input: nextPlannedStep.input && typeof nextPlannedStep.input === "object" && !Array.isArray(nextPlannedStep.input) ? nextPlannedStep.input : {} }
+              : null;
+            const winnerMatchesExecution = Boolean(executingAction) && decision.winner.kind === "tool" && decision.winner.commandId === executingAction.commandId;
+            sessionNext.push(scoredTurn);
+            actionPrompt = {
+              ...actionPrompt,
+              sessionTurns: [...sessionNext],
+              sessionUserContent: JSON.stringify({
+                scoredDecision: actionPrompt.progress.scoredDecision,
+                executingAction,
+                instruction: winnerMatchesExecution
+                  ? `Emit the complete compact JSON action continuing the scored ${executingAction.commandId} choice — fill in its required input fields.`
+                  : executingAction
+                    ? `The scored choice was advisory only and is not what runs. The host is executing the approved plan step ${executingAction.commandId}; emit the complete compact JSON action for ${executingAction.commandId} with its required input. Never restate or quote the scored choice.`
+                    : "Emit the complete compact JSON action for the next step. The scored choice was advisory only; never restate or quote it.",
+              }),
+            };
+            persistSession();
           }
         }
       } catch (scoreError) {
@@ -601,24 +1328,90 @@ class AgentOrchestrator {
       }
     }
     try {
-      if (!response) response = await this.inferAction(actionPrompt);
+      if (!response) {
+        response = await this.inferProposal(actionPrompt);
+        noteCacheMiss(response);
+        recordContextUsage(response, "generative");
+        recordGenerativeTurn(response);
+      }
     } catch (firstInferenceError) {
-      this.emit("action.inference.failed", "degraded", {
-        error: firstInferenceError.message,
-        rawModelOutputRef: firstInferenceError.rawModelOutputRef || null,
-        modelChannels: firstInferenceError.modelChannels || [],
-        parseStatus: "inference-failed",
-        repairAttempt: true,
-      }, { reversible: true });
-      try {
-        response = await this.inferAction({ ...actionPrompt, repair: `Maple did not return a usable action. Return exactly one compact JSON choice {"kind","commandId","input","shortRationale"} for an allowedNextCommands entry. Any model-emitted channels remain recorded separately. The prior error was: ${firstInferenceError.message}` });
-      } catch (secondInferenceError) {
-        const error = new Error(`Maple failed to return a structured action after one repair: ${secondInferenceError.message}`);
+      // Lane fallback (bounded, receipted): a transport-class Maple death may
+      // retry the step ONCE on the task's configured fallback lane before the
+      // in-lane repair loop burns its attempts on a dead transport. The CLI
+      // lane runs the same runCliInference path any non-maple selection uses,
+      // so provider availability (executable resolution) and capacity (the
+      // lane's provider lease) are enforced there — an unreachable lane fails
+      // the attempt and the task blocks naming BOTH failures.
+      const originalProvider = String(task.provider || "maple").toLowerCase();
+      const laneErrorKind = classifyInferenceError(firstInferenceError).kind;
+      const lane = originalProvider === "maple" ? fallbackLaneForTask(task) : null;
+      if (lane && LANE_FALLBACK_ERROR_KINDS.has(laneErrorKind)) {
+        // Receipted BEFORE the attempt — the lane switch is a reversible
+        // host decision, and downstream records (action.provider,
+        // observation.provider, the CLI lane's own stream record) keep the
+        // provenance honest instead of claiming Maple produced the output.
+        this.emit("action.lane.fallback", "degraded", {
+          taskId: task.id,
+          originalProvider: "maple",
+          fallbackProvider: lane,
+          errorClass: laneErrorKind,
+        }, { reversible: true });
+        try {
+          response = await this.inferProposal({ ...actionPrompt, fallbackProvider: lane });
+          recordContextUsage(response, "fallback-generative");
+          // The external lane's output was never committed to Maple's KV
+          // session — replaying it as a Maple turn would diverge the
+          // committed prefix. Rebase the session instead of recording a
+          // generative turn.
+          sessionBroken = true;
+          persistSession();
+        } catch (fallbackError) {
+          const error = new Error(`Maple structured-action inference failed (${laneErrorKind}: ${firstInferenceError.message}) and the configured fallback lane ${lane} also failed: ${fallbackError.message}`);
+          error.code = "LANE_FALLBACK_EXHAUSTED";
+          error.rawModelOutputRef = fallbackError.rawModelOutputRef || firstInferenceError.rawModelOutputRef || null;
+          error.modelChannels = fallbackError.modelChannels || firstInferenceError.modelChannels || [];
+          throw error;
+        }
+      }
+      // Bounded repair loop: a local model on slow hardware produces transient
+      // transport/format failures often enough that a single corrective pass
+      // dead-ends otherwise-recoverable tasks. Two repairs stay bounded while
+      // giving the retry prompt a real chance.
+      let lastInferenceError = firstInferenceError;
+      for (let repairAttempt = 1; repairAttempt <= MAX_ACTION_REPAIR_ATTEMPTS && !response; repairAttempt += 1) {
+        this.emit("action.inference.failed", "degraded", {
+          error: lastInferenceError.message,
+          rawModelOutputRef: lastInferenceError.rawModelOutputRef || null,
+          modelChannels: lastInferenceError.modelChannels || [],
+          parseStatus: "inference-failed",
+          repairAttempt,
+        }, { reversible: true });
+        try {
+          response = await this.inferProposal({ ...actionPrompt, sessionUserContent: null, repair: `Maple did not return a usable action. Return exactly one compact JSON choice {"kind","commandId","input","shortRationale"} for an allowedNextCommands entry. Any model-emitted channels remain recorded separately. The prior error was: ${lastInferenceError.message}` });
+          noteCacheMiss(response);
+          recordContextUsage(response, "generative-repair");
+          recordGenerativeTurn(response);
+        } catch (repairInferenceError) {
+          lastInferenceError = repairInferenceError;
+        }
+      }
+      if (!response) {
+        const error = new Error(`Maple failed to return a structured action after ${MAX_ACTION_REPAIR_ATTEMPTS} repairs: ${lastInferenceError.message}`);
         error.code = "INVALID_ACTION_OUTPUT";
-        error.rawModelOutputRef = secondInferenceError.rawModelOutputRef || firstInferenceError.rawModelOutputRef || null;
-        error.modelChannels = secondInferenceError.modelChannels || firstInferenceError.modelChannels || [];
+        error.rawModelOutputRef = lastInferenceError.rawModelOutputRef || firstInferenceError.rawModelOutputRef || null;
+        error.modelChannels = lastInferenceError.modelChannels || firstInferenceError.modelChannels || [];
         throw error;
       }
+    }
+    // Mid-loop steering rides the prompt as compactTask.steering (pending
+    // items only). A secured response means the model saw it — mark those
+    // items delivered exactly once so stale steering does not ride every
+    // later step's prompt forever.
+    const pendingSteering = (this.task()?.steering || []).filter((item) => item && item.status !== "delivered");
+    if (pendingSteering.length) {
+      const deliveredAt = new Date().toISOString();
+      this.updateTask({ steering: (this.task().steering || []).map((item) => item && item.status !== "delivered" ? { ...item, status: "delivered", deliveredAt } : item) });
+      this.emit("task.steering.delivered", "observed", { taskId: task.id, count: pendingSteering.length, steeringIds: pendingSteering.map((item) => item.id).filter(Boolean) }, { reversible: true });
     }
     const selectionForAction = (action) => {
       const requestedKind = String(action?.kind || "tool");
@@ -676,6 +1469,14 @@ class AgentOrchestrator {
       }
       const selectedStep = selection.step;
       const requestedCommandId = String(action?.commandId || "").trim() || "none";
+      // A compact choice cannot express nested required args — when the
+      // envelope arrives with {} and the executed plan step carries an
+      // approved input, the step input fills it (re-bounded per command)
+      // instead of failing deterministic-input validation.
+      const boundedInput = boundedActionInput(selection.commandId, action);
+      const stepInput = selectedStep?.input && typeof selectedStep.input === "object" && !Array.isArray(selectedStep.input) && Object.keys(selectedStep.input).length
+        ? selectedStep.input
+        : null;
       return validateAction({
         ...modelFields,
         id: actionId,
@@ -683,7 +1484,7 @@ class AgentOrchestrator {
         step: history.actions.length + 1,
         kind: selectedStep.kind || "tool",
         commandId: selection.commandId,
-        input: boundedActionInput(selection.commandId, action),
+        input: Object.keys(boundedInput).length || !stepInput ? boundedInput : boundedActionInput(selection.commandId, { input: stepInput }),
         expectedEvidence: expectedEvidenceForCommand(selection.commandId, selectedStep.expectedEvidence),
         approval: selectedStep.approval || "none",
         status: "proposed",
@@ -691,6 +1492,42 @@ class AgentOrchestrator {
         rawModelOutputRef: modelResult.rawOutputRef || null,
         modelChannels: Array.isArray(modelResult.channels) ? modelResult.channels : [],
         parseStatus: recoveredTruncated ? "recovered-truncated" : coercedPayload ? "coerced-payload" : compactChoice ? "compact-choice" : "valid",
+      }, this.commandRegistry);
+    };
+    // A batch envelope is all-or-nothing at selection time: every item's
+    // command must be inside the current capability boundary — silently
+    // substituting one item would change what the batch means. Items are
+    // persisted as individual durable actions at execution time.
+    const normalizeBatchEnvelope = (payload, modelResult = {}) => {
+      const batch = parseBatchActions(payload, this.commandRegistry);
+      if (batch.kind !== "batch") {
+        // One-item envelope → the same host-selection path as any tool choice.
+        return normalizeHostFields({ kind: "tool", commandId: batch.commandId, input: batch.input, shortRationale: batch.shortRationale, expectedEvidence: batch.expectedEvidence, __compactChoice: true }, modelResult);
+      }
+      const allowedIds = new Set(allowedCommands.map((entry) => entry.commandId));
+      batch.actions.forEach((item, index) => {
+        if (!allowedIds.has(item.commandId)) {
+          const error = new Error(`Batch action ${index + 1} command is outside the approved capability boundary: ${item.commandId}`);
+          error.code = "ACTION_COMMAND_NOT_ALLOWED";
+          throw error;
+        }
+      });
+      return validateAction({
+        schema: ACTION_SCHEMA,
+        id: `action-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+        taskId: task.id,
+        step: history.actions.length + 1,
+        kind: "batch",
+        commandId: null,
+        input: {},
+        actions: batch.actions,
+        shortRationale: batch.shortRationale,
+        expectedEvidence: batch.expectedEvidence,
+        approval: "none",
+        status: "proposed",
+        rawModelOutputRef: modelResult.rawOutputRef || null,
+        modelChannels: Array.isArray(modelResult.channels) ? modelResult.channels : [],
+        parseStatus: "batch",
       }, this.commandRegistry);
     };
     const parseModelResult = (value) => {
@@ -702,10 +1539,14 @@ class AgentOrchestrator {
         error.modelChannels = modelResult.channels || [];
         throw error;
       }
-      try {
-        const parsed = normalizeCompactChoice(extractActionEnvelope(modelResult.content));
+      const parseContent = (content) => {
+        const extracted = extractActionEnvelope(content);
+        if (extracted && Array.isArray(extracted.actions)) {
+          return normalizeBatchEnvelope(extracted, modelResult);
+        }
+        const parsed = normalizeCompactChoice(extracted);
         try {
-          return { modelResult, action: normalizeHostFields(parsed, modelResult) };
+          return normalizeHostFields(parsed, modelResult);
         } catch (validationError) {
           const selection = selectionForAction(parsed);
           const coerced = coerceActionPayload(parsed, {
@@ -717,42 +1558,85 @@ class AgentOrchestrator {
             approval: selection.step?.approval || "none",
           });
           if (!coerced) throw validationError;
-          return { modelResult, action: normalizeHostFields(coerced, modelResult) };
+          return normalizeHostFields(coerced, modelResult);
         }
+      };
+      try {
+        return { modelResult, action: parseContent(modelResult.content) };
       } catch (error) {
+        // Observed Maple failure mode: the forced-prefix JSON arrives split
+        // across channels — `{"command":` in content, the object tail in
+        // reasoning. Rejoin once before spending a repair inference; the
+        // salvage only runs on an otherwise-failed parse and still goes
+        // through the full normalize+validate path, so prose cannot slip in.
+        const reasoningTail = String(modelResult.reasoning || "").trim();
+        if (reasoningTail && /[}\]]\s*$/.test(reasoningTail)) {
+          try {
+            const action = { ...parseContent(`${modelResult.content.trimEnd()}${reasoningTail}`), parseStatus: "channel-rejoined" };
+            this.emit("action.channel.rejoined", "degraded", {
+              taskId: task.id,
+              commandId: action?.commandId || null,
+              reasoningChars: reasoningTail.length,
+            }, { reversible: true });
+            return { modelResult, action };
+          } catch {
+            // The tail was genuine reasoning, not a split envelope — the
+            // original error below stands.
+          }
+        }
         error.rawModelOutputRef ||= modelResult.rawOutputRef || null;
         error.modelChannels ||= modelResult.channels || [];
         throw error;
       }
     };
+    // Lane-honest receipts: a result produced by a provider other than the
+    // task's own lane means a lane fallback ran — the durable action records
+    // which provider did the work and which lane it fell back FROM, so no
+    // receipt ever claims Maple produced fallback-lane output.
+    const receiptForLane = (parsed) => {
+      const provider = parsed?.modelResult?.provider;
+      if (!provider || provider === "maple") return parsed.action;
+      const taskProvider = String(task.provider || "maple").toLowerCase();
+      return { ...parsed.action, provider, ...(provider !== taskProvider ? { fallbackFrom: taskProvider } : {}) };
+    };
     try {
-      return parseModelResult(response).action;
+      return receiptForLane(parseModelResult(response));
     } catch (firstError) {
-      this.emit("action.parse.failed", "blocked", {
-        error: firstError.message,
-        rawModelOutputRef: firstError.rawModelOutputRef || null,
-        modelChannels: firstError.modelChannels || [],
-        parseStatus: "invalid",
-        repairAttempt: true,
-      }, { reversible: true });
-      try {
-        response = await this.inferAction({ ...actionPrompt, repair: `The prior output was invalid: ${firstError.message}. Return only one compact JSON choice object; preserve any model-emitted channels in the model output record.` });
-      } catch (repairInferenceError) {
-        const error = new Error(`Maple failed during structured-action repair: ${repairInferenceError.message}`);
-        error.code = "INVALID_ACTION_OUTPUT";
-        error.rawModelOutputRef = repairInferenceError.rawModelOutputRef || firstError.rawModelOutputRef || null;
-        error.modelChannels = repairInferenceError.modelChannels || firstError.modelChannels || [];
-        throw error;
+      // Bounded re-inference loop: invalid envelopes are re-asked up to
+      // MAX_ACTION_REPAIR_ATTEMPTS times; an inference-level failure during a
+      // repair stays terminal (transport retries already happened lower down).
+      let lastError = firstError;
+      for (let repairAttempt = 1; repairAttempt <= MAX_ACTION_REPAIR_ATTEMPTS; repairAttempt += 1) {
+        this.emit("action.parse.failed", "blocked", {
+          error: lastError.message,
+          rawModelOutputRef: lastError.rawModelOutputRef || null,
+          modelChannels: lastError.modelChannels || [],
+          parseStatus: "invalid",
+          repairAttempt,
+        }, { reversible: true });
+        try {
+          response = await this.inferProposal({ ...actionPrompt, sessionUserContent: null, repair: `The prior output was invalid: ${lastError.message}. Return only one compact JSON choice object; preserve any model-emitted channels in the model output record.` });
+          noteCacheMiss(response);
+          recordContextUsage(response, "generative-repair");
+          recordGenerativeTurn(response);
+        } catch (repairInferenceError) {
+          const error = new Error(`Maple failed during structured-action repair: ${repairInferenceError.message}`);
+          error.code = "INVALID_ACTION_OUTPUT";
+          error.rawModelOutputRef = repairInferenceError.rawModelOutputRef || firstError.rawModelOutputRef || null;
+          error.modelChannels = repairInferenceError.modelChannels || firstError.modelChannels || [];
+          throw error;
+        }
+        try {
+          return receiptForLane(parseModelResult(response));
+        } catch (retryError) {
+          lastError = retryError;
+        }
       }
-      try {
-        return parseModelResult(response).action;
-      } catch (secondError) {
-        const error = new Error(`Maple produced two invalid action envelopes: ${secondError.message}`);
-        error.code = "INVALID_ACTION_OUTPUT";
-        error.rawModelOutputRef = secondError.rawModelOutputRef || firstError.rawModelOutputRef || null;
-        error.modelChannels = secondError.modelChannels || firstError.modelChannels || [];
-        throw error;
-      }
+      const error = new Error(`Maple produced ${MAX_ACTION_REPAIR_ATTEMPTS + 1} invalid action envelopes: ${lastError.message}`);
+      error.code = "INVALID_ACTION_OUTPUT";
+      error.rawModelOutputRef = lastError.rawModelOutputRef || firstError.rawModelOutputRef || null;
+      error.modelChannels = lastError.modelChannels || firstError.modelChannels || [];
+      throw error;
     }
   }
 
@@ -764,7 +1648,10 @@ class AgentOrchestrator {
     const nextIndex = history.actions.length;
     const step = plan.steps[nextIndex];
     if (!step) return createAction({ taskId: task.id, step: nextIndex + 1, kind: "complete", shortRationale: "All planned steps have verified observations.", expectedEvidence: ["receipt://task"] });
-    return createAction({ taskId: task.id, step: nextIndex + 1, kind: step.kind || "tool", commandId: step.commandId, input: {}, shortRationale: step.label, expectedEvidence: step.expectedEvidence, approval: step.approval || "none" });
+    const stepInput = step.input && typeof step.input === "object" && !Array.isArray(step.input) && Object.keys(step.input).length
+      ? boundedActionInput(step.commandId, { input: step.input })
+      : {};
+    return createAction({ taskId: task.id, step: nextIndex + 1, kind: step.kind || "tool", commandId: step.commandId, input: stepInput, shortRationale: step.label, expectedEvidence: step.expectedEvidence, approval: step.approval || "none" });
   }
 
   pauseTask(taskId = this.task()?.id) {
@@ -824,7 +1711,7 @@ class AgentOrchestrator {
         const completedIds = completedTaskCommands(history);
         const hasIncompletePlanStep = plan.steps.some((step) => step?.commandId && !completedIds.has(step.commandId));
         if (hasIncompletePlanStep) {
-          const redirect = resolveProgressCommand(action, completedIds, completedWorkKeys(history), plan.steps);
+          const redirect = resolveProgressCommand(action, completedIds, completedWorkKeys(history), plan.steps, mutationIntervened(history, action.commandId, this.commandRegistry));
           if (redirect.redirected) {
             this.emit("action.redirected", "degraded", {
               taskId,
@@ -840,30 +1727,80 @@ class AgentOrchestrator {
       }
       validateAction(action, this.commandRegistry);
     } catch (error) {
-      const nextStep = plan.steps[history.actions.length];
-      const deterministicSafeCommands = new Set(["context.refresh", "repo-map", "repo.inspect", "git.status", "git.diff", "verification.list", "verify", "code.inspect"]);
-      if ((error.code !== "INVALID_ACTION_OUTPUT" || nextStep?.commandId?.startsWith("artifact.")) && (nextStep?.commandId?.startsWith("artifact.") || deterministicSafeCommands.has(nextStep?.commandId) || !nextStep)) {
-        const mode = nextStep ? "approved-plan-step" : "evidence-backed-terminal-step";
-        this.emit("action.inference.fallback", "degraded", {
-          taskId,
-          commandId: nextStep?.commandId || "complete",
-          reason: error.message,
-          mode,
-          rawModelOutputRef: error.rawModelOutputRef || null,
-          modelChannels: error.modelChannels || [],
-          parseStatus: "fallback",
-          fallbackMode: "deterministic-action",
-        }, { reversible: true });
-        action = {
-          ...this.deterministicAction(task, plan, history),
-          rawModelOutputRef: error.rawModelOutputRef || null,
-          modelChannels: error.modelChannels || [],
-          parseStatus: "fallback",
-          fallbackMode: "deterministic-action",
-        };
-      } else {
-      return this.blockTask(taskId, error.message, { code: error.code || "ACTION_INVALID" });
+      // Lane-fallback exhaustion is terminal for the step: the original lane
+      // AND the configured fallback both failed, and the reason already names
+      // each. Deterministic plan-step recovery must not silently paper over a
+      // two-lane outage — block honestly instead.
+      if (error?.code === "LANE_FALLBACK_EXHAUSTED") {
+        return this.blockTask(taskId, error.message, { rawModelOutputRef: error.rawModelOutputRef || null });
       }
+      // Context exhaustion blocks honestly instead of degrading to the
+      // deterministic plan step: an action committed against an unbounded
+      // prompt would fail identically next step, and silent progress would
+      // hide the real constraint from the spine. The suggestion names the
+      // supported recovery — fresh thread or conversation reset/trim.
+      if (error?.code === "CONTEXT_BUDGET_EXHAUSTED") {
+        return this.blockTask(taskId, `${error.message} Suggestion: start a fresh thread or run conversation.reset / conversation.trim, then resume the plan.`, {
+          contextExhausted: true,
+          contextUsage: error.contextUsage || null,
+          suggestion: "fresh-thread-or-context-reset",
+        });
+      }
+      const nextStep = plan.steps[history.actions.length];
+      // The approved plan is the capability boundary, so a malformed or
+      // unavailable model turn never dead-ends a receipt-backed task: the host
+      // falls back to the next approved plan step (or the terminal completion
+      // step once the plan is exhausted). The degraded event keeps the model
+      // failure durable instead of silently swallowing it.
+      const mode = nextStep ? "approved-plan-step" : "evidence-backed-terminal-step";
+      this.emit("action.inference.fallback", "degraded", {
+        taskId,
+        commandId: nextStep?.commandId || "complete",
+        reason: error.message,
+        mode,
+        rawModelOutputRef: error.rawModelOutputRef || null,
+        modelChannels: error.modelChannels || [],
+        parseStatus: "fallback",
+        fallbackMode: "deterministic-action",
+      }, { reversible: true });
+      action = {
+        ...this.deterministicAction(task, plan, history),
+        rawModelOutputRef: error.rawModelOutputRef || null,
+        modelChannels: error.modelChannels || [],
+        parseStatus: "fallback",
+        fallbackMode: "deterministic-action",
+      };
+    }
+    // Decide/score winners are advisory — policy is "execute the plan, log
+    // the divergence". Whenever the executed action is not the scored winner
+    // (terminal kind ignored for a planned step, redirect, or fallback),
+    // receipt the mismatch instead of letting it pass silently.
+    const decided = this._scoredDecision;
+    this._scoredDecision = null;
+    if (decided && decided.taskId === taskId) {
+      const executedKind = action.kind === "batch" ? "tool" : action.kind;
+      const executedCommandId = action.kind === "batch" ? action.actions?.[0]?.commandId ?? null : action.commandId ?? null;
+      const decidedKind = decided.winner?.kind ?? null;
+      const decidedCommandId = decidedKind === "tool" ? decided.winner?.commandId ?? null : null;
+      if (decidedKind !== executedKind || decidedCommandId !== executedCommandId) {
+        this.emit("action.scored.divergence", "observed", {
+          taskId,
+          mode: decided.mode,
+          decidedKind,
+          decidedCommandId,
+          executedKind,
+          executedCommandId,
+          probability: decided.probability ?? null,
+          confidence: decided.confidence ?? null,
+          margin: decided.margin ?? null,
+        }, { evidenceRefs: action.expectedEvidence || [], reversible: true });
+      }
+    }
+    if (action.kind === "batch") {
+      // The container stays ephemeral: plan/history indexing assumes one
+      // durable action per step, so each batch item is created as its own
+      // action inside executeBatchActions.
+      return this.executeBatchActions(task, action, plan, budget);
     }
     this.kernel.createAction(action);
     this.updateTask({ phase: action.kind === "ask_user" ? "waiting_for_user" : "work", status: action.kind === "ask_user" ? "waiting_for_approval" : "running", foregroundStep: action.shortRationale, activeActionId: action.id, budget: { ...budget, agentStepsUsed: history.actions.length + 1 } });
@@ -912,26 +1849,27 @@ class AgentOrchestrator {
 
   async inferArtifactRepair(task, plan, history, verification, artifact, attempt) {
     if (!this.inferAction) return null;
-    const issueSummary = (verification?.issues || []).slice(0, 12).map((item) => `${item.code}: ${item.message}`).join("\n") || String(verification?.summary || "Preview verification failed.");
-    const response = await this.inferAction({
+    const issueSummary = (verification?.issues || []).slice(0, 16).map((item) => `${item.code}: ${item.message}`).join("\n") || String(verification?.summary || "Preview verification failed.");
+    const response = await this.inferProposal({
       system: [
         "You are Maple-Preview repairing a task-scoped scratch artifact inside Hemlock.",
         "Return exactly one JSON action envelope and no prose.",
         "The host owns action identity, task identity, step, commandId, approval, lifecycle, and evidence.",
         "Use commandId artifact.update. Provide either input.source as a complete relative-file source map or input.patches as bounded complete file replacements.",
         "Do not modify repository files. Do not return a diff fragment, shell command, or partial file.",
-        '{"schema":"hemlock.agent.action.v1","id":"action-unique","taskId":"current-task-id","step":1,"kind":"tool","commandId":"artifact.update","input":{"source":{"index.html":"complete file contents"},"repairFor":{"revision":1,"issues":[]}},"shortRationale":"Repair the reported preview issue.","expectedEvidence":["artifact://revision"],"approval":"none","status":"proposed"}',
+        "Echo input.repair.issues back in input.repairFor.issues verbatim — never return an empty issues list unless input.repair.issues is empty.",
+        '{"schema":"hemlock.agent.action.v1","id":"action-unique","taskId":"current-task-id","step":1,"kind":"tool","commandId":"artifact.update","input":{"source":{"index.html":"complete file contents"},"repairFor":{"revision":1,"issues":[{"code":"<issue-code>","message":"<issue message from input.repair.issues>"}]}},"shortRationale":"Repair the reported preview issue.","expectedEvidence":["artifact://revision"],"approval":"none","status":"proposed"}',
       ].join("\n"),
       task,
       plan,
       nextPlannedStep: { kind: "tool", commandId: "artifact.update", expectedEvidence: ["artifact://revision"], approval: "none" },
-      history: { actions: history.actions.slice(-6), observations: history.observations.slice(-6), operations: history.operations.slice(-6) },
+      history: { actions: history.actions.slice(-10), observations: history.observations.slice(-10), operations: history.operations.slice(-10) },
       repair: {
         schema: "hemlock.agent.artifact.repair.v1",
         attempt,
         baseRevision: Number(artifact?.revision || verification?.revision || 0),
         artifactId: artifact?.id || null,
-        issues: (verification?.issues || []).slice(0, 12),
+        issues: (verification?.issues || []).slice(0, 16),
         inspectionDigest: verification?.inspectionDigest || null,
         instruction: issueSummary,
       },
@@ -967,7 +1905,7 @@ class AgentOrchestrator {
 
   async inferCodingRepair(task, plan, history, verification, attempt) {
     if (!this.inferAction) return null;
-    const response = await this.inferAction({
+    const response = await this.inferProposal({
       system: [
         "You are Maple-Preview repairing ordinary source code inside a user-assigned Hemlock workspace.",
         "Return exactly one JSON action envelope and no prose.",
@@ -979,14 +1917,14 @@ class AgentOrchestrator {
       task,
       plan,
       nextPlannedStep: { kind: "tool", commandId: "code.apply", expectedEvidence: ["changeset://applied"], approval: "plan" },
-      history: { actions: history.actions.slice(-8), observations: history.observations.slice(-8), operations: history.operations.slice(-8) },
+      history: { actions: history.actions.slice(-12), observations: history.observations.slice(-12), operations: history.operations.slice(-12) },
       repair: {
         schema: "hemlock.agent.repair.v1",
         attempt,
-        maxAttempts: Number(task.budget?.maxCodeRepairs || 2),
+        maxAttempts: Number(task.budget?.maxCodeRepairs ?? DEFAULT_BUDGET.maxCodeRepairs),
         threadId: task.threadId || null,
         taskId: task.id,
-        issues: (verification?.issues || []).slice(0, 16),
+        issues: (verification?.issues || []).slice(0, 24),
         instruction: (verification?.issues || []).map((item) => `${item.code || "verification"}: ${item.message || item}`).join("\n") || String(verification?.summary || "Verification failed."),
       },
     });
@@ -1019,6 +1957,52 @@ class AgentOrchestrator {
     }, this.commandRegistry);
   }
 
+  // One-shot corrective re-inference for deterministic-input failures: the
+  // compact choice can't express nested required args, so the repair prompt
+  // echoes the command's inputHint plus the parsed required field names and
+  // asks only for the corrected input object. The command itself is fixed —
+  // a repair may never switch commandId.
+  async inferActionInputRepair(task, plan, action, failure) {
+    if (!this.inferAction) return null;
+    const descriptor = this.commandRegistry[action.commandId] || {};
+    const requiredFields = requiredInputFields(descriptor.inputHint);
+    const history = this.kernel.getTaskHistory(task.id);
+    const response = await this.inferProposal({
+      system: [
+        "You are Maple-Preview repairing a tool-call input inside Hemlock.",
+        "Return exactly one compact JSON choice in the content channel — no prose, no markdown:",
+        `{"kind":"tool","commandId":${JSON.stringify(action.commandId)},"input":{...},"shortRationale":"one-line reason"}`,
+        "The host owns id, taskId, step, approval, expectedEvidence, and status. Never emit them.",
+        `The prior ${action.commandId} call failed deterministic input validation; supply a corrected input object only.`,
+      ].join("\n"),
+      task,
+      plan,
+      nextPlannedStep: { kind: "tool", commandId: action.commandId, label: descriptor.label || action.commandId },
+      history: { actions: history.actions.slice(-10), observations: history.observations.slice(-10), operations: history.operations.slice(-10) },
+      repair: {
+        schema: "hemlock.agent.input.repair.v1",
+        attempt: Number(action.inputRepairsUsed || 0) + 1,
+        maxAttempts: MAX_INPUT_REPAIR_ATTEMPTS,
+        commandId: action.commandId,
+        error: String(failure?.message || failure || "deterministic input validation failed").slice(0, 800),
+        inputHint: descriptor.inputHint || null,
+        requiredFields,
+        priorInput: action.input && typeof action.input === "object" && !Array.isArray(action.input) ? action.input : {},
+        instruction: `Provide a corrected input object for ${action.commandId}.${requiredFields.length ? ` Required fields: ${requiredFields.join(", ")}.` : ""}`,
+      },
+    });
+    const modelResult = typeof response === "string" ? { content: response } : response || {};
+    const choice = normalizeCompactChoice(extractActionEnvelope(modelResult.content || ""));
+    if (!choice || String(choice.commandId || action.commandId) !== action.commandId) return null;
+    const ENVELOPE_KEYS = new Set(["schema", "id", "taskId", "step", "kind", "commandId", "command", "input", "shortRationale", "expectedEvidence", "approval", "status", "reason", "title"]);
+    const rawInput = choice.input && typeof choice.input === "object" && !Array.isArray(choice.input) && Object.keys(choice.input).length
+      ? choice.input
+      : Object.fromEntries(Object.entries(choice).filter(([key]) => !ENVELOPE_KEYS.has(key) && !key.startsWith("__")));
+    const input = boundedActionInput(action.commandId, { input: rawInput });
+    if (!Object.keys(input).length) return null;
+    return { input, requiredFields, shortRationale: String(choice.shortRationale || "").trim() || `Retry ${action.commandId} with repaired input.` };
+  }
+
   artifactFromHistory(history) {
     return history.observations.map((item) => item.structuredOutput).reverse().find((output) => output?.schema === "hemlock.agent.artifact.v1" && output.id) || null;
   }
@@ -1028,7 +2012,7 @@ class AgentOrchestrator {
     const artifact = this.artifactFromHistory(history);
     const budget = mergeBudget(task.budget);
     const previous = task.artifactRepair || {};
-    const maxAttempts = Math.max(0, Number(previous.maxAttempts ?? budget.maxArtifactRepairs ?? 2));
+    const maxAttempts = Math.max(0, Number(previous.maxAttempts ?? budget.maxArtifactRepairs ?? DEFAULT_BUDGET.maxArtifactRepairs));
     let attempt = Number(previous.attempt || 0);
     let lastFailure = failedResult;
     let lastGoodRevision = Number(previous.lastGoodRevision || 0) || null;
@@ -1121,7 +2105,7 @@ class AgentOrchestrator {
     return { schema: "hemlock.agent.artifact.repair.v1", status: "passed", action: "use-last-good", artifact: restored, artifactRepair: this.task(), evidenceRefs: restored.evidenceRefs || [] };
   }
 
-  async executeAction(actionId) {
+  async executeAction(actionId, internal = {}) {
     const task = this.task();
     const action = this.kernel.getProjection().actions.find((item) => item.id === actionId);
     if (!action || action.taskId !== task?.id) throw new Error(`Hemlock action was not found: ${actionId}`);
@@ -1162,10 +2146,15 @@ class AgentOrchestrator {
     const autonomyAllows = action.approval === "explicit" && action.commandId && autonomyPermitsCommand(task, action.commandId, this.commandRegistry);
     if (action.approval !== "none" && !planApproved && !autonomyAllows) return { schema: "hemlock.agent.action.result.v1", status: "waiting_for_approval", action, task: this.task() };
     const descriptor = this.commandRegistry[action.commandId] || {};
-    if (descriptor.capability === "write") {
+    // Mutation budget: recovery (rollback) and journaling (experiment.note)
+    // are write-capable but must never consume a mutation set — a model that
+    // can't roll back its own apply or record a finding would be trapped.
+    // Usage is counted on success below, not here: a failed apply leaves the
+    // set free for repair.
+    const consumesMutationSet = descriptor.capability === "write" && !MUTATION_EXEMPT_COMMANDS.has(action.commandId);
+    if (consumesMutationSet) {
       const budget = mergeBudget(this.task().budget);
-      if (Number(budget.mutationSetsUsed || 0) >= Number(budget.maxMutationSets || 1)) return this.blockTask(task.id, "The single mutation-set budget is already consumed.", { actionId: action.id });
-      this.updateTask({ budget: { ...budget, mutationSetsUsed: Number(budget.mutationSetsUsed || 0) + 1 } });
+      if (Number(budget.mutationSetsUsed || 0) >= Number(budget.maxMutationSets || 1)) return this.blockTask(task.id, "The mutation-set budget is already consumed.", { actionId: action.id });
     }
     this.kernel.transitionAction(action.id, "start");
     this.emit("command.started", "running", { actionId: action.id, command: action.commandId }, { reversible: true });
@@ -1218,9 +2207,32 @@ class AgentOrchestrator {
           && Object.prototype.hasOwnProperty.call(commandInput.source, commandInput.filename)
           && Object.entries(commandInput.source).every(([file, contents]) => typeof file === "string" && file && typeof contents === "string" && contents.length <= 2 * 1024 * 1024);
         if (!sourceMapIsUsable) {
-          commandInput.source = { "index.html": fallbackAnimationSource(task.objective) };
+          // One bounded repair pass before the canned scaffold: the model
+          // failed to emit a usable source map, but a targeted re-ask (the
+          // same contract as a verification repair) often produces real
+          // content. The canned template stays the last resort, not the first.
+          let repairedSource = null;
+          if (this.inferAction) {
+            try {
+              const repairAction = await this.inferArtifactRepair(task, plan, this.kernel.getTaskHistory(task.id), {
+                revision: Number(latestArtifact?.revision || 0),
+                issues: [{ code: "authoring_source_missing", message: "artifact.author returned no usable input.source map; author the complete file contents for the objective now." }],
+                summary: "The authored source map was missing or malformed — produce complete file contents.",
+              }, latestArtifact, 1);
+              const candidate = repairAction?.input?.source;
+              if (candidate && typeof candidate === "object" && !Array.isArray(candidate)
+                && Object.prototype.hasOwnProperty.call(candidate, commandInput.filename)
+                && Object.entries(candidate).every(([file, contents]) => typeof file === "string" && file && typeof contents === "string" && contents.length <= 2 * 1024 * 1024)) {
+                repairedSource = candidate;
+                this.emit("artifact.author.repaired", "degraded", { taskId: task.id, reason: "authoring source recovered by one bounded repair inference" }, { reversible: true });
+              }
+            } catch { /* fall through to the canned scaffold */ }
+          }
+          commandInput.source = repairedSource || { "index.html": fallbackAnimationSource(task.objective) };
           commandInput.status = "previewable";
-          commandInput.evidence = [{ type: "authoring.host_fallback", reason: commandInput.source ? "Maple returned malformed or incomplete source; host scaffold retained." : "Maple did not return a usable structured authoring envelope." }];
+          commandInput.evidence = repairedSource
+            ? [{ type: "authoring.repaired_source", reason: "Maple's authoring envelope lacked usable source; a bounded repair inference produced the content." }]
+            : [{ type: "authoring.host_fallback", reason: commandInput.source ? "Maple returned malformed or incomplete source; host scaffold retained." : "Maple did not return a usable structured authoring envelope." }];
         }
       }
       if (action.commandId === "artifact.preview.open" && !commandInput.artifactId && latestArtifact?.id) commandInput.artifactId = latestArtifact.id;
@@ -1315,7 +2327,7 @@ class AgentOrchestrator {
       if (TERMINAL_TASK_STATUSES.has(this.task()?.status) || this.kernel.getProjection().actions.find((item) => item.id === action.id)?.status === "cancelled") {
         return { schema: "hemlock.agent.action.result.v1", status: "cancelled", action: this.kernel.getProjection().actions.find((item) => item.id === action.id), task: this.task() };
       }
-      const observation = compactObservation(result, { operationId: result?.operationId, elapsedMs: Date.now() - startedAt });
+      const observation = tagObservationLane(compactObservation(result, { operationId: result?.operationId, elapsedMs: Date.now() - startedAt }), action);
       this.kernel.recordObservation(observation);
       const actionTransition = observation.status === "blocked" ? "block" : observation.status === "failed" ? "fail" : "complete";
       this.kernel.transitionAction(action.id, actionTransition, { observationId: observation.id, operationId: observation.operationId || result?.operationId || null });
@@ -1323,14 +2335,21 @@ class AgentOrchestrator {
       this.emit("episode.updated", "recorded", { episode }, { evidenceRefs: observation.evidenceRefs, reversible: true });
       this.emit("observation.recorded", observation.status, { actionId: action.id, observation }, { evidenceRefs: observation.evidenceRefs, reversible: true });
       if (observation.status === "blocked" || observation.status === "failed") return this.blockTask(task.id, observation.summary, { actionId: action.id, observationId: observation.id });
+      if (consumesMutationSet && observation.status === "passed") {
+        const budget = mergeBudget(this.task().budget);
+        this.updateTask({ budget: { ...budget, mutationSetsUsed: Number(budget.mutationSetsUsed || 0) + 1 } });
+      }
       this.emit("action.completed", "passed", { actionId: action.id, observationId: observation.id }, { evidenceRefs: observation.evidenceRefs, reversible: true });
       const nextPlan = this.kernel.getProjection().plans.find((item) => item.id === task.activePlanId);
       if (!nextPlan) return this.completeTask(task.id, "Action completed with a receipt.");
+      // A batch item returns control to executeBatchActions — the batch owns
+      // the next step boundary instead of recursing into a fresh proposal.
+      if (internal.batchItem) return { schema: "hemlock.agent.action.result.v1", status: "passed", action: this.kernel.getProjection().actions.find((item) => item.id === action.id), observation, task: this.task() };
       return this.proposeNextAction(task.id, nextPlan);
     } catch (error) {
       const category = classifyFailure(error);
       const hint = ACTIONABLE_HINTS[action.commandId];
-      const observation = compactObservation({ status: "failed", error: error.message, summary: hint ? `${error.message} hint: ${hint}` : error.message }, { elapsedMs: Date.now() - startedAt });
+      const observation = tagObservationLane(compactObservation({ status: "failed", error: error.message, summary: hint ? `${error.message} hint: ${hint}` : error.message }, { elapsedMs: Date.now() - startedAt }), action);
       this.kernel.recordObservation(observation);
       this.kernel.transitionAction(action.id, category === "cancelled" ? "cancel" : "fail", { observationId: observation.id, failureCategory: category, error: error.message });
       const episode = this.kernel.appendEpisodeEvent(task.id, { action: this.kernel.getProjection().actions.find((item) => item.id === action.id), observation, outcome: category });
@@ -1341,10 +2360,131 @@ class AgentOrchestrator {
         this.kernel.createAction(retry);
         this.emit("action.retry.proposed", "retrying", { actionId: action.id, category, retryCount: action.retryCount + 1 }, { reversible: true });
         this.updateTask({ activeActionId: retry.id, foregroundStep: `Retrying ${action.commandId} after a transient failure` });
-        return this.executeAction(retry.id);
+        return this.executeAction(retry.id, internal);
+      }
+      // A missing/malformed required-arg failure (deterministic-input) is
+      // never an instant terminal block: the compact envelope could not
+      // express the args, so re-infer once with the command's input contract
+      // echoed back, then retry the action exactly once.
+      if (category === "deterministic-input" && this.inferAction && Number(action.inputRepairsUsed || 0) < MAX_INPUT_REPAIR_ATTEMPTS) {
+        const plan = this.kernel.getProjection().plans.find((item) => item.id === task.activePlanId) || { steps: [] };
+        try {
+          const repaired = await this.inferActionInputRepair(task, plan, action, error);
+          if (repaired?.input && Object.keys(repaired.input).length) {
+            const retry = {
+              ...action,
+              id: `${action.id}-input-repair-${Number(action.inputRepairsUsed || 0) + 1}`,
+              input: { ...(action.input && typeof action.input === "object" && !Array.isArray(action.input) ? action.input : {}), ...repaired.input },
+              shortRationale: repaired.shortRationale || action.shortRationale,
+              inputRepairsUsed: Number(action.inputRepairsUsed || 0) + 1,
+              status: "proposed",
+              proposedAt: new Date().toISOString(),
+              validatedAt: null,
+              startedAt: null,
+              completedAt: null,
+              operationId: null,
+              observationId: null,
+            };
+            this.kernel.createAction(retry);
+            this.emit("action.input.repaired", "retrying", {
+              taskId: task.id,
+              actionId: action.id,
+              retryActionId: retry.id,
+              commandId: action.commandId,
+              requiredFields: repaired.requiredFields,
+            }, { evidenceRefs: expectedEvidenceForCommand(action.commandId), reversible: true });
+            this.updateTask({ activeActionId: retry.id, foregroundStep: `Retrying ${action.commandId} with repaired input`, status: "running", phase: "work", blockedReason: null });
+            return this.executeAction(retry.id, internal);
+          }
+          this.emit("action.input.repair.failed", "degraded", { taskId: task.id, actionId: action.id, commandId: action.commandId, reason: "repair inference returned no usable input" }, { reversible: true });
+        } catch (repairError) {
+          this.emit("action.input.repair.failed", "degraded", { taskId: task.id, actionId: action.id, commandId: action.commandId, error: repairError.message }, { reversible: true });
+        }
       }
       return this.blockTask(task.id, `${category}: ${error.message}`, { actionId: action.id, observationId: observation.id });
     }
+  }
+
+  // Sequential batch execution. The container action is ephemeral — each item
+  // becomes its own durable action (kernel record, action.proposed/validated,
+  // observation, receipt) so plan/history indexing and audit trails are
+  // identical to the single-action path. The first non-passed item halts the
+  // batch with a batch.halted receipt; earlier mutations stay journaled —
+  // rollback is explicit (code.rollback), never automatic.
+  async executeBatchActions(task, batch, plan, budget = {}) {
+    const items = Array.isArray(batch.actions) ? batch.actions : [];
+    const halt = (status, index, reason, result) => {
+      this.emit("batch.halted", status === "paused" ? "paused" : status === "cancelled" ? "cancelled" : "blocked", {
+        taskId: task.id,
+        batchId: batch.id,
+        completedCount: index,
+        failedIndex: index,
+        reason,
+      }, { reversible: true });
+      return result;
+    };
+    for (let index = 0; index < items.length; index += 1) {
+      // Same step-boundary semantics as proposeNextAction: a paused task parks
+      // before the next item (the in-flight one already receipted), a terminal
+      // task stops the batch outright.
+      const current = this.task();
+      if (!current || TERMINAL_TASK_STATUSES.has(current.status)) {
+        const status = current?.status || "cancelled";
+        return halt(status, index, status, { schema: "hemlock.agent.action.result.v1", status, task: current });
+      }
+      if (current.status === "paused") {
+        return halt("paused", index, "paused", { schema: "hemlock.agent.action.result.v1", status: "paused", task: current });
+      }
+      const history = this.kernel.getTaskHistory(task.id);
+      const liveBudget = mergeBudget(current.budget);
+      // Each item counts independently against step and wall-clock budgets —
+      // a batch is one proposal, not one step.
+      if (history.actions.length >= Number(liveBudget.maxAgentSteps || DEFAULT_BUDGET.maxAgentSteps)) {
+        return halt("blocked", index, "step-budget-exhausted", this.blockTask(task.id, "Agent step budget exhausted before the batch finished.", { batchId: batch.id }));
+      }
+      if (Date.now() - Number(liveBudget.wallClockStartedAt || Date.now()) > Number(liveBudget.maxWallClockMs || DEFAULT_BUDGET.maxWallClockMs)) {
+        return halt("blocked", index, "wall-clock-budget-exhausted", this.blockTask(task.id, "Agent wall-clock budget exhausted before the batch finished.", { batchId: batch.id }));
+      }
+      const item = items[index];
+      const descriptor = this.commandRegistry[item.commandId] || {};
+      const plannedStep = (plan.steps || []).slice(history.actions.length).find((step) => step?.commandId === item.commandId);
+      const itemInput = item.input && typeof item.input === "object" && Object.keys(item.input).length
+        ? item.input
+        : plannedStep?.input && typeof plannedStep.input === "object" && !Array.isArray(plannedStep.input) && Object.keys(plannedStep.input).length
+          ? boundedActionInput(item.commandId, { input: plannedStep.input })
+          : item.input;
+      const itemAction = validateAction({
+        schema: ACTION_SCHEMA,
+        id: `${batch.id}-item-${index + 1}`,
+        taskId: task.id,
+        step: history.actions.length + 1,
+        kind: "tool",
+        commandId: item.commandId,
+        input: itemInput,
+        shortRationale: item.shortRationale,
+        expectedEvidence: item.expectedEvidence?.length ? item.expectedEvidence : expectedEvidenceForCommand(item.commandId),
+        approval: plannedStep?.approval || (descriptor.approval === "plan" ? "plan" : "none"),
+        status: "proposed",
+        batchId: batch.id,
+        batchIndex: index,
+        batchSize: items.length,
+        rawModelOutputRef: batch.rawModelOutputRef || null,
+        modelChannels: batch.modelChannels || [],
+        parseStatus: batch.parseStatus || "batch",
+      }, this.commandRegistry);
+      this.kernel.createAction(itemAction);
+      this.updateTask({ phase: "work", status: "running", foregroundStep: itemAction.shortRationale, activeActionId: itemAction.id, budget: { ...liveBudget, agentStepsUsed: history.actions.length + 1 } });
+      this.emit("action.proposed", "proposed", { action: itemAction }, { evidenceRefs: itemAction.expectedEvidence, reversible: true });
+      this.kernel.transitionAction(itemAction.id, "validate");
+      this.emit("action.validated", "passed", { action: itemAction }, { evidenceRefs: itemAction.expectedEvidence, reversible: true });
+      const result = await this.executeAction(itemAction.id, { batchItem: true });
+      if (result?.status !== "passed") {
+        return halt(result?.status === "cancelled" ? "cancelled" : result?.status === "paused" ? "paused" : "blocked", index, result?.status || "failed", result);
+      }
+    }
+    const nextPlan = this.kernel.getProjection().plans.find((item) => item.id === task.activePlanId);
+    if (!nextPlan) return this.completeTask(task.id, "Batched actions completed with receipts.");
+    return this.proposeNextAction(task.id, nextPlan);
   }
 
   completeTask(taskId, reason) {
@@ -1405,4 +2545,4 @@ class AgentOrchestrator {
   }
 }
 
-module.exports = { AgentOrchestrator, ACTIONABLE_HINTS, defaultPlanSteps, completedTaskCommands, resolveProgressCommand };
+module.exports = { AgentOrchestrator, ACTIONABLE_HINTS, defaultPlanSteps, completedTaskCommands, resolveProgressCommand, mutationIntervened, fallbackLaneForTask, LANE_FALLBACK_ERROR_KINDS, buildActionSystemPrompt, contextMaxTokensFor, resolveContextMaxTokens, estimateActionPromptTokens, CONTEXT_BUDGET_ERROR_CODE };

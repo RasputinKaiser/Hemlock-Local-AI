@@ -13,8 +13,9 @@ the agent does lands in a durable, inspectable projection — no hidden state.
 ## The agent loop
 
 An intent becomes a durable plan; Maple then proposes one structured JSON
-action at a time. The host validates it against a registry of ~90 allowlisted
-commands, executes one bounded operation, records an observation with evidence
+action at a time — or a `{"actions":[...]}` batch envelope executed step by
+step. The host validates it against a registry of 116 allowlisted commands,
+executes one bounded operation, records an observation with evidence
 references, and asks for the next step. Prose is never executed.
 
 - **Graduated autonomy** — `supervised` (approve every plan) → `guided` (plans
@@ -25,15 +26,29 @@ references, and asks for the next step. Prose is never executed.
   state, `steer:` injects guidance into the next decision, cancel is terminal.
 - **Scored action selection** — `/v1/score` teacher-forces candidate action
   envelopes against a shared prefilled KV cache and picks the argmax, instead
-  of generating JSON autoregressively. Complete envelopes execute with zero
-  generated tokens (structurally incapable of invalid JSON); prefix winners
-  fall through to generation only for free fields.
+  of generating JSON autoregressively; `/v1/decide` scores labeled options on
+  forked caches for calibrated confidence, with confidence and top1−top2
+  margin gates falling back to generation on weak calls. Complete envelopes
+  execute with zero generated tokens (structurally incapable of invalid
+  JSON); prefix winners fall through to generation only for free fields.
 - **Self-describing** — `agent.capabilities` returns the live command registry
-  with input contracts; every command carries an `inputHint`; failed actions
-  return actionable recovery hints, not dead ends.
+  with input contracts; `agent.self` reports task, budget, queue, pending
+  approvals, and recent failures with host-authored recovery hints; every
+  command carries an `inputHint`.
+- **Self-correcting** — a missing required input gets one bounded repair
+  inference; `plan.revise` lets Maple replan the unexecuted suffix
+  mid-task (validated, receipted); decide divergences are logged, not hidden.
 - **Self-improving** — Maple can read this repo, `improve.propose` a bounded
   change (receipt'd, never auto-applied), `code.apply` it under an approved
-  plan, `verify` with real build/test profiles, and `remember` the lesson.
+  plan, `verify` with real build/test profiles, and `remember` the lesson via
+  `memory.note`. `shell.exec` runs bounded allowlisted executables against
+  the workspace.
+- **Resident and warm** — a persistent multi-entry prompt cache survives
+  restarts and lane switches, and the host warm-prefills the shared action
+  prefix on server-ready and thread-switch, so first steps are cache-hot.
+- **Multi-lane** — Maple is the default; Codex and Claude lanes exist, and a
+  configured fallback lane retries transport-death inference once — receipted
+  with `fallbackFrom` so the record never claims Maple did the work.
 
 ## The Grove
 
@@ -41,14 +56,21 @@ Maple exists as a hooded figure in a 3D world (`dream-chat/src/groveScene.js`).
 `experiment.run` executes deterministic physics sims (pendulum, projectile,
 orbit, spring, collision, terminal) in a bounded sandbox — each run emits a
 receipt **and** a trail of real integration samples that the grove replays at
-Maple's lab bench while Maple physically works. Findings feed the Dream
+Maple's lab bench while Maple physically works. `experiment.suggest` picks
+the next run from coverage gaps and open hypotheses; `world.place` lets Maple
+leave persistent markers in the world it inhabits. Findings feed the Dream
 dataset. World → experiment → receipt → finding → dataset → adapter → behavior.
 
 ## Dream training → graft → fuse
 
-Dream Lab prepares a token-budgeted dataset (splits oversized rows, records
-trimming metadata, deterministic holdout) and runs real MLX LoRA training with
-isolated adapters and base-weight provenance. A verified adapter can be:
+Dream Lab prepares a token-budgeted dataset — facts, conversations, coding
+examples, **and durable agentic action traces** (real system-prompt bytes,
+step context rebuilt at each action's own timestamp, only completed actions
+with passed observations) — with `dream.dataset.preview` auditing the mix
+before anything trains. Then real MLX LoRA training runs with isolated
+adapters and base-weight provenance. An idle-dream scheduler *proposes* a
+cycle when enough new findings have landed; training itself always stays
+explicitly approved. A verified adapter can be:
 
 - **grafted** — served via `--adapter-path`, detachable (`dream.detach`),
 - **fused** — `dream.fuse` merges it into a *new* checkpoint and serves that;
@@ -61,9 +83,14 @@ explicit, auditable act — never silent.
 ## Surfaces
 
 Chat · Artifact Studio (versioned live previews, sandboxed) · Command Center
-(host loop, intent queue, metrics) · Understory Grove · Dream Lab · Memory
-Garden · SIPS · Activity · Receipts · Project Map · Settings. Ordinary
-conversation stays ordinary — creation verbs alone don't trigger plans.
+(host loop, intent queue, metrics, notification history) · **Threads**
+(search, checkpoints, fork, full lifecycle) · Understory Grove · Dream Lab ·
+Memory Garden (staleness/provenance-ranked recall, near-dupe consolidation) ·
+SIPS · Activity · Receipts (expandable, cross-window deep links) · Project
+Map · Settings (runtime tuning: KV-cache quantization, context ceiling,
+prefill step, prompt-cache slots, fallback lane, dependency probes).
+Ordinary conversation stays ordinary — creation verbs alone don't trigger
+plans.
 
 ## Run it
 
@@ -93,14 +120,22 @@ python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens 
 
 ```sh
 cd dream-chat
-npm run test:agent      # host harness: orchestrator, queue, contracts, receipts
+npm run test:agent      # host harness: orchestrator, queue, contracts, receipts,
+                      # durable-io recovery, session restore, real-main soak
 npm run test:ui         # renderer projection tests
 npm run verify:agent    # all of the above + production build
 node scripts/gui-electron-smoke.mjs   # real-Electron end-to-end checks
+python -m pytest mlx_lm/tests/test_server.py   # inference server incl. kernels
 ```
 
 Maple is a 20B-A1B ternary MoE — 24 layers, 256 experts, top-8, 512-token
 sliding window on 3 of 4 layers, 2-bit packed `{-α, 0, +α}` weights.
+Inside Hemlock the decode path additionally runs fused custom Metal kernels
+for the expert block (one dispatch for gate+up+SwiGLU across all 8 active
+experts, another for weighted down-projection), and `HEMLOCK_KV_BITS=8`
+opt-in quantizes the six full-attention KV caches past a configurable start
+token — lifting the practical context ceiling from ~24k to ~61k tokens while
+sliding-window layers stay exact.
 
 | chip | head | decode tok/s | prefill tok/s | peak |
 | --- | --- | --- | --- | --- |

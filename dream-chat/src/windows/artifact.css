@@ -1,0 +1,79 @@
+/* Artifact Studio styles — owned by ArtifactStudio.jsx. Loaded after
+   styles.css, so these rules extend and override the base artifact surface. */
+
+/* --- honesty banners ----------------------------------------------------- */
+.artifact-banner { display: flex; align-items: flex-start; gap: 9px; margin: 10px 20px 0; padding: 9px 12px; border-radius: 8px; font-size: 12px; line-height: 1.45; }
+.artifact-banner svg { flex: 0 0 auto; margin-top: 1px; }
+.artifact-banner-fallback { border: 1px solid #e2b58a; background: #fbeadd; color: #7c4423; }
+.artifact-banner-fallback strong { color: #6b3517; }
+.artifact-banner-repaired { border: 1px solid #d8cf9f; background: #faf3dc; color: #6f6020; }
+
+.artifact-approval-chip { display: flex; align-items: center; gap: 8px; margin: 10px 20px 0; padding: 7px 11px; border: 1px solid #d2ae59; border-radius: 8px; background: #fbf3d8; color: #7a5b16; font-family: "DM Mono", monospace; font-size: 10px; }
+.artifact-approval-chip button { min-height: 24px; padding: 0 9px; border: 1px solid #c9a548; border-radius: 5px; background: #fff8e2; color: #7a5b16; font-family: "DM Mono", monospace; font-size: 9px; cursor: pointer; }
+.artifact-approval-chip button:hover { background: #fdf0cd; }
+
+/* --- durable notice stack ------------------------------------------------- */
+.artifact-notice-stack { display: flex; flex-direction: column; gap: 4px; margin: 10px 20px 0; }
+.artifact-notice { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 7px 10px; border-radius: 7px; background: #fff1e8; color: #8e5136; font-size: 12px; line-height: 1.4; }
+.artifact-notice.notice-warn { background: #f7ecd8; color: #8a6420; }
+.artifact-notice .notice-count { font-style: normal; font-family: "DM Mono", monospace; font-size: 10px; opacity: .75; }
+.artifact-notice > span { min-width: 0; overflow-wrap: anywhere; }
+.artifact-notice > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 0; border-radius: 4px; background: transparent; color: inherit; opacity: .6; cursor: pointer; }
+.artifact-notice > button:hover { opacity: 1; background: rgba(0, 0, 0, .06); }
+
+/* --- source file tabs ------------------------------------------------------ */
+.source-tab-strip { display: flex; gap: 2px; padding: 4px 8px 0; border-bottom: 1px solid #e0e2d8; background: #f4f2e6; overflow-x: auto; }
+.source-tab-strip button { display: inline-flex; align-items: baseline; gap: 6px; min-height: 26px; padding: 0 9px; border: 1px solid transparent; border-bottom: 0; border-radius: 6px 6px 0 0; background: transparent; color: #5e7163; font-family: "DM Mono", monospace; font-size: 10px; white-space: nowrap; cursor: pointer; }
+.source-tab-strip button small { color: #93a08d; font-size: 8px; }
+.source-tab-strip button:hover { background: #ece9da; }
+.source-tab-strip button.is-selected { border-color: #ddd8c5; background: #fffdf5; color: #2e4e38; }
+.source-tab-strip button.is-selected small { color: #7d6529; }
+
+/* --- syntax tokens (preview aid, not an editor) ---------------------------- */
+.source-view .tok-comment { color: #8a927f; font-style: italic; }
+.source-view .tok-string { color: #7a5b16; }
+.source-view .tok-keyword { color: #24508a; }
+.source-view .tok-number { color: #8a4d8f; }
+.source-view .tok-tag { color: #1f6a4a; font-weight: 500; }
+.source-view .tok-attr { color: #7a5b16; }
+.source-view .tok-punct { color: #6e8071; }
+
+/* --- aligned diff lines ----------------------------------------------------- */
+.diff-line { grid-template-columns: 3em 3em 14px 1fr; }
+.diff-line .diff-num { color: #a3ad9c; font-size: 9px; text-align: right; user-select: none; }
+.diff-line .diff-sign { color: #5e7561; user-select: none; }
+.diff-line.is-added .diff-sign { color: #2e5c38; }
+.diff-line.is-removed .diff-sign { color: #8c4a33; }
+.diff-line.is-removed code { text-decoration: line-through; text-decoration-color: rgba(140, 74, 51, .4); }
+
+/* --- revision rail badges ---------------------------------------------------- */
+.artifact-revisions .rev-dot { display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 50%; background: #a3ad9c; vertical-align: 1px; }
+.artifact-revisions .rev-dot.rev-ready { background: #4d8155; }
+.artifact-revisions .rev-dot.rev-drafting { background: #cf9e42; }
+.artifact-revisions .rev-dot.rev-failed { background: #c4562f; }
+.artifact-revisions button.is-selected .rev-dot { background: #e0b65f; }
+
+/* --- preview interact palette ----------------------------------------------- */
+.preview-palette { display: flex; align-items: center; gap: 5px; padding: 6px 8px; border-bottom: 1px solid rgba(242, 233, 207, .15); background: rgba(242, 233, 207, .04); color: #b9c7b1; }
+.preview-palette svg { flex: 0 0 auto; color: #5e7560; }
+.preview-palette select { flex: 0 0 auto; min-height: 26px; padding: 0 6px; border: 1px solid rgba(242, 233, 207, .2); border-radius: 5px; background: #101a16; color: #e0b65f; font-family: "DM Mono", monospace; font-size: 10px; }
+.preview-palette input { flex: 1 1 60px; min-width: 0; min-height: 26px; padding: 0 7px; border: 1px solid rgba(242, 233, 207, .18); border-radius: 5px; background: rgba(255, 253, 246, .06); color: #eee6d4; font-family: "DM Mono", monospace; font-size: 10px; }
+.preview-palette input::placeholder { color: #5e7560; }
+.preview-palette .primary-action { flex: 0 0 auto; min-height: 26px; padding: 0 10px; border-radius: 5px; font-family: "DM Mono", monospace; font-size: 9px; }
+.preview-palette .primary-action:disabled { opacity: .45; cursor: not-allowed; }
+
+.preview-interact-result { display: flex; flex-direction: column; gap: 6px; padding: 6px 10px; border-bottom: 1px solid rgba(242, 233, 207, .12); }
+.preview-interact-result code { color: #b9c7b1; font-family: "DM Mono", monospace; font-size: 10px; overflow-wrap: anywhere; }
+.preview-screenshot { max-width: 100%; max-height: 160px; align-self: flex-start; border: 1px solid rgba(242, 233, 207, .25); border-radius: 6px; }
+
+/* --- send errors to Maple ----------------------------------------------------- */
+.send-errors-action { display: inline-flex; align-items: center; gap: 5px; color: #a25038 !important; }
+.send-errors-action:hover:not(:disabled) { background: #f9e8e0; }
+
+/* --- understory theme --------------------------------------------------------- */
+.understory .artifact-banner-fallback { border-color: #cfa27b; background: #ead9c5; color: #6d4023; }
+.understory .artifact-banner-repaired { border-color: #c9bb85; background: #e8dfba; color: #63571c; }
+.understory .artifact-approval-chip { border-color: #bb9a48; background: #ecdfba; color: #6b5214; }
+.understory .artifact-notice { background: #eadfcf; color: #7c4a30; }
+.understory .source-tab-strip { background: #e2dac4; }
+.understory .source-tab-strip button.is-selected { background: #ece5d2; }

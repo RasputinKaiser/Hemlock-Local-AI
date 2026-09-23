@@ -68,12 +68,17 @@ test("classifyHealthFailure: unknown and non-object inputs", () => {
 
 test("missingCheckpointItem: valid MLX checkpoint passes", () => {
   assert.equal(missingCheckpointItem(["config.json", "model.safetensors", "tokenizer.model"]), null);
-  assert.equal(missingCheckpointItem(["config.json", "model-00001-of-00002.safetensors"]), null);
+  assert.equal(missingCheckpointItem(["config.json", "model-00001-of-00002.safetensors", "tokenizer.json", "tokenizer_config.json"]), null);
+  // Vocab/merges-style tokenizers count as tokenizer presence too.
+  assert.equal(missingCheckpointItem(["config.json", "model.safetensors", "vocab.json", "merges.txt"]), null);
 });
 
 test("missingCheckpointItem: names what is missing", () => {
   assert.equal(missingCheckpointItem(["tokenizer.model"]), "config.json");
   assert.equal(missingCheckpointItem(["config.json", "README.md"]), "safetensors weights");
+  // Weights present but no tokenizer files: the server would boot and then
+  // fail every load; name the missing piece instead.
+  assert.equal(missingCheckpointItem(["config.json", "model-00001-of-00002.safetensors"]), "tokenizer files");
   assert.equal(missingCheckpointItem([]), "config.json");
   assert.equal(missingCheckpointItem(undefined), "config.json");
 });

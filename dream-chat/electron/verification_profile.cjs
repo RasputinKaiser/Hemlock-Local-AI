@@ -55,8 +55,11 @@ function chooseVerificationProfile(profiles, appliedPaths = []) {
   }
   if (paths.some(isSourcePath)) {
     // Prefer an explicit "npm test"-shaped runner before any other test
-    // runner shape.
-    const npmTest = candidates.find((profile) => commandMentions(profile, /(^|[\s/])npm([\s]+run)?[\s]+test($|\s)/));
+    // runner shape. Named test scripts count too: `npm run test:agent` is a
+    // test profile, not a build profile — the old `test($|\s)` anchor missed
+    // the colon suffix and skipped verification entirely on repos whose only
+    // test script is a named one (Hemlock's own test:agent included).
+    const npmTest = candidates.find((profile) => commandMentions(profile, /(^|[\s/])(npm|pnpm|yarn|bun)([\s]+run)?[\s]+test(:[\w.-]+)?($|[\s&|])/));
     if (npmTest) return npmTest;
     const testRunner = candidates.find((profile) => (
       commandMentions(profile, /(^|[\s/])node[\s]+--test/)

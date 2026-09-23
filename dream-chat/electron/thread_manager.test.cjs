@@ -87,6 +87,128 @@ test("workspace fingerprints change when a project file changes", () => {
   }
 });
 
+test("switching away from a running thread parks it instead of claiming live work", () => {
+  const item = fixture();
+  try {
+    const first = item.manager.ensureDefaultThread();
+    item.manager.updateThread(first.id, {
+      status: "running",
+      phase: "executing",
+      taskId: "task-live",
+      taskSnapshot: { id: "task-live", status: "running", phase: "executing" },
+    });
+    const second = item.manager.createThread({ workspaceRoot: item.projectB, title: "Other work" });
+    const parked = item.manager.thread(first.id);
+    assert.equal(parked.status, "paused");
+    assert.equal(parked.phase, "paused");
+    assert.equal(parked.taskSnapshot.status, "paused");
+    assert.match(parked.blockedReason, /switched to another thread/i);
+    assert.equal(item.manager.latestCheckpoint(first.id).reason, "thread-switched-away");
+    assert.equal(item.manager.snapshot().activeThreadId, second.id);
+    // Switching back is allowed: paused is resumable, not terminal.
+    assert.equal(item.manager.switchThread(first.id).id, first.id);
+    // A parked thread does not park again when switched away from.
+    item.manager.switchThread(second.id);
+    assert.equal(item.manager.thread(first.id).status, "paused");
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
+test("archive reassigns active pointers, restore un-archives, rename validates", () => {
+  const item = fixture();
+  try {
+    const first = item.manager.ensureDefaultThread();
+    const second = item.manager.createThread({ workspaceRoot: item.projectB, title: "Soon archived" });
+    assert.equal(item.manager.snapshot().activeThreadId, second.id);
+    item.manager.archiveThread(second.id);
+    assert.equal(item.manager.thread(second.id).status, "archived");
+    assert.equal(item.manager.snapshot().activeThreadId, first.id);
+    assert.equal(item.manager.project(item.manager.thread(second.id).projectId).activeThreadId, null);
+    assert.throws(() => item.manager.switchThread(second.id), /restored/);
+    assert.throws(() => item.manager.restoreThread(first.id), /only archived/i);
+    const restored = item.manager.restoreThread(second.id);
+    assert.equal(restored.status, "ready");
+    assert.equal(restored.archivedAt, null);
+    assert.equal(item.manager.renameThread(second.id, "  Renamed thread  ").title, "Renamed thread");
+    assert.throws(() => item.manager.renameThread(second.id, "   "), /title is required/i);
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
+test("deleteThread removes registry entry and owned files, refuses live work without force", () => {
+  const item = fixture();
+  try {
+    const thread = item.manager.createThread({ workspaceRoot: item.projectA, title: "Disposable" });
+    item.manager.appendConversation(thread.id, { role: "user", content: "hi" });
+    item.manager.checkpoint(thread.id, { phase: "conversation", status: "ready" });
+    item.manager.createSuggestion({ threadId: thread.id, title: "Try this" });
+    item.manager.updateThread(thread.id, { status: "running", phase: "executing", taskId: "task-x" });
+    assert.throws(() => item.manager.deleteThread(thread.id), /live work/);
+    const result = item.manager.deleteThread(thread.id, { force: true });
+    assert.equal(result.deleted, true);
+    assert.equal(item.manager.thread(thread.id), null);
+    assert.equal(item.manager.snapshot().threads.some((item) => item.id === thread.id), false);
+    assert.equal(item.manager.listSuggestions({ threadId: thread.id }).length, 0);
+    assert.equal(item.manager.checkpoints(thread.id).length, 0);
+    assert.equal(fs.existsSync(item.manager.thread(thread.id)?.conversationRef || ""), false);
+    assert.notEqual(item.manager.snapshot().activeThreadId, thread.id);
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a queued waiter thread rejects its pending provider acquire", async () => {
+  const item = fixture();
+  try {
+    const first = item.manager.createThread({ workspaceRoot: item.projectA, title: "Lane holder" });
+    const second = item.manager.createThread({ workspaceRoot: item.projectB, title: "Waiting" });
+    const lease = await item.manager.acquireProvider("maple", first.id);
+    const waiting = item.manager.acquireProvider("maple", second.id);
+    item.manager.cancelThread(second.id);
+    await assert.rejects(waiting, /cancelled/);
+    lease.release();
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
+test("taskHistory records previous task ids when the pointer moves", () => {
+  const item = fixture();
+  try {
+    const thread = item.manager.ensureDefaultThread();
+    item.manager.updateThread(thread.id, { taskId: "task-1" });
+    item.manager.updateThread(thread.id, { taskId: "task-2" });
+    item.manager.updateThread(thread.id, { taskId: "task-3" });
+    assert.deepEqual(item.manager.thread(thread.id).taskHistory, ["task-1", "task-2"]);
+    const restored = new ThreadManager({ root: item.runtime, defaultWorkspaceRoot: item.projectA });
+    assert.deepEqual(restored.thread(thread.id).taskHistory, ["task-1", "task-2"]);
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
+test("corrupt registry recovers from backup and quarantines the bad file", () => {
+  const item = fixture();
+  try {
+    const thread = item.manager.createThread({ workspaceRoot: item.projectA, title: "Durable" });
+    const registryPath = path.join(item.runtime, "threads", "registry.json");
+    fs.writeFileSync(registryPath, "{ not json", "utf8");
+    const recovered = new ThreadManager({ root: item.runtime, defaultWorkspaceRoot: item.projectA });
+    assert.ok(recovered.thread(thread.id), "expected recovery from registry.json.bak");
+    const quarantined = fs.readdirSync(path.dirname(registryPath)).filter((name) => name.startsWith("registry.json.corrupt-"));
+    assert.equal(quarantined.length, 1);
+    // A corrupt registry with no usable backup starts clean instead of crashing.
+    fs.writeFileSync(registryPath, "{ not json again", "utf8");
+    fs.rmSync(`${registryPath}.bak`, { force: true });
+    const fresh = new ThreadManager({ root: item.runtime, defaultWorkspaceRoot: item.projectA });
+    assert.equal(fresh.snapshot().threads.length, 0);
+  } finally {
+    fs.rmSync(item.root, { recursive: true, force: true });
+  }
+});
+
 test("persists provider capacity changes and thread conversation references", () => {
   const item = fixture();
   try {

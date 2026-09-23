@@ -9,7 +9,7 @@ const { ACTION_SCHEMA, createAction, parseActionEnvelope } = require("./agent_co
 const { ArtifactRegistry } = require("./artifact_registry.cjs");
 const { createMockMapleActionSource } = require("./mock_maple.cjs");
 
-function makeHarness({ inferAction = null, scoreActions = null, executeCommand = async (command) => ({ status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`], ...(command === "artifact.create" ? { artifactId: `artifact-mock-${++makeHarness.mockCounter}` } : {}) }), commandRegistry = null } = {}) {
+function makeHarness({ inferAction = null, scoreActions = null, buildCandidates = null, executeCommand = async (command) => ({ status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`], ...(command === "artifact.create" ? { artifactId: `artifact-mock-${++makeHarness.mockCounter}` } : {}) }), commandRegistry = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hemlock-agent-loop-"));
   const task = {
     schema: "hemlock.agent.task.v1",
@@ -32,6 +32,7 @@ function makeHarness({ inferAction = null, scoreActions = null, executeCommand =
     executeCommand,
     inferAction,
     scoreActions,
+    buildCandidates,
   });
   return { root, kernel, orchestrator, events, get task() { return currentTask; } };
 }
@@ -412,10 +413,11 @@ test("falls back to the next approved artifact step when Maple action output is 
   let calls = 0;
   const harness = makeHarness({
     commandRegistry: { "artifact.author": { capability: "artifact" } },
+    // All bounded repairs fail too (1 initial + 2 repair inferences), so the
+    // host recovers into the approved plan step instead of dead-ending.
     inferAction: async () => {
       calls += 1;
-      if (calls <= 2) throw new Error("Maple returned no structured action content.");
-      return JSON.stringify(createAction({ taskId: "task-loop", step: 2, kind: "complete", shortRationale: "The artifact evidence is complete." }));
+      throw new Error("Maple returned no structured action content.");
     },
   });
   try {
@@ -466,15 +468,20 @@ test("repairs an empty Maple action response once before continuing", async () =
   }
 });
 
-test("blocks after a second invalid Maple action envelope", async () => {
-  const mock = createMockMapleActionSource(["not json", "still not json"]);
+test("recovers into the approved plan after repeated invalid Maple action envelopes", async () => {
+  // 1 initial + 2 bounded repair inferences all return garbage; the host then
+  // falls back to the approved plan step rather than dead-ending the task.
+  const mock = createMockMapleActionSource(["not json", "still not json", "still invalid"]);
   const harness = makeHarness({ inferAction: mock.inferAction });
   try {
     const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
     const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
-    assert.equal(result.status, "blocked");
-    assert.match(result.reason, /two invalid action envelopes/i);
-    assert.equal(mock.source.calls.length, 2);
+    assert.equal(result.status, "completed");
+    assert.equal(mock.source.calls.length, 3);
+    assert.equal(harness.events.some((event) => event.type === "action.inference.fallback"), true);
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.status, "completed");
   } finally {
     fs.rmSync(harness.root, { recursive: true, force: true });
   }
@@ -595,7 +602,7 @@ test("clamps out-of-range budget overrides at approval time into task.budget", a
   try {
     const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ kind: "answer", label: "Answer from scoped local context" }] }).plan;
     await harness.orchestrator.approvePlan(harness.task.id, plan.id, { maxAgentSteps: 999, maxCommands: -4, garbageKey: 7 });
-    assert.equal(harness.task.budget.maxAgentSteps, 24);
+    assert.equal(harness.task.budget.maxAgentSteps, 64);
     assert.equal(harness.task.budget.maxCommands, 1);
     assert.equal(harness.task.budget.garbageKey, undefined);
   } finally {
@@ -1094,5 +1101,933 @@ test("a guided task runs an adaptively-selected explicit sandboxed action; super
     assert.equal(supervisedRun.includes("artifact.preview.stop"), false, "supervised task never executes an unapproved explicit command");
   } finally {
     fs.rmSync(supervised.root, { recursive: true, force: true });
+  }
+});
+
+test("continuous KV session replays prior steps verbatim and delta-slices history", async () => {
+  // Each step's request/response is recorded as a chat turn so the next
+  // rendered prompt is a strict token-prefix extension of the server's
+  // committed prompt cache — only the trailing delta prefills.
+  const prompts = [];
+  const harness = makeHarness({
+    commandRegistry: { "repo-map": { capability: "read" }, "repo.inspect": { capability: "read" }, "git.status": { capability: "read" } },
+    inferAction: async (prompt) => {
+      prompts.push(prompt);
+      const step = prompts.length;
+      const content = JSON.stringify({ kind: "tool", commandId: ["repo-map", "repo.inspect", "git.status"][step - 1], input: {} });
+      return { content, requestContent: `request-${step}`, cachedTokens: 10, reasoning: "" };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "repo-map", label: "Map" }, { commandId: "repo.inspect", label: "Inspect" }, { commandId: "git.status", label: "Status" }],
+    }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(prompts.length, 3, "one model turn per planned step");
+    assert.equal(prompts[0].sessionTurns.length, 0, "first step starts cold");
+    assert.deepEqual(
+      prompts[1].sessionTurns.map((turn) => turn.role),
+      ["user", "assistant"],
+      "second step replays step one's exchange verbatim",
+    );
+    assert.equal(prompts[1].sessionTurns[0].content, "request-1");
+    assert.ok(prompts[1].sessionTurns[1].content.startsWith("<think>\n"), "reasoning-free output replays inside the forced think block");
+    assert.equal(prompts[2].sessionTurns.length, 4, "transcript accumulates two turns per step");
+    // Delta mode: the session transcript already carries older history, so the
+    // fresh user turn only re-states the freshest entries.
+    assert.equal(prompts[2].history.actions.length, 1, "delta turn carries only the newest action");
+    assert.equal(prompts[0].history.actions.length, 0);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("scored session commits replay as an assistant turn across steps", async () => {
+  const { buildScoreCandidates, SCORED_REASONING_PREFIX } = require("./agent_contracts.cjs");
+  const candidates = buildScoreCandidates(["repo-map", "repo.inspect"]);
+  const winners = [
+    candidates.findIndex((c) => c.commandId === "repo-map" && c.complete),
+    candidates.findIndex((c) => c.commandId === "repo.inspect" && c.complete),
+  ];
+  const prompts = [];
+  const harness = makeHarness({
+    inferAction: async () => { throw new Error("generative path should not run"); },
+    scoreActions: async (prompt, texts) => {
+      prompts.push(prompt);
+      const winnerIndex = winners[prompts.length - 1];
+      return {
+        candidates: texts.map((text, index) => ({
+          index, text,
+          logprob: index === winnerIndex ? -5 : -40,
+          avgLogprob: index === winnerIndex ? -0.5 : -4,
+          tokens: 20,
+        })),
+        promptTokens: 100,
+        cachedTokens: prompts.length === 1 ? 0 : 60,
+        committedIndex: winnerIndex,
+        committedText: texts[winnerIndex],
+        requestContent: `score-req-${prompts.length}`,
+      };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "repo-map", label: "Map" }, { commandId: "repo.inspect", label: "Inspect" }],
+    }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(prompts.length, 2, "both steps decided by scoring alone");
+    const replay = prompts[1].sessionTurns;
+    assert.equal(replay.length, 2);
+    assert.equal(replay[0].role, "user");
+    assert.equal(replay[0].content, "score-req-1");
+    assert.equal(replay[1].role, "assistant");
+    assert.equal(replay[1].reasoning_content, SCORED_REASONING_PREFIX, "replay matches the /v1/score suffix prefix");
+    assert.equal(replay[1].content, candidates[winners[0]].text, "committed winner replays verbatim");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+function decidePayloadFor(cands, winnerIndex, confidence = 0.9) {
+  const rest = Math.max(cands.length - 1, 1);
+  const probabilities = Object.fromEntries(cands.map((candidate, index) => [`cand-${index}`, index === winnerIndex ? 0.7 : 0.3 / rest]));
+  return {
+    schema: "hemlock.decide.v1",
+    answers: { "next-action": { type: "choice", choice: `cand-${winnerIndex}`, confidence, probabilities } },
+    committedQuestion: "next-action",
+    committedKey: `cand-${winnerIndex}`,
+    committedText: cands[winnerIndex]?.text,
+    usage: { promptTokens: 100, cachedTokens: 80 },
+  };
+}
+
+test("decide-choice maps a complete winner and records probability telemetry", async () => {
+  let generated = 0;
+  let scoreCalls = 0;
+  let decideCalls = 0;
+  const harness = makeHarness({
+    inferAction: async () => { generated += 1; return JSON.stringify({ kind: "tool", commandId: "repo.inspect", input: {} }); },
+    scoreActions: {
+      decide: async (_prompt, cands) => {
+        decideCalls += 1;
+        assert.ok(cands.every((candidate) => typeof candidate === "object" && typeof candidate.text === "string"), "decide receives full candidate objects");
+        const winnerIndex = cands.findIndex((candidate) => candidate.commandId === "repo-map" && candidate.complete);
+        return decidePayloadFor(cands, winnerIndex, 0.9);
+      },
+      score: async () => { scoreCalls += 1; return null; },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(decideCalls, 1);
+    assert.equal(scoreCalls, 0, "a decide decision never falls back to per-candidate scoring");
+    assert.equal(generated, 0, "complete decide winner executes with zero generated tokens");
+    const scored = harness.events.find((event) => event.type === "action.scored");
+    assert.equal(scored.payload.mode, "decide");
+    assert.equal(scored.payload.winner.commandId, "repo-map");
+    assert.equal(scored.payload.complete, true);
+    assert.equal(scored.payload.probability, 0.7);
+    assert.equal(scored.payload.confidence, 0.9);
+    assert.ok(scored.payload.margin > 0, "margin is p1 − p2");
+    assert.equal(scored.payload.indecisive, false);
+    const action = harness.kernel.getProjection().actions.find((item) => item.kind === "tool");
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.status, "completed");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a low-confidence decide winner falls through to the generative path", async () => {
+  let generated = 0;
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      generated += 1;
+      assert.equal(prompt.progress?.scoredDecision?.commandId, "repo-map", "indecisive decision is recorded for the fill-in");
+      assert.equal(prompt.progress?.scoredDecision?.indecisive, true);
+      return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} });
+    },
+    scoreActions: {
+      decide: async (_prompt, cands) => decidePayloadFor(cands, cands.findIndex((candidate) => candidate.commandId === "repo-map" && candidate.complete), 0.2),
+      score: async () => { throw new Error("score must not run when decide answered"); },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(generated, 1, "confidence < 0.35 does not take a zero-token complete winner");
+    const scored = harness.events.find((event) => event.type === "action.scored");
+    assert.equal(scored.payload.mode, "decide");
+    assert.equal(scored.payload.indecisive, true);
+    assert.equal(scored.payload.confidence, 0.2);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a missing decide endpoint falls back to the /v1/score path", async () => {
+  let decideCalls = 0;
+  let scoreCalls = 0;
+  let generated = 0;
+  const harness = makeHarness({
+    inferAction: async () => { generated += 1; return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} }); },
+    scoreActions: {
+      // main.cjs returns null on a 404 and marks the endpoint unsupported.
+      decide: async () => { decideCalls += 1; return null; },
+      score: async (_prompt, texts) => {
+        scoreCalls += 1;
+        const winnerIndex = texts.findIndex((text) => { try { return JSON.parse(text).commandId === "repo-map"; } catch { return false; } });
+        return {
+          candidates: texts.map((text, index) => ({ index, text, logprob: index === winnerIndex ? -5 : -40, avgLogprob: index === winnerIndex ? -0.5 : -4, tokens: 20 })),
+          promptTokens: 100,
+          cachedTokens: 80,
+        };
+      },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(decideCalls, 1);
+    assert.equal(scoreCalls, 1, "decide returning null falls back to scoring");
+    assert.equal(generated, 0);
+    const scored = harness.events.find((event) => event.type === "action.scored" && event.status === "passed");
+    assert.equal(scored.payload.mode, "score");
+    assert.equal(scored.payload.winner.commandId, "repo-map");
+    assert.equal(scored.payload.avgLogprob, -0.5, "score path keeps avgLogprob telemetry");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a decide transport error still falls back to the /v1/score path", async () => {
+  let scoreCalls = 0;
+  const harness = makeHarness({
+    inferAction: async () => { throw new Error("generative path should not run"); },
+    scoreActions: {
+      decide: async () => { throw new Error("decide exploded"); },
+      score: async (_prompt, texts) => {
+        scoreCalls += 1;
+        const winnerIndex = texts.findIndex((text) => { try { return JSON.parse(text).commandId === "repo-map"; } catch { return false; } });
+        return { candidates: texts.map((text, index) => ({ index, text, logprob: index === winnerIndex ? -5 : -40, avgLogprob: index === winnerIndex ? -0.5 : -4, tokens: 20 })) };
+      },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(scoreCalls, 1);
+    const degraded = harness.events.find((event) => event.type === "action.scored" && event.status === "degraded" && event.payload?.mode === "decide");
+    assert.ok(degraded, "the decide failure is recorded, not hidden");
+    assert.equal(harness.events.find((event) => event.type === "action.scored" && event.status === "passed")?.payload?.mode, "score");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a bare scoreActions function stays score-only (legacy dep shape)", async () => {
+  let scoreCalls = 0;
+  const harness = makeHarness({
+    inferAction: async () => { throw new Error("generative path should not run"); },
+    scoreActions: async (_prompt, texts) => {
+      scoreCalls += 1;
+      const winnerIndex = texts.findIndex((text) => { try { return JSON.parse(text).commandId === "repo-map"; } catch { return false; } });
+      return { candidates: texts.map((text, index) => ({ index, text, logprob: index === winnerIndex ? -5 : -40, avgLogprob: index === winnerIndex ? -0.5 : -4, tokens: 20 })) };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(scoreCalls, 1);
+    assert.equal(harness.orchestrator.scoreActions.decide, undefined);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// Wiring guard (main.cjs has no test export seam — same pattern as
+// maple_notify.test.cjs): the decide transport, its env/404 kill-switches,
+// the {decide, score} injection, and the memory.select rerank receipt.
+test("main.cjs wires /v1/decide with score fallback and the memory rerank", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "main.cjs"), "utf8");
+  assert.match(source, /async function decideStructuredAction\(prompt, candidates\)/);
+  assert.match(source, /`\$\{endpoint\}\/v1\/decide`/);
+  assert.match(source, /let decideEndpointUnsupported = false/);
+  assert.match(source, /process\.env\.HEMLOCK_NO_DECIDE !== "1"/, "HEMLOCK_NO_DECIDE=1 disables the decide path");
+  assert.match(source, /decideEndpointUnsupported = true/, "a 404 marks decide unsupported for the session");
+  assert.match(source, /scoreActions:\s*\{\s*decide:\s*decideStructuredAction,\s*score:\s*scoreStructuredAction\s*\}/);
+  assert.match(source, /commitQuestion:\s*"next-action"/);
+  assert.match(source, /decideRerankMemoryRecords\(heuristicRecords\.slice\(0, MEMORY_RERANK_LIMIT\)/);
+  assert.match(source, /decideRanked: true/, "the reorder is receipted on the memory.select event");
+});
+
+test("a batch envelope executes each item through the normal action path with its own receipt", async () => {
+  let inferCalls = 0;
+  const commands = [];
+  const harness = makeHarness({
+    inferAction: async () => {
+      inferCalls += 1;
+      return JSON.stringify({ actions: [{ command: "repo-map", input: {} }, { command: "repo.inspect", input: {} }] });
+    },
+    executeCommand: async (command) => {
+      commands.push(command);
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }, { commandId: "repo.inspect", label: "Inspect repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(inferCalls, 1, "one inference produced the whole batch");
+    assert.deepEqual(commands, ["repo-map", "repo.inspect"], "items ran in order");
+    const actions = harness.kernel.getProjection().actions;
+    assert.equal(actions.filter((item) => item.kind === "batch").length, 0, "the batch container stays ephemeral");
+    const items = actions.filter((item) => item.kind === "tool");
+    assert.equal(items.length, 2);
+    assert.ok(items.every((item) => item.batchId && item.batchSize === 2 && item.status === "completed"));
+    assert.deepEqual(items.map((item) => item.batchIndex), [0, 1]);
+    assert.equal(harness.kernel.getProjection().observations.length, 2, "each item produced its own observation");
+    assert.equal(harness.events.filter((event) => event.type === "action.proposed" && event.payload?.action?.batchId).length, 2);
+    assert.ok(items.every((item) => harness.events.some((event) => event.type === "action.completed" && event.payload?.actionId === item.id)), "each item earned a normal completion receipt");
+    assert.equal(harness.events.some((event) => event.type === "batch.halted"), false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a batch halts on the first failure with a batch.halted receipt and never runs later items", async () => {
+  const commands = [];
+  const harness = makeHarness({
+    inferAction: async () => JSON.stringify({ actions: [{ command: "repo-map" }, { command: "repo.inspect" }, { command: "repo-map" }] }),
+    executeCommand: async (command) => {
+      commands.push(command);
+      if (command === "repo.inspect") return { status: "blocked", summary: "inspection refused" };
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }, { commandId: "repo.inspect", label: "Inspect repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "blocked");
+    assert.deepEqual(commands, ["repo-map", "repo.inspect"], "the third item never ran");
+    const halted = harness.events.find((event) => event.type === "batch.halted");
+    assert.ok(halted, "batch.halted receipt emitted");
+    assert.equal(halted.payload.completedCount, 1);
+    assert.equal(halted.payload.failedIndex, 1);
+    assert.equal(halted.payload.reason, "blocked");
+    const actions = harness.kernel.getProjection().actions;
+    assert.equal(actions.length, 2, "only attempted items are durable");
+    assert.equal(actions[0].status, "completed");
+    assert.equal(actions[1].status, "blocked");
+    // Prior mutations stay journaled — no automatic rollback of item 0.
+    assert.equal(harness.kernel.getProjection().observations.length, 2);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("each batch item consumes the mutation-set budget independently", async () => {
+  const commands = [];
+  const harness = makeHarness({
+    commandRegistry: {
+      "file.read": { capability: "read" },
+      "code.apply": { capability: "write", approval: "plan" },
+    },
+    inferAction: async () => JSON.stringify({ actions: [{ command: "file.read" }, { command: "code.apply" }, { command: "code.apply" }] }),
+    executeCommand: async (command) => {
+      commands.push(command);
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [
+        { commandId: "file.read", label: "Read a file" },
+        { commandId: "code.apply", label: "Apply the change", approval: "plan" },
+      ],
+    }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "blocked");
+    assert.deepEqual(commands, ["file.read", "code.apply"], "the second mutation never ran — the set was already consumed");
+    assert.equal(harness.task.budget.mutationSetsUsed, 1);
+    const halted = harness.events.find((event) => event.type === "batch.halted");
+    assert.equal(halted.payload.completedCount, 2);
+    assert.equal(halted.payload.failedIndex, 2);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling mid-batch prevents later items from running", async () => {
+  const commands = [];
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const harness = makeHarness({
+    inferAction: async () => JSON.stringify({ actions: [{ command: "repo-map" }, { command: "repo.inspect" }] }),
+    executeCommand: async (command) => {
+      commands.push(command);
+      if (command === "repo-map") return pending;
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }, { commandId: "repo.inspect", label: "Inspect repo" }] }).plan;
+    const running = harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    harness.orchestrator.cancel(harness.task.id);
+    release({ status: "passed", summary: "late", evidenceRefs: ["receipt://late"] });
+    const result = await running;
+    assert.equal(result.status, "cancelled");
+    assert.deepEqual(commands, ["repo-map"], "the second batch item never ran");
+    const halted = harness.events.find((event) => event.type === "batch.halted");
+    assert.ok(halted);
+    assert.equal(halted.status, "cancelled");
+    assert.equal(halted.payload.completedCount, 0);
+    assert.equal(halted.payload.failedIndex, 0);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("pausing mid-batch lets the in-flight item finish and parks before the next", async () => {
+  const commands = [];
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const harness = makeHarness({
+    inferAction: async () => JSON.stringify({ actions: [{ command: "repo-map" }, { command: "repo.inspect" }] }),
+    executeCommand: async (command) => {
+      commands.push(command);
+      if (command === "repo-map") return pending;
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }, { commandId: "repo.inspect", label: "Inspect repo" }] }).plan;
+    const running = harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    harness.orchestrator.pauseTask(harness.task.id);
+    release({ status: "passed", summary: "done", evidenceRefs: ["receipt://repo-map"] });
+    const result = await running;
+    assert.equal(result.status, "paused");
+    assert.deepEqual(commands, ["repo-map"], "the in-flight item finished; the next one parked");
+    const halted = harness.events.find((event) => event.type === "batch.halted");
+    assert.ok(halted);
+    assert.equal(halted.status, "paused");
+    assert.equal(halted.payload.completedCount, 1);
+    assert.equal(halted.payload.failedIndex, 1);
+    assert.equal(halted.payload.reason, "paused");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a single candidate skips /v1/decide and /v1/score and receipts the skip honestly", async () => {
+  let decideCalls = 0;
+  let scoreCalls = 0;
+  let generated = 0;
+  const commands = [];
+  const harness = makeHarness({
+    inferAction: async () => { generated += 1; throw new Error("no generative inference expected for a complete single candidate"); },
+    buildCandidates: () => [{ text: '{"kind":"tool","commandId":"repo-map","input":{},"shortRationale":"Map the repo."}', kind: "tool", commandId: "repo-map", input: {}, complete: true }],
+    scoreActions: {
+      decide: async () => { decideCalls += 1; return null; },
+      score: async () => { scoreCalls += 1; return null; },
+    },
+    executeCommand: async (command) => {
+      commands.push(command);
+      return { status: "passed", summary: `${command} passed`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(decideCalls, 0, "decide skipped — there is nothing to rank");
+    assert.equal(scoreCalls, 0, "score skipped — there is nothing to rank");
+    assert.equal(generated, 0, "the complete candidate needs no fill-in either");
+    assert.deepEqual(commands, ["repo-map"]);
+    const scored = harness.events.find((event) => event.type === "action.scored");
+    assert.equal(scored.payload.mode, "single-candidate");
+    assert.equal(scored.payload.skipped, true);
+    assert.equal(scored.payload.reason, "single-candidate");
+    assert.equal(scored.payload.winner.commandId, "repo-map");
+    assert.equal(scored.payload.candidateCount, 1);
+    const action = harness.kernel.getProjection().actions.find((item) => item.kind === "tool");
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.status, "completed");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("action proposals carry the forced JSON assistant prefix on the prompt, plus an options arg when the transport declares one", async () => {
+  const seen = [];
+  async function inferWithOptions(prompt, options) {
+    seen.push({ prompt, options });
+    return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} });
+  }
+  const harness = makeHarness({ inferAction: inferWithOptions });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.ok(seen.length >= 1);
+    assert.ok(seen.every((call) => call.options?.assistantPrefix === '{"command":'), "every structured proposal gets the options argument");
+    assert.ok(seen.every((call) => call.prompt?.assistantPrefix === '{"command":'), "and the prompt field the live transport forwards as assistant_prefix");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+
+  const calls = [];
+  const oneArg = makeHarness({
+    inferAction: async (...args) => {
+      calls.push(args);
+      return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} });
+    },
+  });
+  try {
+    const plan = oneArg.orchestrator.proposePlan(oneArg.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await oneArg.orchestrator.approvePlan(oneArg.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.ok(calls.length >= 1);
+    assert.ok(calls.every((args) => args.length === 1), "a single-parameter transport is never handed the options argument");
+    assert.ok(calls.every((args) => args[0]?.assistantPrefix === '{"command":'), "the prompt field still carries the prefix — inferStructuredAction forwards it");
+  } finally {
+    fs.rmSync(oneArg.root, { recursive: true, force: true });
+  }
+});
+
+test("a decide winner the host overrides is receipted as action.scored.divergence, and the fill-in names the executing step", async () => {
+  // Observed failure: /v1/decide returned {"kind":"blocked"} at p 0.83–0.99
+  // while the host correctly executed the planned step — but the fill-in
+  // prompt said "continue the scored command choice", so the model parroted
+  // "Blocked due to insufficient evidence" and once emitted a literal
+  // {"kind":"blocked"} that killed the task in one step.
+  const { buildScoreCandidates } = require("./agent_contracts.cjs");
+  const candidates = buildScoreCandidates(["repo-map", "repo.inspect"]);
+  const blockedIndex = candidates.findIndex((candidate) => candidate.kind === "blocked");
+  let fillInContent = null;
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      fillInContent = prompt.sessionUserContent;
+      return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {}, shortRationale: "Map the repo." });
+    },
+    scoreActions: {
+      decide: async (_prompt, cands) => decidePayloadFor(cands, blockedIndex, 0.9),
+      score: async () => null,
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed", "the ignored blocked winner must not kill the task");
+    const divergence = harness.events.find((event) => event.type === "action.scored.divergence");
+    assert.ok(divergence, "executed ≠ decided is receipted");
+    assert.equal(divergence.payload.decidedKind, "blocked");
+    assert.equal(divergence.payload.executedKind, "tool");
+    assert.equal(divergence.payload.executedCommandId, "repo-map");
+    assert.equal(divergence.payload.mode, "decide");
+    assert.equal(divergence.payload.probability, 0.7);
+    assert.equal(divergence.payload.confidence, 0.9);
+    assert.ok(typeof divergence.payload.margin === "number");
+    // The fill-in prompt names the ACTUAL executing action, not the winner.
+    const fillIn = JSON.parse(fillInContent);
+    assert.equal(fillIn.executingAction.commandId, "repo-map");
+    assert.match(fillIn.instruction, /repo-map/);
+    assert.doesNotMatch(fillIn.instruction, /continuing the scored/i);
+    const action = harness.kernel.getProjection().actions.find((item) => item.kind === "tool");
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.status, "completed");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("no divergence event when the executed action is the decided winner", async () => {
+  const { buildScoreCandidates } = require("./agent_contracts.cjs");
+  const candidates = buildScoreCandidates(["repo-map"]);
+  const winnerIndex = candidates.findIndex((candidate) => candidate.commandId === "repo-map" && candidate.complete);
+  const harness = makeHarness({
+    inferAction: async () => { throw new Error("generative path should not run"); },
+    scoreActions: {
+      decide: async (_prompt, cands) => decidePayloadFor(cands, winnerIndex, 0.9),
+      score: async () => null,
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(harness.events.some((event) => event.type === "action.scored.divergence"), false, "decided = executed is not a divergence");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("an empty compact-choice input is filled from the executed plan step's input", async () => {
+  // Observed failure evt-1789959126534: {"commandId":"improve.propose","input":{}}
+  // passed envelope validation then died on deterministic-input validation —
+  // the plan step's own input was never consulted.
+  const payloads = [];
+  const harness = makeHarness({
+    commandRegistry: { "improve.propose": { capability: "write", inputHint: '{summary, rationale, files?:["repo-relative"]}' } },
+    inferAction: async () => JSON.stringify({ kind: "tool", commandId: "improve.propose", input: {} }),
+    executeCommand: async (command, payload) => {
+      payloads.push({ command, payload });
+      if (!payload?.summary) throw new Error("improve.propose needs a summary of the bounded change.");
+      return { status: "passed", summary: "proposed", evidenceRefs: ["receipt://proposed-improvement"] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "improve.propose", label: "Propose the bounded fix", input: { summary: "bounded fix", rationale: "from receipts" } }],
+    }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].payload.summary, "bounded fix", "the plan step's input fills the empty compact input");
+    assert.equal(payloads[0].payload.rationale, "from receipts");
+    const action = harness.kernel.getProjection().actions.find((item) => item.kind === "tool");
+    assert.equal(action.input.summary, "bounded fix");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a deterministic-input failure gets exactly one corrective re-inference before blocking", async () => {
+  const payloads = [];
+  const repairPrompts = [];
+  let calls = 0;
+  const harness = makeHarness({
+    commandRegistry: { "improve.propose": { capability: "write", inputHint: '{summary, rationale, files?:["repo-relative"]}' } },
+    inferAction: async (prompt) => {
+      calls += 1;
+      if (prompt.repair?.schema === "hemlock.agent.input.repair.v1") {
+        repairPrompts.push(prompt.repair);
+        return JSON.stringify({ kind: "tool", commandId: "improve.propose", input: { summary: "bounded fix", rationale: "from receipts" } });
+      }
+      return JSON.stringify({ kind: "tool", commandId: "improve.propose", input: {} });
+    },
+    executeCommand: async (command, payload) => {
+      payloads.push(payload);
+      if (!payload?.summary || !payload?.rationale) throw new Error("improve.propose needs a summary of the bounded change.");
+      return { status: "passed", summary: "proposed", evidenceRefs: ["receipt://proposed-improvement"] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "improve.propose", label: "Propose the bounded fix" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed", "a missing required arg is not an instant terminal block");
+    assert.equal(payloads.length, 2, "the original call plus exactly one repaired retry");
+    assert.equal(payloads[1].summary, "bounded fix");
+    assert.equal(payloads[1].rationale, "from receipts");
+    assert.equal(repairPrompts.length, 1);
+    assert.deepEqual(repairPrompts[0].requiredFields, ["summary", "rationale"], "the repair prompt echoes the required-arg schema");
+    assert.match(repairPrompts[0].inputHint, /summary/);
+    const repaired = harness.events.find((event) => event.type === "action.input.repaired");
+    assert.ok(repaired, "the input repair is receipted");
+    assert.deepEqual(repaired.payload.requiredFields, ["summary", "rationale"]);
+    const actions = harness.kernel.getProjection().actions.filter((item) => item.commandId === "improve.propose");
+    assert.equal(actions.length, 2, "the failed attempt and the repaired retry are both durable");
+    assert.equal(actions[1].inputRepairsUsed, 1);
+    assert.equal(actions[1].status, "completed");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("the input repair is one-shot: a second deterministic-input failure blocks honestly", async () => {
+  const harness = makeHarness({
+    commandRegistry: { "improve.propose": { capability: "write", inputHint: "{summary, rationale}" } },
+    inferAction: async (prompt) => prompt.repair?.schema === "hemlock.agent.input.repair.v1"
+      ? JSON.stringify({ kind: "tool", commandId: "improve.propose", input: { summary: "still missing rationale" } })
+      : JSON.stringify({ kind: "tool", commandId: "improve.propose", input: {} }),
+    executeCommand: async () => { throw new Error("improve.propose needs a rationale grounded in local evidence."); },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "improve.propose", label: "Propose" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "blocked");
+    assert.equal(harness.events.filter((event) => event.type === "action.input.repaired").length, 1, "exactly one input repair attempt");
+    assert.equal(harness.events.some((event) => event.type === "task.blocked"), true);
+    const actions = harness.kernel.getProjection().actions.filter((item) => item.commandId === "improve.propose");
+    assert.equal(actions.length, 2, "no unbounded repair loop");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("plan.revise rewrites the remaining steps inside the capability boundary and receipts a diff", async () => {
+  const commands = [];
+  const harness = makeHarness({
+    commandRegistry: {
+      "repo-map": { capability: "read" },
+      "repo.inspect": { capability: "read" },
+      "git.status": { capability: "read", auto: true },
+    },
+    executeCommand: async (command) => {
+      commands.push(command);
+      if (command === "repo-map") return { status: "blocked", summary: "map unavailable" };
+      return { status: "passed", summary: `${command} ok`, evidenceRefs: [`receipt://${command}`] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "repo-map", label: "Map" }, { commandId: "repo.inspect", label: "Inspect" }],
+    }).plan;
+    const blocked = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(blocked.status, "blocked");
+    const revised = harness.orchestrator.revisePlan(harness.task.id, {
+      steps: [{ commandId: "git.status", label: "Check worktree scope instead" }, { kind: "answer", label: "Answer from the worktree state" }],
+      rationale: "repo-map failed; use the git surface",
+    });
+    assert.equal(revised.status, "revised");
+    assert.equal(revised.diff.keptCount, 1, "the executed prefix is immutable");
+    assert.deepEqual(revised.diff.removed.map((step) => step.commandId), ["repo.inspect"]);
+    assert.deepEqual(revised.diff.added.map((step) => step.commandId), ["git.status", null]);
+    const stored = harness.kernel.getProjection().plans.find((item) => item.id === plan.id);
+    assert.deepEqual(stored.steps.map((step) => step.commandId), ["repo-map", "git.status", null]);
+    assert.equal(stored.steps[1].status, "ready");
+    assert.equal(stored.revisions.length, 1);
+    const event = harness.events.find((entry) => entry.type === "plan.revised");
+    assert.ok(event, "plan.revised is emitted with the step diff");
+    assert.equal(event.payload.rationale, "repo-map failed; use the git surface");
+    const resumed = await harness.orchestrator.resumeTask(harness.task.id);
+    assert.equal(resumed.status, "completed");
+    assert.deepEqual(commands, ["repo-map", "git.status"], "the revised step is what executes");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("plan.revise rejects unknown or out-of-boundary commands and keeps the plan", async () => {
+  const harness = makeHarness({
+    commandRegistry: {
+      "repo-map": { capability: "read" },
+      "repo.inspect": { capability: "read" },
+      dream: { capability: "train", approval: "explicit" },
+    },
+    executeCommand: async (command) => ({ status: "blocked", summary: `${command} blocked` }),
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "repo-map", label: "Map" }, { commandId: "repo.inspect", label: "Inspect" }],
+    }).plan;
+    await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(harness.task.status, "blocked");
+    const rejected = harness.orchestrator.revisePlan(harness.task.id, { steps: [{ commandId: "shell.exec", label: "invented" }] });
+    assert.equal(rejected.status, "rejected");
+    assert.match(rejected.reason, /unknown commandId/i);
+    const outOfBoundary = harness.orchestrator.revisePlan(harness.task.id, { steps: [{ commandId: "dream", label: "train" }] });
+    assert.equal(outOfBoundary.status, "rejected");
+    assert.match(outOfBoundary.reason, /capability boundary/i);
+    const stored = harness.kernel.getProjection().plans.find((item) => item.id === plan.id);
+    assert.deepEqual(stored.steps.map((step) => step.commandId), ["repo-map", "repo.inspect"], "the plan is unchanged");
+    assert.equal(harness.events.filter((event) => event.type === "plan.revision.rejected").length, 2);
+    assert.equal(harness.events.some((event) => event.type === "plan.revised"), false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("mid-loop steering is delivered on the next action step and marked delivered", async () => {
+  const prompts = [];
+  const harness = makeHarness({
+    commandRegistry: { "repo-map": { capability: "read" }, "repo.inspect": { capability: "read" } },
+    inferAction: async (prompt) => {
+      prompts.push(prompt);
+      const step = prompts.length;
+      return JSON.stringify({ kind: "tool", commandId: ["repo-map", "repo.inspect"][step - 1], input: {} });
+    },
+  });
+  try {
+    harness.orchestrator.updateTask({ steering: [{ id: "steer-1", content: "Prefer the git surface", source: "test", status: "accepted" }] });
+    const plan = harness.orchestrator.proposePlan(harness.task, {
+      steps: [{ commandId: "repo-map", label: "Map" }, { commandId: "repo.inspect", label: "Inspect" }],
+    }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(prompts.length, 2);
+    assert.equal(prompts[0].task.steering[0].status, "accepted", "the pending item reaches the step prompt");
+    assert.equal(prompts[1].task.steering[0].status, "delivered", "delivered steering does not ride later prompts as pending");
+    const delivered = harness.events.find((event) => event.type === "task.steering.delivered");
+    assert.ok(delivered, "delivery is receipted");
+    assert.deepEqual(delivered.payload.steeringIds, ["steer-1"]);
+    assert.equal(harness.task.steering[0].status, "delivered");
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+// Wiring guard: the three structured-action transports must only send
+// PENDING steering (status !== "delivered") so a delivered item is cleared
+// from later step prompts.
+test("main.cjs action transports send pending-only steering, cleared on delivery", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "main.cjs"), "utf8");
+  const matches = source.match(/status !== "delivered"/g) || [];
+  assert.ok(matches.length >= 3, "infer/score/decide compactTask.steering all filter delivered items");
+});
+
+// defaultPlanSteps reachability: the newest registry commands must be
+// plannable, not just adaptive-selectable. Explicit-only lifecycle commands
+// (conversation.trim, thread mutations) intentionally stay out of defaults.
+test("defaultPlanSteps wires the newer registered commands into reachable plans", () => {
+  const { defaultPlanSteps } = require("./agent_orchestrator.cjs");
+  const ids = (intent, objective) => defaultPlanSteps(intent, objective).map((step) => step.commandId || step.kind);
+  assert.ok(ids("memory").includes("memory.note"), "memory plan can record a note");
+  assert.ok(ids("memory").includes("memory.list"), "memory plan still lists records first");
+  assert.ok(ids("experiment").includes("world.state"), "experiment plan reads the world first");
+  assert.ok(ids("experiment").includes("experiment.suggest"));
+  assert.ok(ids("improve").includes("dream.dataset.preview"), "improve plan previews the dataset before proposing");
+  assert.ok(ids("improve").includes("improve.propose"));
+  assert.ok(ids("other-unmapped-intent").includes("agent.capabilities"), "the fallback plan surfaces the command map");
+  assert.deepEqual(ids("conversation"), ["answer"], "conversation stays answer-only");
+  assert.ok(!ids("memory").includes("conversation.trim"), "explicit-only trim is never a default step");
+});
+
+test("a near-tie decide winner falls through to the generative path despite high confidence", async () => {
+  // Calibration fix: confidence alone admitted over-confident picks (a ~0.9
+  // `blocked` winner once argued against the approved plan). The winner must
+  // also clear a minimum top1-top2 probability margin.
+  let generated = 0;
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      generated += 1;
+      assert.equal(prompt.progress?.scoredDecision?.indecisive, true, "the fill-in sees the indecisive flag");
+      return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} });
+    },
+    scoreActions: {
+      decide: async (_prompt, cands) => {
+        const winnerIndex = cands.findIndex((candidate) => candidate.commandId === "repo-map" && candidate.complete);
+        const runnerUpIndex = cands.findIndex((candidate, index) => index !== winnerIndex);
+        const probabilities = Object.fromEntries(cands.map((candidate, index) => [`cand-${index}`,
+          index === winnerIndex ? 0.4 : index === runnerUpIndex ? 0.36 : 0.24 / Math.max(cands.length - 2, 1)]));
+        return {
+          schema: "hemlock.decide.v1",
+          answers: { "next-action": { type: "choice", choice: `cand-${winnerIndex}`, confidence: 0.9, probabilities } },
+          committedQuestion: "next-action",
+          committedKey: `cand-${winnerIndex}`,
+          committedText: cands[winnerIndex]?.text,
+        };
+      },
+      score: async () => { throw new Error("score must not run when decide answered"); },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(generated, 1, "a 0.04 margin does not take the zero-token winner");
+    const scored = harness.events.find((event) => event.type === "action.scored");
+    assert.equal(scored.payload.mode, "decide");
+    assert.equal(scored.payload.indecisive, true);
+    assert.equal(scored.payload.confidence, 0.9);
+    assert.ok(scored.payload.margin < 0.1);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a clear-margin decide winner still executes with zero generated tokens", async () => {
+  let generated = 0;
+  const harness = makeHarness({
+    inferAction: async () => { generated += 1; return JSON.stringify({ kind: "tool", commandId: "repo.inspect", input: {} }); },
+    scoreActions: {
+      decide: async (_prompt, cands) => decidePayloadFor(cands, cands.findIndex((candidate) => candidate.commandId === "repo-map" && candidate.complete), 0.9),
+      score: async () => { throw new Error("score must not run when decide answered"); },
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(generated, 0, "margin >= 0.1 keeps the zero-token fast path");
+    assert.equal(harness.events.find((event) => event.type === "action.scored")?.payload?.indecisive, false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a budget-exhausted command failure blocks without spending the input repair", async () => {
+  // classifyFailure used to bucket every unmatched failure as
+  // deterministic-input, so a spent budget burned the one input-repair
+  // inference before blocking anyway.
+  let repairCalls = 0;
+  const harness = makeHarness({
+    inferAction: async (prompt) => {
+      if (prompt.repair?.schema === "hemlock.agent.input.repair.v1") repairCalls += 1;
+      return JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} });
+    },
+    executeCommand: async () => {
+      const error = new Error("Hemlock command budget exhausted (12/12).");
+      error.code = "COMMAND_BUDGET_EXHAUSTED";
+      throw error;
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "blocked");
+    assert.equal(repairCalls, 0, "no input-repair inference ran");
+    assert.equal(harness.events.some((event) => event.type === "action.input.repaired"), false);
+    assert.match(harness.task.blockedReason, /^budget-exhausted:/);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("rejoins a structured action split across content and reasoning channels", async () => {
+  // Observed Maple outputs: content carried `{"command":` while the JSON tail
+  // (`"repo-map","input":{}}`) landed in the reasoning channel — a PARSE_FAIL.
+  // Rejoin once instead of spending a repair inference.
+  let calls = 0;
+  const harness = makeHarness({
+    inferAction: async () => {
+      calls += 1;
+      return { content: '{"command":', reasoning: '"repo-map","input":{}}', channels: [{ name: "content", text: '{"command":' }, { name: "reasoning", text: '"repo-map","input":{}}' }] };
+    },
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    assert.equal(calls, 1, "the salvage avoids a repair inference");
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(action.parseStatus, "channel-rejoined");
+    assert.equal(harness.events.some((event) => event.type === "action.channel.rejoined"), true);
+    assert.equal(harness.events.some((event) => event.type === "action.parse.failed"), false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("a genuine reasoning channel never contaminates the parsed action", async () => {
+  // The salvage only fires when content alone fails to parse AND the rejoined
+  // text validates — normal reasoning must not reach the envelope.
+  const harness = makeHarness({
+    inferAction: async () => ({
+      content: JSON.stringify({ kind: "tool", commandId: "repo-map", input: {} }),
+      reasoning: "I considered repo.inspect but repo-map is the planned step.",
+      channels: [{ name: "reasoning", text: "reasoning text" }],
+    }),
+  });
+  try {
+    const plan = harness.orchestrator.proposePlan(harness.task, { steps: [{ commandId: "repo-map", label: "Map repo" }] }).plan;
+    const result = await harness.orchestrator.approvePlan(harness.task.id, plan.id);
+    assert.equal(result.status, "completed");
+    const action = harness.kernel.getProjection().actions[0];
+    assert.equal(action.commandId, "repo-map");
+    assert.equal(harness.events.some((event) => event.type === "action.channel.rejoined"), false);
+  } finally {
+    fs.rmSync(harness.root, { recursive: true, force: true });
   }
 });

@@ -7,6 +7,7 @@ export const CASCADE_STEP = 24;
 export const WINDOW_DEFINITIONS = {
   center: { label: "Command Center", preferred: { width: 1180, height: 650 }, minimum: { width: 720, height: 500 } },
   chat: { label: "Chat / Code", preferred: { width: 880, height: 640 }, minimum: { width: 520, height: 480 } },
+  threads: { label: "Threads", preferred: { width: 900, height: 580 }, minimum: { width: 560, height: 400 } },
   artifact: { label: "Artifact Studio", preferred: { width: 860, height: 600 }, minimum: { width: 560, height: 400 } },
   activity: { label: "Activity", preferred: { width: 640, height: 440 }, minimum: { width: 460, height: 280 } },
   receipts: { label: "Receipts", preferred: { width: 640, height: 440 }, minimum: { width: 460, height: 280 } },

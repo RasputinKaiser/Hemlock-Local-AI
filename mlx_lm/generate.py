@@ -313,7 +313,13 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        # Only the plain KVCache implements to_quantized; rotating/batched
+        # caches expose the method but raise NotImplementedError (and the
+        # raised error has been observed to abort the Metal command buffer,
+        # killing the server). Mixed-attention models like Maple keep their
+        # sliding-window layers on RotatingKVCache while the full-attention
+        # layers quantize.
+        if type(c) is KVCache and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
@@ -1473,6 +1479,10 @@ class GenerationBatch:
         Returns:
             Tuple of token list and logprobs list.
         """
+        import os as _os
+        _prof = _os.environ.get("MLX_LM_PROF")
+        if _prof:
+            _t0 = time.perf_counter()
         self._current_tokens = self._next_tokens
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
@@ -1480,6 +1490,8 @@ class GenerationBatch:
         # Forward pass
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
+        if _prof:
+            _t_model = time.perf_counter()
 
         # Logits processors
         token_context = []
@@ -1499,17 +1511,24 @@ class GenerationBatch:
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if _prof:
+            _t_lp = time.perf_counter()
 
         # Sample
         if any(self.samplers):
-            all_samples = []
-            for e in range(len(self.uids)):
-                sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
+            if len(self.samplers) == 1:
+                sampled = (self.samplers[0] or self.fallback_sampler)(logprobs)
+            else:
+                all_samples = []
+                for e in range(len(self.uids)):
+                    sample_sampler = self.samplers[e] or self.fallback_sampler
+                    sampled = sample_sampler(logprobs[e : e + 1])
+                    all_samples.append(sampled)
+                sampled = mx.concatenate(all_samples, axis=0)
         else:
             sampled = self.fallback_sampler(logprobs)
+        if _prof:
+            _t_samp = time.perf_counter()
 
         # Assign the next step to member variables and start computing it
         # asynchronously
@@ -1520,7 +1539,37 @@ class GenerationBatch:
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
+        if _prof:
+            _t_async = time.perf_counter()
         mx.eval(inputs, self._current_logprobs)
+        if _prof:
+            _t_eval = time.perf_counter()
+            st = getattr(self, "_prof_state", None)
+            if st is None:
+                st = self._prof_state = [0, 0.0, 0.0, 0.0, 0.0]
+            st[0] += 1
+            st[1] += _t_model - _t0
+            st[2] += _t_async - _t_model
+            st[3] += _t_eval - _t_async
+            st[4] += time.perf_counter() - _t_eval
+            if len(st) < 9:
+                st.extend([0.0] * (9 - len(st)))
+            st[5] += _t_lp - _t_model
+            st[6] += _t_samp - _t_lp
+            st[7] += _t_async - _t_samp
+            if st[0] % 64 == 0:
+                print(
+                    f"[PROF] n={st[0]} model_build={st[1]/st[0]*1e3:.2f}ms "
+                    f"sampler_build={st[2]/st[0]*1e3:.2f}ms "
+                    f"eval_wait={st[3]/st[0]*1e3:.2f}ms "
+                    f"tail={st[4]/st[0]*1e3:.2f}ms | "
+                    f"logprobs={st[5]/st[0]*1e3:.2f} samp={st[6]/st[0]*1e3:.2f} "
+                    f"async_eval={st[7]/st[0]*1e3:.2f}",
+                    file=sys.stderr, flush=True,
+                )
+                for i in range(1, 8):
+                    st[i] = 0.0
+                st[0] = 0
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)

@@ -1,3 +1,6 @@
+// Test-fixture helper only: consumed by e2e_artistic_fixture.cjs to pick a
+// max_tokens for the fixture server. The live inference path does NOT use it —
+// main.cjs sends `mapleMaxTokens` (or an explicit payload.max_tokens) instead.
 function responseBudget(text = "") {
   const value = String(text || "").trim();
   if (

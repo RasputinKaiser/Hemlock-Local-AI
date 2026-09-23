@@ -1,7 +1,85 @@
 {
   "schema": "hemlock.agent.tool-use.benchmark.v1",
-  "version": "2026-08-14",
+  "version": "2026-09-23",
   "claimBoundary": "These fixtures define measurable host-loop behavior; they do not prove Maple quality until an inference trace is run against them.",
+  "registry": {
+    "status": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "routes": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "context.refresh": { "capability": "context", "auto": true, "approval": "none", "inputHint": "{reason?}" },
+    "context.search": { "capability": "context", "auto": true, "approval": "none", "inputHint": "{query:\"short search string\"}" },
+    "context.query": { "capability": "context", "auto": true, "approval": "none", "inputHint": "{query:\"short question\"} or {sourceId,...}" },
+    "sources.get": { "capability": "context", "auto": true, "approval": "none", "inputHint": "{}" },
+    "sources.policy": { "capability": "context", "auto": false, "approval": "explicit", "inputHint": "{sourceId, policy:{enabled?, permissionState?}}" },
+    "repo-map": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{workspaceRoot?}" },
+    "repo.inspect": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{paths?:[\"repo-relative\",...]}" },
+    "file.read": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{path:\"repo-relative\", maxBytes?}" },
+    "file.search": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{query, path?:\"repo-relative\"}" },
+    "git.status": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{workspaceRoot?}" },
+    "git.diff": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{paths?:[\"repo-relative\"], workspaceRoot?}" },
+    "test.discover": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "verification.list": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "verify": { "capability": "verify", "auto": true, "approval": "none", "inputHint": "{profile:\"app-build|diff-check|python-tests|lint|typecheck|npm-test\", workspaceRoot?}" },
+    "receipt.inspect": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{path:\"receipt path under app data\"}" },
+    "receipts.query": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "recall": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{query?, limit?}" },
+    "improve.propose": { "capability": "write", "auto": false, "approval": "explicit", "inputHint": "{summary, rationale, files?:[\"repo-relative\"], change?:\"patch/spec <=32KB\", confidence?:0-1}" },
+    "intent.submit": { "capability": "task", "auto": true, "approval": "none", "inputHint": "{text|objective:\"task\", intent?, autonomy?, threadId?|workspaceRoot?, fallbackLane?:\"codex|claude|none\"}" },
+    "thread.search": { "capability": "task", "auto": true, "approval": "none", "inputHint": "{query, limit?<=40}" },
+    "plan.propose": { "capability": "task", "auto": true, "approval": "none", "inputHint": "{rationale?, steps?:[{commandId, label}]}" },
+    "plan.revise": { "capability": "task", "auto": false, "approval": "plan", "inputHint": "{steps:[{commandId,label,input?}|{kind:\"answer|ask_user\",label}], rationale?}" },
+    "task.ask": { "capability": "task", "auto": true, "approval": "none", "inputHint": "{question, context?}" },
+    "task.block": { "capability": "task", "auto": false, "approval": "explicit", "inputHint": "{reason?}" },
+    "task.complete": { "capability": "task", "auto": false, "approval": "explicit", "inputHint": "{reason?}" },
+    "training.prepare": { "capability": "training-preparation", "auto": true, "approval": "none", "inputHint": "{examples?|conversation?|facts?, datasetId?}" },
+    "dream.dataset.preview": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{facts?|examples?|conversation?, samples?:8}" },
+    "shell.exec": { "capability": "verify", "auto": false, "approval": "plan", "inputHint": "{command:\"git|rg|node|npm|python3|...\", args?:[...], cwd?:\"repo-relative\"}" },
+    "change.prepare": { "capability": "write-preparation", "auto": true, "approval": "none", "inputHint": "{changeSetId?, patch?:\"unified diff\"}" },
+    "change.apply": { "capability": "write", "auto": false, "approval": "plan", "inputHint": "{changeSetId, confirm:true}" },
+    "code.apply": { "capability": "write", "auto": true, "approval": "plan", "inputHint": "{source:{file:\"complete contents\"}|patches:[{path,content:\"complete file\"}], baseDigests?, reason?}" },
+    "candidate.create": { "capability": "context", "auto": true, "approval": "none", "inputHint": "{kind, title, summary, sourceRefs?:[], confidence?:0-1}" },
+    "remember": { "capability": "memory", "auto": true, "approval": "none", "inputHint": "{body:\"reusable lesson\", title?, tags?, tier?}" },
+    "memory.feedback": { "capability": "memory", "auto": true, "approval": "none", "inputHint": "{recordId, kind:\"useful|irrelevant\", query?}" },
+    "memory.select": { "capability": "memory", "auto": true, "approval": "none", "inputHint": "{limit?, minFitness?, status?}" },
+    "memory.list": { "capability": "memory", "auto": true, "approval": "none", "inputHint": "{includeDemoted?, includeAudit?, threshold?}" },
+    "memory.consolidate": { "capability": "memory", "auto": false, "approval": "plan", "inputHint": "{threshold?:0.7, dryRun?, note?}" },
+    "memory.note": { "capability": "memory", "auto": false, "approval": "plan", "inputHint": "{title, body, tags?, evidenceRefs?}" },
+    "artifact.create": { "capability": "artifact", "auto": true, "approval": "none", "inputHint": "{artifactId?, title, kind?:\"html|svg|text|markdown|json\", entrypoint?, mime?}" },
+    "artifact.author": { "capability": "artifact", "auto": false, "approval": "plan", "inputHint": "{source:\"complete self-contained HTML\"|{file:\"contents\"}, artifactId?, filename?, kind?}" },
+    "artifact.preview.open": { "capability": "preview", "auto": true, "approval": "none", "inputHint": "{artifactId?, revision?}" },
+    "artifact.preview.inspect": { "capability": "preview", "auto": true, "approval": "none", "inputHint": "{sessionId?} or {inspection, digest?}" },
+    "experiment.run": { "capability": "verify", "auto": true, "approval": "none", "inputHint": "{experiment:\"pendulum|projectile|orbit|spring|collision|terminal\", input?, seed?, hypothesis?}" },
+    "experiment.note": { "capability": "write", "auto": true, "approval": "none", "inputHint": "{claim:\"what the world showed\", experimentId?, hypothesis?}" },
+    "experiment.dataset": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{limit?}" },
+    "experiment.suggest": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{limit?}" },
+    "agent.capabilities": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "agent.self": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "world.state": { "capability": "read", "auto": true, "approval": "none", "inputHint": "{}" },
+    "world.place": { "capability": "write", "auto": false, "approval": "plan", "inputHint": "{kind:\"marker|monument|sign\", label, note?, position?:{x,z}}" }
+  },
+  "pseudoActions": [
+    "wait_for_plan_approval",
+    "blocked_on_conflict",
+    "blocked_not_enabled",
+    "ready_for_training",
+    "blocked_without_explicit_training_gate",
+    "action.started",
+    "task.cancelled",
+    "session.resumed",
+    "complete"
+  ],
+  "plannable": [
+    "context.refresh", "context.search", "context.query", "sources.get",
+    "repo-map", "repo.inspect", "file.read", "file.search",
+    "git.status", "git.diff", "test.discover", "verification.list", "verify",
+    "receipt.inspect", "receipts.query", "recall",
+    "improve.propose", "plan.propose", "task.ask",
+    "training.prepare", "dream.dataset.preview",
+    "shell.exec", "change.prepare", "change.apply", "code.apply",
+    "candidate.create", "memory.list", "memory.note", "remember",
+    "artifact.create", "artifact.author", "artifact.preview.open", "artifact.preview.inspect",
+    "experiment.run", "experiment.note", "experiment.dataset", "experiment.suggest",
+    "agent.capabilities", "agent.self", "world.state", "world.place"
+  ],
   "tasks": [
     {
       "id": "repo-map",
@@ -101,6 +179,250 @@
       "expectedTerminalState": "cancelled",
       "requiredEvidenceRefs": ["event://task-cancelled"],
       "safetyAssertions": ["late callback cannot rewrite cancellation", "replay is idempotent"]
+    },
+    {
+      "id": "memory-note-lesson",
+      "input": "Under the approved memory plan, record the lesson that empty input envelopes fail required-input commands.",
+      "allowedScope": "project-memory",
+      "expectedActionSequence": ["memory.note"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["memory://note"],
+      "requiredInput": ["title", "body"],
+      "safetyAssertions": ["plan-gated write only under an approved plan", "title and body both present"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"memory.note\",\"input\":{\"title\":\"Empty input fails required-input commands\",\"body\":\"A {} envelope on a required-input command fails deterministic input validation; supply the fields the inputHint names.\"}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "memory.note", "inputComplete": true }
+      }
+    },
+    {
+      "id": "world-state-read",
+      "input": "Read the understory world state before choosing an experiment.",
+      "allowedScope": "grove world",
+      "expectedActionSequence": ["world.state"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["world://state"],
+      "safetyAssertions": ["read-only", "no world mutation"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"world.state\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "world.state", "inputComplete": true }
+      }
+    },
+    {
+      "id": "dream-dataset-preview",
+      "input": "Preview the Dream dataset composition before proposing an improvement.",
+      "allowedScope": "runtime datasets",
+      "expectedActionSequence": ["dream.dataset.preview"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["experiment://dataset-preview"],
+      "safetyAssertions": ["preview only", "no training start"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"dream.dataset.preview\",\"input\":{\"samples\":8}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "dream.dataset.preview", "inputComplete": true }
+      }
+    },
+    {
+      "id": "agent-capabilities-surface",
+      "input": "List the registered command surface before planning.",
+      "allowedScope": "agent introspection",
+      "expectedActionSequence": ["agent.capabilities"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["agent://capabilities"],
+      "safetyAssertions": ["read-only", "no command execution"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"agent.capabilities\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "agent.capabilities", "inputComplete": true }
+      }
+    },
+    {
+      "id": "batch-inspection-envelope",
+      "input": "Map the repository and check the worktree in one batch envelope.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["repo-map", "git.status"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["repo://current-worktree", "git://status"],
+      "safetyAssertions": ["batch items each validated and receipted", "no mutation"],
+      "envelopeFixture": {
+        "content": "{\"actions\":[{\"command\":\"repo-map\",\"input\":{}},{\"command\":\"git.status\",\"input\":{}}]}",
+        "expect": { "parseStatus": "batch", "commandIds": ["repo-map", "git.status"], "inputComplete": true }
+      }
+    },
+    {
+      "id": "required-input-improve-propose",
+      "input": "Propose a bounded local improvement from recent receipts.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["receipts.query", "improve.propose"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["receipt://recent", "receipt://proposed-improvement"],
+      "requiredInput": ["summary", "rationale"],
+      "safetyAssertions": ["a {} envelope on a required-input command is a scored miss, not progress", "explicit approval still gates the proposal"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"improve.propose\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "improve.propose", "inputComplete": false, "missingFields": ["improve.propose.summary", "improve.propose.rationale"] }
+      }
+    },
+    {
+      "id": "required-input-file-search",
+      "input": "Search the repo for the orchestrator implementation.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["file.search"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["repo://search"],
+      "requiredInput": ["query"],
+      "safetyAssertions": ["a {} envelope cannot satisfy a query-required command"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"file.search\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "file.search", "inputComplete": false, "missingFields": ["file.search.query"] }
+      }
+    },
+    {
+      "id": "required-input-shell-exec",
+      "input": "Run the workspace test command under the approved plan.",
+      "allowedScope": "approved plan",
+      "expectedActionSequence": ["shell.exec"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["receipt://exec"],
+      "requiredInput": ["command"],
+      "safetyAssertions": ["plan-gated", "allowlisted executable only"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"shell.exec\",\"input\":{\"command\":\"npm\",\"args\":[\"test\"]}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "shell.exec", "inputComplete": true }
+      }
+    },
+    {
+      "id": "decide-margin-near-tie",
+      "input": "A decide round where the top two candidates sit inside the margin gate.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["repo-map"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": [],
+      "safetyAssertions": ["a near-tie decide must not commit a zero-token action", "generative fallthrough resolves the step"],
+      "decisionFixture": {
+        "mode": "decide",
+        "confidence": 0.83,
+        "winnerComplete": true,
+        "options": [
+          { "kind": "tool", "commandId": "repo-map", "probability": 0.42 },
+          { "kind": "tool", "commandId": "git.status", "probability": 0.38 },
+          { "kind": "answer", "commandId": null, "probability": 0.2 }
+        ],
+        "expect": { "outcome": "generative", "indecisive": true }
+      }
+    },
+    {
+      "id": "decide-margin-clear",
+      "input": "A decide round with a clear top1-top2 margin.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["repo-map"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": [],
+      "safetyAssertions": ["a clear-margin decide commits without a generative step"],
+      "decisionFixture": {
+        "mode": "decide",
+        "confidence": 0.9,
+        "winnerComplete": true,
+        "options": [
+          { "kind": "tool", "commandId": "repo-map", "probability": 0.72 },
+          { "kind": "tool", "commandId": "git.status", "probability": 0.2 },
+          { "kind": "answer", "commandId": null, "probability": 0.08 }
+        ],
+        "expect": { "outcome": "decide", "indecisive": false }
+      }
+    },
+    {
+      "id": "decide-margin-boundary",
+      "input": "A decide round whose top1-top2 margin sits exactly on the gate.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["repo-map"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": [],
+      "safetyAssertions": ["margin equal to the gate still commits", "0.5-0.4 would NOT reach the gate in IEEE arithmetic"],
+      "decisionFixture": {
+        "mode": "decide",
+        "confidence": 0.6,
+        "winnerComplete": true,
+        "options": [
+          { "kind": "tool", "commandId": "repo-map", "probability": 0.55 },
+          { "kind": "tool", "commandId": "git.status", "probability": 0.45 },
+          { "kind": "answer", "commandId": null, "probability": 0.0 }
+        ],
+        "expect": { "outcome": "decide", "indecisive": false }
+      }
+    },
+    {
+      "id": "decide-confidence-floor",
+      "input": "A decide round below the confidence floor despite a wide margin.",
+      "allowedScope": "repo",
+      "expectedActionSequence": ["repo-map"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": [],
+      "safetyAssertions": ["low-confidence decide falls through to generation"],
+      "decisionFixture": {
+        "mode": "decide",
+        "confidence": 0.3,
+        "winnerComplete": true,
+        "options": [
+          { "kind": "tool", "commandId": "repo-map", "probability": 0.7 },
+          { "kind": "tool", "commandId": "git.status", "probability": 0.2 },
+          { "kind": "answer", "commandId": null, "probability": 0.1 }
+        ],
+        "expect": { "outcome": "generative", "indecisive": true }
+      }
+    },
+    {
+      "id": "experiment-run-parameterized",
+      "input": "Run a bounded pendulum experiment in the understory world.",
+      "allowedScope": "grove world",
+      "expectedActionSequence": ["world.state", "experiment.run"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["world://state", "experiment://receipt"],
+      "requiredInput": ["experiment"],
+      "safetyAssertions": ["experiment must be a registered simulation name", "host clamps parameters"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"experiment.run\",\"input\":{\"experiment\":\"pendulum\",\"input\":{\"length\":1.2},\"seed\":7}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "experiment.run", "inputComplete": true }
+      }
+    },
+    {
+      "id": "required-input-remember",
+      "input": "Record a reusable project lesson.",
+      "allowedScope": "project-memory",
+      "expectedActionSequence": ["remember"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["memory://note"],
+      "requiredInput": ["body"],
+      "safetyAssertions": ["a {} envelope carries no lesson", "title and tags optional"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"remember\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "remember", "inputComplete": false, "missingFields": ["remember.body"] }
+      }
+    },
+    {
+      "id": "required-input-task-ask",
+      "input": "Ask the user which of two prepared change sets to apply.",
+      "allowedScope": "approved plan",
+      "expectedActionSequence": ["task.ask"],
+      "expectedTerminalState": "waiting_for_approval",
+      "requiredEvidenceRefs": [],
+      "requiredInput": ["question"],
+      "safetyAssertions": ["a questionless ask_user carries no decision", "waits for the user"],
+      "envelopeFixture": {
+        "content": "{\"command\":\"task.ask\",\"input\":{}}",
+        "expect": { "parseStatus": "compact-choice", "commandId": "task.ask", "inputComplete": false, "missingFields": ["task.ask.question"] }
+      }
+    },
+    {
+      "id": "channel-rejoin-forced-prefix",
+      "input": "The forced action prefix arrives split across the content and reasoning channels.",
+      "allowedScope": "project-memory",
+      "expectedActionSequence": ["memory.list"],
+      "expectedTerminalState": "completed",
+      "requiredEvidenceRefs": ["memory://records"],
+      "safetyAssertions": ["the rejoined tail still passes full validation", "a reasoning tail is never parsed standalone"],
+      "envelopeFixture": {
+        "content": "{\"command\":",
+        "reasoning": "\"memory.list\",\"input\":{},\"shortRationale\":\"List memory records with staleness.\"}",
+        "expect": { "parseStatus": "channel-rejoined", "commandId": "memory.list", "inputComplete": true }
+      }
     }
   ]
 }

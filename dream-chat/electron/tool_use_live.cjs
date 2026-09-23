@@ -4,8 +4,14 @@ const path = require("node:path");
 const { benchmarkPath, loadBenchmark } = require("./tool_use_eval.cjs");
 
 const SCHEMA_LIVE = "hemlock.agent.tool-use.live.v1";
+const SCHEMA_COMPARISON = "hemlock.agent.tool-use.live-comparison.v1";
 // Terminal kinds the orchestrator accepts instead of a tool command (agent_orchestrator.cjs).
 const TERMINAL_KINDS = new Set(["ask_user", "blocked", "answer"]);
+// Terminal kind -> the benchmark expectedTerminalState it would produce if
+// the host executed it. Used to score whether a terminal answer was the
+// RIGHT terminal answer (asking for approval on a task that should complete
+// is a miss, not a pass).
+const TERMINAL_STATE_BY_KIND = { ask_user: "waiting_for_approval", blocked: "blocked", answer: "completed" };
 const MAX_TOKENS = 1536;
 const DEFAULT_ENDPOINT = "http://127.0.0.1:8080";
 
@@ -70,31 +76,34 @@ function extractFirstJsonObject(text) {
 // Parse one model reply into an action-envelope verdict. Pure: no network, no fs.
 function parseModelReply(content, allowlist = null) {
   const trimmed = String(content || "").trim();
-  if (!trimmed) return { parseStatus: "empty", envelope: null, commandId: null, validEnvelope: false };
+  if (!trimmed) return { parseStatus: "empty", envelope: null, kind: null, commandId: null, validEnvelope: false };
   try {
     const envelope = extractFirstJsonObject(trimmed);
     const kind = typeof envelope.kind === "string" ? envelope.kind : "tool";
     const commandId = typeof envelope.commandId === "string" ? envelope.commandId : null;
     if (!TERMINAL_KINDS.has(kind) && kind !== "tool") {
-      return { parseStatus: `invalid:unknown-kind:${kind}`, envelope, commandId, validEnvelope: false };
+      return { parseStatus: `invalid:unknown-kind:${kind}`, envelope, kind, commandId, validEnvelope: false };
     }
     if (TERMINAL_KINDS.has(kind)) {
-      return { parseStatus: "parsed", envelope, commandId: commandId || null, validEnvelope: true };
+      return { parseStatus: "parsed", envelope, kind, commandId: commandId || null, validEnvelope: true };
     }
     if (!commandId) {
-      return { parseStatus: "invalid:missing-commandId", envelope, commandId: null, validEnvelope: false };
+      return { parseStatus: "invalid:missing-commandId", envelope, kind, commandId: null, validEnvelope: false };
     }
     if (allowlist && !allowlist.has(commandId)) {
-      return { parseStatus: "parsed-unallowlisted", envelope, commandId, validEnvelope: false };
+      return { parseStatus: "parsed-unallowlisted", envelope, kind, commandId, validEnvelope: false };
     }
-    return { parseStatus: "parsed", envelope, commandId, validEnvelope: true };
+    return { parseStatus: "parsed", envelope, kind, commandId, validEnvelope: true };
   } catch (error) {
-    return { parseStatus: `invalid:${error.message}`, envelope: null, commandId: null, validEnvelope: false };
+    return { parseStatus: `invalid:${error.message}`, envelope: null, kind: null, commandId: null, validEnvelope: false };
   }
 }
 
-// Injectable-for-tests default caller. Honors the shared wall-clock budget via AbortController.
-async function fetchInference({ endpoint, system, user, remainingMs, signal } = {}) {
+// Injectable-for-tests default caller. Honors the shared wall-clock budget via
+// AbortController. `adapterPath` grafts a LoRA adapter onto the request the
+// same way codingInference does (`adapters` field), so base and candidate
+// lanes run identical prompts against the same served weights.
+async function fetchInference({ endpoint, system, user, remainingMs, signal, adapterPath = "" } = {}) {
   const base = String(endpoint || DEFAULT_ENDPOINT).replace(/\/$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort("tool-use-live-budget"), Math.max(1000, remainingMs));
@@ -114,6 +123,7 @@ async function fetchInference({ endpoint, system, user, remainingMs, signal } = 
         top_k: 0,
         max_tokens: MAX_TOKENS,
         stream: false,
+        ...(adapterPath ? { adapters: adapterPath } : {}),
       }),
       signal: owned,
     });
@@ -129,6 +139,18 @@ async function fetchInference({ endpoint, system, user, remainingMs, signal } = 
   }
 }
 
+// Score one parsed verdict against the task it answered: a tool envelope hits
+// when its commandId is inside the benchmark's expectedActionSequence, a
+// terminal kind hits when it maps to the task's expectedTerminalState.
+function taskMatch(task, verdict) {
+  if (!verdict || !verdict.validEnvelope) return false;
+  const expected = Array.isArray(task?.expectedActionSequence) ? task.expectedActionSequence : [];
+  if (verdict.kind && TERMINAL_KINDS.has(verdict.kind)) {
+    return TERMINAL_STATE_BY_KIND[verdict.kind] === String(task?.expectedTerminalState || "");
+  }
+  return expected.includes(verdict.commandId);
+}
+
 // Run every fixture input through the model once, score response quality only.
 async function runLiveToolUseEval(options = {}) {
   const {
@@ -137,9 +159,11 @@ async function runLiveToolUseEval(options = {}) {
     limit = null,
     inferenceFn = null,
     benchmarkPathOverride = benchmarkPath,
+    adapterPath = "",
+    lane = "tool-use-live",
     now = () => Date.now(),
   } = options;
-  const infer = inferenceFn || ((args) => fetchInference({ ...args, endpoint }));
+  const infer = inferenceFn || ((args) => fetchInference({ ...args, endpoint, adapterPath }));
   const startedAt = now();
   const benchmark = loadBenchmark(benchmarkPathOverride);
   const tasks = Number.isFinite(limit) && limit > 0 ? benchmark.tasks.slice(0, limit) : benchmark.tasks;
@@ -152,14 +176,14 @@ async function runLiveToolUseEval(options = {}) {
     const remainingMs = maxMs - elapsedBefore;
     if (remainingMs <= 0) {
       // Skip remaining on wall-clock timeout, mirroring e2e_artistic_maple behavior.
-      results.push({ taskId: task.id, responded: false, parseStatus: "skipped-timeout", commandId: null, validEnvelope: false, elapsedMs: 0 });
+      results.push({ taskId: task.id, responded: false, parseStatus: "skipped-timeout", kind: null, commandId: null, validEnvelope: false, taskMatch: false, elapsedMs: 0 });
       continue;
     }
     const taskStartedAt = now();
     let content = "";
     let failure = null;
     try {
-      content = await infer({ task, system, user: String(task.input), remainingMs });
+      content = await infer({ task, system, user: String(task.input), remainingMs, adapterPath });
     } catch (error) {
       failure = error;
     }
@@ -170,8 +194,10 @@ async function runLiveToolUseEval(options = {}) {
         taskId: task.id,
         responded: false,
         parseStatus: timedOut ? "skipped-timeout" : `error:${String(failure.message).slice(0, 200)}`,
+        kind: null,
         commandId: null,
         validEnvelope: false,
+        taskMatch: false,
         elapsedMs,
       });
       continue;
@@ -181,8 +207,11 @@ async function runLiveToolUseEval(options = {}) {
       taskId: task.id,
       responded: Boolean(String(content || "").trim()),
       parseStatus: verdict.parseStatus,
+      kind: verdict.kind || null,
       commandId: verdict.validEnvelope ? verdict.commandId : null,
       validEnvelope: verdict.validEnvelope,
+      expectedCommands: Array.isArray(task.expectedActionSequence) ? task.expectedActionSequence : [],
+      taskMatch: taskMatch(task, verdict),
       elapsedMs,
     });
   }
@@ -190,8 +219,9 @@ async function runLiveToolUseEval(options = {}) {
   const total = results.length || 1;
   return {
     schema: SCHEMA_LIVE,
-    lane: "tool-use-live",
+    lane,
     endpoint: String(endpoint),
+    adapterPath: adapterPath || null,
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date(now()).toISOString(),
     elapsedMs: now() - startedAt,
@@ -200,10 +230,75 @@ async function runLiveToolUseEval(options = {}) {
     ranTaskIds: results.map((item) => item.taskId),
     respondedRate: results.filter((item) => item.responded).length / total,
     validEnvelopeRate: results.filter((item) => item.validEnvelope).length / total,
+    // The honest quality signal: did the model pick the command (or terminal
+    // kind) the benchmark expected, not merely any well-formed envelope.
+    taskMatchRate: results.filter((item) => item.taskMatch).length / total,
     allowlist: [...allowlist],
     maxTokens: MAX_TOKENS,
     results,
   };
+}
+
+// Before/after comparison of two live runs (e.g. base vs grafted adapter).
+// Per-task transitions show exactly which task selections improved or
+// regressed — the signal a Dream cycle needs to decide whether an adapter
+// earned promotion, instead of diffing two rate numbers by eye.
+function compareLiveRuns(before, after) {
+  const beforeResults = Array.isArray(before?.results) ? before.results : [];
+  const afterResults = Array.isArray(after?.results) ? after.results : [];
+  const beforeById = new Map(beforeResults.map((item) => [item.taskId, item]));
+  const transitions = afterResults.map((item) => {
+    const prior = beforeById.get(item.taskId) || null;
+    let change = "new";
+    if (prior) {
+      if (item.taskMatch && !prior.taskMatch) change = "improved";
+      else if (!item.taskMatch && prior.taskMatch) change = "regressed";
+      else if (item.validEnvelope && !prior.validEnvelope) change = "improved";
+      else if (!item.validEnvelope && prior.validEnvelope) change = "regressed";
+      else if (item.commandId !== prior.commandId) change = "changed-command";
+      else change = "unchanged";
+    }
+    return {
+      taskId: item.taskId,
+      change,
+      before: prior ? { responded: prior.responded, parseStatus: prior.parseStatus, commandId: prior.commandId, validEnvelope: prior.validEnvelope, taskMatch: prior.taskMatch } : null,
+      after: { responded: item.responded, parseStatus: item.parseStatus, commandId: item.commandId, validEnvelope: item.validEnvelope, taskMatch: item.taskMatch },
+    };
+  });
+  const improved = transitions.filter((item) => item.change === "improved").length;
+  const regressed = transitions.filter((item) => item.change === "regressed").length;
+  const delta = (key) => (Number(after?.[key]) || 0) - (Number(before?.[key]) || 0);
+  return {
+    schema: SCHEMA_COMPARISON,
+    baseLane: before?.lane || "base",
+    candidateLane: after?.lane || "candidate",
+    baseAdapterPath: before?.adapterPath ?? null,
+    candidateAdapterPath: after?.adapterPath ?? null,
+    taskCount: afterResults.length,
+    deltas: {
+      respondedRate: delta("respondedRate"),
+      validEnvelopeRate: delta("validEnvelopeRate"),
+      taskMatchRate: delta("taskMatchRate"),
+    },
+    improvedTasks: improved,
+    regressedTasks: regressed,
+    verdict: regressed > 0 && improved === 0 ? "regressed" : improved > 0 && regressed === 0 ? "improved" : improved || regressed ? "mixed" : "unchanged",
+    transitions,
+    claimBoundary:
+      "This comparison measures structured action selection between two runs on the same benchmark — which commandId or terminal kind the model chose per task. No host action was executed in either lane, and a positive verdict is promotion evidence, not proof of general quality.",
+  };
+}
+
+// Run the benchmark twice — once on the base model, once with `adapterPath`
+// grafted — and emit the comparison. `inferenceFn` stays injectable; it
+// receives `adapterPath` so tests can simulate per-lane behavior.
+async function runAdapterComparison(options = {}) {
+  const { adapterPath = "", inferenceFn = null, ...rest } = options;
+  const infer = inferenceFn || ((args) => fetchInference({ ...args, endpoint: options.endpoint }));
+  const base = await runLiveToolUseEval({ ...rest, inferenceFn: (args) => infer({ ...args, adapterPath: "" }), adapterPath: "", lane: "tool-use-live:base" });
+  const candidate = await runLiveToolUseEval({ ...rest, inferenceFn: (args) => infer({ ...args, adapterPath }), adapterPath, lane: "tool-use-live:candidate" });
+  const comparison = compareLiveRuns(base, candidate);
+  return { schema: SCHEMA_COMPARISON, lane: "tool-use-live-comparison", base, candidate, comparison };
 }
 
 // Receipt assembly stays here; writing is the caller's job (CLI writes its own).
@@ -224,20 +319,24 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-// Dual mode: also runnable as a CLI against a live local server (default http://127.0.0.1:8080).
+// Dual mode: also runnable as a CLI against a live local server (default
+// http://127.0.0.1:8080). Set HEMLOCK_TOOL_USE_ADAPTER to an adapter dir to
+// run base-vs-adapter comparison mode instead of a single pass.
 if (require.main === module) {
   const cliMaxMs = Number(process.env.HEMLOCK_MAPLE_MAX_MS || 600000);
   const cliLimitRaw = Number(process.env.HEMLOCK_TOOL_USE_LIMIT);
   const cliEndpoint = process.env.HEMLOCK_MAPLE_BASE || DEFAULT_ENDPOINT;
-  runLiveToolUseEval({
-    endpoint: cliEndpoint,
-    maxMs: cliMaxMs,
-    limit: Number.isFinite(cliLimitRaw) && cliLimitRaw > 0 ? cliLimitRaw : null,
-  })
-    .then((runResult) => {
-      const receiptDir = path.join(os.homedir(), "Library", "Application Support", "Hemlock", "e2e", "tool-use-live");
-      const receiptPath = path.join(receiptDir, `tool-use-live-${Date.now()}.json`);
-      const receipt = buildLiveToolUseReceipt(runResult, { endpoint: cliEndpoint });
+  const cliAdapter = String(process.env.HEMLOCK_TOOL_USE_ADAPTER || "").trim();
+  const cliLimit = Number.isFinite(cliLimitRaw) && cliLimitRaw > 0 ? cliLimitRaw : null;
+  const receiptDir = path.join(os.homedir(), "Library", "Application Support", "Hemlock", "e2e", "tool-use-live");
+  const receiptPath = path.join(receiptDir, `tool-use-live-${Date.now()}.json`);
+  const run = cliAdapter
+    ? runAdapterComparison({ endpoint: cliEndpoint, maxMs: cliMaxMs, limit: cliLimit, adapterPath: cliAdapter })
+        .then((result) => buildLiveToolUseReceipt(result, { endpoint: cliEndpoint, adapterPath: cliAdapter }))
+    : runLiveToolUseEval({ endpoint: cliEndpoint, maxMs: cliMaxMs, limit: cliLimit })
+        .then((runResult) => buildLiveToolUseReceipt(runResult, { endpoint: cliEndpoint }));
+  run
+    .then((receipt) => {
       writeJson(receiptPath, receipt);
       process.stdout.write(`${JSON.stringify({ ...receipt, receiptPath }, null, 2)}\n`);
     })
@@ -249,7 +348,9 @@ if (require.main === module) {
 
 module.exports = {
   SCHEMA_LIVE,
+  SCHEMA_COMPARISON,
   TERMINAL_KINDS,
+  TERMINAL_STATE_BY_KIND,
   MAX_TOKENS,
   benchmarkPath,
   loadBenchmark,
@@ -257,7 +358,10 @@ module.exports = {
   buildActionSystemPrompt,
   extractFirstJsonObject,
   parseModelReply,
+  taskMatch,
   fetchInference,
   runLiveToolUseEval,
+  compareLiveRuns,
+  runAdapterComparison,
   buildLiveToolUseReceipt,
 };

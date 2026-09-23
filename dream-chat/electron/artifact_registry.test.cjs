@@ -60,3 +60,20 @@ test("applies bounded complete-file patches and restores the prior revision", ()
   assert.equal(restored.source["index.html"], "<main>good</main>");
   assert.throws(() => registry.update({ taskId: "task-1", artifactId: "garden", patches: [{ path: "index.html", content: 42 }] }), /complete text content/);
 });
+
+test("update after restore allocates a fresh revision id instead of colliding", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "hemlock-artifact-"));
+  const registry = new ArtifactRegistry({ root, workspaceId: "workspace-test" });
+  registry.create({ taskId: "task-1", artifactId: "garden", kind: "html" });
+  registry.author({ taskId: "task-1", artifactId: "garden", kind: "html", filename: "index.html", runtimeTemplate: "html", objective: "Make a garden", source: { "index.html": "<main>r1</main>" } });
+  registry.update({ taskId: "task-1", artifactId: "garden", source: { "index.html": "<main>r2</main>" } });
+  registry.restore({ taskId: "task-1", artifactId: "garden", revision: 1 });
+  // artifact.revision is back at 1; the next update must mint r3 rather than
+  // overwrite the existing r2 revision directory and manifest record.
+  const next = registry.update({ taskId: "task-1", artifactId: "garden", source: { "index.html": "<main>r3</main>" } });
+  assert.equal(next.revision, 3);
+  assert.equal(next.revisions.length, 3);
+  assert.deepEqual(next.revisions.map((item) => item.id), ["r1", "r2", "r3"]);
+  const r2Source = fs.readFileSync(path.join(root, "workspaces", "workspace-test", "tasks", "task-1", "artifacts", "garden", "revisions", "r2", "index.html"), "utf8");
+  assert.equal(r2Source, "<main>r2</main>");
+});

@@ -70,6 +70,17 @@ test("buildDigest: lines are capped at 12, newest-wins among dropped", () => {
   assert.match(digest.summaryLines[11], /^user: Point 19 here\.$/);
 });
 
+test("buildDigest: duplicate sentences collapse and older uniques backfill", () => {
+  const dropped = [msg("user", "Same question.")];
+  for (let i = 0; i < 15; i += 1) dropped.push(msg("assistant", `Unique ${i} here.`));
+  for (let i = 0; i < 6; i += 1) dropped.push(msg("user", "Same question."));
+  const digest = buildDigest(dropped);
+  // 16 unique lines available; the cap still holds and dupes were collapsed.
+  assert.equal(digest.summaryLines.length, DIGEST_MAX_LINES);
+  assert.equal(new Set(digest.summaryLines).size, digest.summaryLines.length);
+  assert.match(digest.summaryLines[11], /^user: Same question\.$/);
+});
+
 test("buildDigest: sentences longer than 100 chars are truncated to 100", () => {
   const long = "a".repeat(250);
   const digest = buildDigest([msg("assistant", long)]);

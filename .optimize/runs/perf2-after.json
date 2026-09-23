@@ -1,0 +1,27 @@
+{
+  "agent": "perf2",
+  "server": "mlx_lm.server :8081 maple-2bit-mlx --flash-head --temp 0.7 --top-p 0.95 --top-k 20 --prefill-step-size 1024",
+  "ts": "2026-09-22T02:07:00",
+  "note": "after checkpoint maple.py sync (runtime artifact update, not a repo diff) + neutral node trims (add_rms reshape drop, qk flat-qkv reuse, B=1 sampler fast path). Custom fused-expert kernels tried and REVERTED (slower than gather_qmm); compiled MoE block tried and REVERTED (neutral, plus router-kernel ctr mutation unsafe under compile).",
+  "decode": {
+    "mode": "decode",
+    "ttft_ms": 191.58,
+    "decode_tps": 88.49,
+    "completion_tokens": 128,
+    "prompt_tokens": 25,
+    "cached_tokens": 24,
+    "context_tokens": 0,
+    "reps": 4
+  },
+  "decode_postsync_reference": {
+    "mode": "decode",
+    "ttft_ms": 134.34,
+    "decode_tps": 90.78,
+    "completion_tokens": 128,
+    "prompt_tokens": 25,
+    "cached_tokens": 24,
+    "context_tokens": 0,
+    "reps": 4,
+    "note": "measured right after checkpoint sync, before any perf2 code edits"
+  }
+}

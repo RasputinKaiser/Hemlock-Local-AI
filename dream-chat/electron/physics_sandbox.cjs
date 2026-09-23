@@ -45,22 +45,44 @@ const DEFAULTS = {
   terminal: { mass: 80, dragCoefficient: 1, area: 0.7, gravity: 9.81, height: 2000 },
 };
 
+function invalidInput(message) {
+  const error = new Error(message);
+  error.code = "INVALID_EXPERIMENT_INPUT";
+  return error;
+}
+
 function clampInputs(experiment, input = {}) {
   const bounds = BOUNDS[experiment];
   if (!bounds) return { input: {}, notes: [`unknown experiment: ${experiment}`] };
   const defaults = DEFAULTS[experiment];
   const notes = [];
   const normalized = {};
+  if (input == null) input = {};
+  // A finite out-of-range number clamps with an honest note, but a typo'd key
+  // or a non-numeric value would silently run defaults — those fail loudly
+  // naming what the world actually accepts.
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw invalidInput(`${experiment} input must be an object of bounded parameters (${Object.keys(bounds).join(", ")}) — got ${JSON.stringify(input)}.`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!Object.hasOwn(bounds, key)) {
+      throw invalidInput(`${experiment} has no input "${key}". Valid inputs: ${Object.keys(bounds).join(", ")}.`);
+    }
+  }
   for (const [key, [min, max]] of Object.entries(bounds)) {
-    const raw = Number(input[key]);
-    if (Number.isFinite(raw)) {
-      const value = Math.min(max, Math.max(min, raw));
-      if (value !== raw) notes.push(`${key} clamped to [${min}, ${max}]`);
-      normalized[key] = value;
-    } else {
+    const provided = input[key];
+    if (provided === undefined || provided === null) {
       notes.push(`${key} defaulted to ${defaults[key]}`);
       normalized[key] = defaults[key];
+      continue;
     }
+    const raw = Number(provided);
+    if (!Number.isFinite(raw)) {
+      throw invalidInput(`${experiment}.${key} must be a finite number in [${min}, ${max}] — got ${JSON.stringify(provided)}.`);
+    }
+    const value = Math.min(max, Math.max(min, raw));
+    if (value !== raw) notes.push(`${key} clamped to [${min}, ${max}]`);
+    normalized[key] = value;
   }
   return { input: normalized, notes };
 }
@@ -245,4 +267,109 @@ function runExperiment(spec = {}) {
   };
 }
 
-module.exports = { EXPERIMENT_SCHEMA, EXPERIMENTS, BOUNDS, runExperiment };
+// --- Coverage suggestions ----------------------------------------------------
+// experiment.suggest reads only recorded run receipts and finding rows, so the
+// same history always ranks the same gaps — a suggestion is derived evidence,
+// never a model guess.
+//
+// Hypothesis semantics: a declared hypothesis starts "open" on the receipt and
+// becomes "addressed" only when a hemlock.world.finding.v1 row cites that run's
+// id (or the receipt was already marked addressed). The host cannot judge a
+// natural-language claim, so confirmed/refuted is never a host-computed
+// outcome — "addressed" only means a finding exists.
+
+function experimentCoverage(receipts = [], findings = []) {
+  const addressed = new Set(findings.map((row) => row?.experimentId).filter(Boolean));
+  const summary = {};
+  for (const kind of EXPERIMENTS) summary[kind] = { runs: 0, findings: 0, hypothesesTested: 0, hypothesesOpen: 0 };
+  for (const row of findings) {
+    const kind = String(row?.experiment || "").toLowerCase();
+    if (summary[kind]) summary[kind].findings += 1;
+  }
+  for (const receipt of receipts) {
+    const kind = String(receipt?.experiment || "").toLowerCase();
+    if (!summary[kind]) continue;
+    summary[kind].runs += 1;
+    if (receipt.hypothesis) {
+      if (addressed.has(receipt.id) || receipt.hypothesisOutcome === "addressed") summary[kind].hypothesesTested += 1;
+      else summary[kind].hypothesesOpen += 1;
+    }
+  }
+  return summary;
+}
+
+// The least-explored bounded parameter of a run history: smallest fraction of
+// its valid range covered, ties broken by fewer distinct values then BOUNDS
+// order (deterministic).
+function leastExploredParam(kind, runs) {
+  const bounds = BOUNDS[kind];
+  if (!bounds) return null;
+  let worst = null;
+  for (const [param, [min, max]] of Object.entries(bounds)) {
+    const used = runs.map((run) => Number(run?.input?.[param])).filter(Number.isFinite);
+    if (!used.length || !(max > min)) continue;
+    const distinct = new Set(used).size;
+    const span = (Math.max(...used) - Math.min(...used)) / (max - min);
+    if (!worst || span < worst.span || (span === worst.span && distinct < worst.distinct)) {
+      worst = { param, min, max, used, distinct, span };
+    }
+  }
+  return worst;
+}
+
+// The range endpoint farthest from every recorded value — pushing to an
+// extreme is the deterministic choice, never a midpoint guess.
+function farthestEndpoint({ min, max, used }) {
+  const span = max - min;
+  const distance = (point) => Math.min(...used.map((value) => Math.abs((value - min) / span - point)));
+  return distance(1) >= distance(0) ? max : min;
+}
+
+function suggestExperiments({ receipts = [], findings = [], limit = 12 } = {}) {
+  const coverageSummary = experimentCoverage(receipts, findings);
+  const addressed = new Set(findings.map((row) => row?.experimentId).filter(Boolean));
+  const suggestions = [];
+  // Never-run kinds first — zero evidence outranks every refinement.
+  for (const kind of EXPERIMENTS) {
+    const coverage = coverageSummary[kind];
+    if (coverage.runs === 0) {
+      suggestions.push({ rank: 0, experiment: kind, reason: `${kind} has never been run — no receipts exist`, suggestedInput: { ...DEFAULTS[kind] }, coverage });
+    }
+  }
+  // Hypotheses declared on a run that no finding ever cited.
+  for (const receipt of receipts) {
+    const kind = String(receipt?.experiment || "").toLowerCase();
+    if (!receipt?.hypothesis || !coverageSummary[kind]) continue;
+    if (addressed.has(receipt.id) || receipt.hypothesisOutcome === "addressed") continue;
+    suggestions.push({
+      rank: 1,
+      experiment: kind,
+      reason: `hypothesis still open — "${String(receipt.hypothesis).slice(0, 140)}" was declared on ${receipt.id} but no experiment.note cites it`,
+      ...(receipt.input && typeof receipt.input === "object" ? { suggestedInput: { ...receipt.input } } : {}),
+      coverage: coverageSummary[kind],
+    });
+  }
+  // Kinds that ran but only explored a corner of their bounded input space.
+  for (const kind of EXPERIMENTS) {
+    const coverage = coverageSummary[kind];
+    if (coverage.runs === 0) continue;
+    const runs = receipts.filter((receipt) => String(receipt?.experiment || "").toLowerCase() === kind);
+    const gap = leastExploredParam(kind, runs);
+    if (!gap || !(gap.span < 0.25 || gap.distinct <= 1)) continue;
+    const value = farthestEndpoint(gap);
+    suggestions.push({
+      rank: 2,
+      experiment: kind,
+      reason: `input region unexplored — ${gap.param} stayed within [${Math.min(...gap.used)}, ${Math.max(...gap.used)}] of the valid [${gap.min}, ${gap.max}] across ${coverage.runs} run(s)`,
+      suggestedInput: { ...DEFAULTS[kind], [gap.param]: value },
+      coverage,
+    });
+  }
+  const ordered = suggestions
+    .sort((a, b) => a.rank - b.rank || a.coverage.runs - b.coverage.runs || a.experiment.localeCompare(b.experiment) || a.reason.localeCompare(b.reason))
+    .slice(0, Math.max(1, Math.min(48, Math.round(limit) || 12)))
+    .map(({ rank, ...entry }) => entry);
+  return { suggestions: ordered, coverageSummary };
+}
+
+module.exports = { EXPERIMENT_SCHEMA, EXPERIMENTS, BOUNDS, DEFAULTS, runExperiment, experimentCoverage, suggestExperiments };

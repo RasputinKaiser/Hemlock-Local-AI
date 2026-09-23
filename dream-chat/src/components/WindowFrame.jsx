@@ -37,12 +37,14 @@ export function WindowFrame({ windowState, meta, active, dragging, resizing, onF
   return (
     <section
       className={`os-window window-${id} ${active ? "is-active" : ""} ${maximized ? "is-maximized" : ""} ${dragging ? "is-dragging" : ""} ${resizing ? "is-resizing" : ""}`}
+      data-window-id={id}
       style={style}
       aria-label={meta.label}
+      aria-roledescription="window"
       onPointerDownCapture={(event) => { if (primaryPointer(event)) raiseWindow(); }}
       onFocusCapture={raiseWindow}
     >
-      <header className="window-bar" onPointerDown={(event) => { if (primaryPointer(event)) onDragStart(event, id); }} onDoubleClick={() => onMaximize(id)} onContextMenu={(event) => { if (!onActions) return; event.preventDefault(); onActions(id, event.currentTarget.querySelector('.window-actions-trigger')); }}>
+      <header className="window-bar" title={`${meta.label} — drag to move, double-click to ${maximized ? "restore" : "fill"} the workspace`} onPointerDown={(event) => { if (primaryPointer(event)) onDragStart(event, id); }} onDoubleClick={() => onMaximize(id)} onContextMenu={(event) => { if (!onActions) return; event.preventDefault(); onActions(id, event.currentTarget.querySelector('.window-actions-trigger')); }}>
         <div className="window-title">
           <span className={`window-glyph glyph-${meta.tone || "green"}`}><Icon name={meta.icon} size={14} /></span>
           <strong>{meta.label}</strong>
@@ -52,7 +54,7 @@ export function WindowFrame({ windowState, meta, active, dragging, resizing, onF
           {onActions && <button type="button" className="window-actions-trigger" onClick={(event) => onActions(id, event.currentTarget)} aria-label={`Window actions for ${meta.label}`} aria-haspopup="menu" title="Window actions · tile, center, resize"><Icon name="more" size={17} /></button>}
           <button type="button" onClick={() => onMinimize(id)} aria-label={`Minimize ${meta.label}`} title="Minimize · ⌘⌥M"><Icon name="minimize" size={15} /></button>
           <button type="button" onClick={() => onMaximize(id)} aria-label={`${maximized ? "Restore" : "Maximize"} ${meta.label}`} title={maximized ? "Restore size · ⌘⌥↓" : "Fill workspace · ⌘⌥↑"}><Icon name={maximized ? "restore" : "maximize"} size={15} /></button>
-          <button type="button" onClick={() => onClose(id)} aria-label={`Close ${meta.label}`} title="Close window · ⌘⌥W"><Icon name="close" size={16} /></button>
+          <button type="button" onClick={() => onClose(id)} aria-label={`Close ${meta.label}`} title="Close window · ⌘W"><Icon name="close" size={16} /></button>
         </div>
       </header>
       <div className="window-body">{children}</div>

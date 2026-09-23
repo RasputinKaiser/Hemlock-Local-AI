@@ -39,6 +39,6 @@ export function windowMenuItems(state) {
     { id: "center", label: "Center window", icon: "centerWindow" },
     { id: "default-size", label: "Reset size & position", icon: "resetSize" },
     { id: "minimize", label: "Minimize", icon: "minimize", shortcut: "⌘⌥M", disabled: minimized },
-    { id: "close", label: "Close window", icon: "close", shortcut: "⌘⌥W", destructive: true },
+    { id: "close", label: "Close window", icon: "close", shortcut: "⌘W", destructive: true },
   ];
 }

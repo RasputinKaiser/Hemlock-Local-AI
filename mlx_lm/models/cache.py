@@ -1663,6 +1663,7 @@ class LRUPromptCache:
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self._mru = None
 
     def __len__(self):
         return len(self._lru)
@@ -1670,6 +1671,51 @@ class LRUPromptCache:
     @property
     def nbytes(self):
         return self._n_bytes
+
+    def mru_entry(self):
+        """Return ``(model, tokens, prompt_cache)`` for the most recently
+        inserted entry still held, or ``None`` when the cache is empty.
+
+        The LRU only reorders on insert, so the last insert is also the
+        entry furthest from eviction — the "hottest" sequence."""
+        if self._mru is None:
+            return None
+        model, tokens = self._mru
+        try:
+            entry = self._trie.get(model, tokens)
+        except KeyError:
+            self._mru = None
+            return None
+        return model, tokens, entry.prompt_cache
+
+    def recent_entries(self, n: int):
+        """Up to ``n`` most recently inserted entries still held.
+
+        Returns ``[(model, tokens, prompt_cache), ...]`` hottest first.
+        ``self._mru`` is the global hottest; each per-type LRU deque is
+        recency-ordered within its cache_type, so the remaining slots are
+        filled by walking each type's deque newest-to-oldest. Entries the
+        trie no longer holds (evicted/popped) are skipped."""
+        out = []
+
+        def take(model, tokens):
+            for m, t, _ in out:
+                if m == model and t == tokens:
+                    return
+            try:
+                entry = self._trie.get(model, tokens)
+            except KeyError:
+                return
+            out.append((model, list(tokens), entry.prompt_cache))
+
+        if self._mru is not None:
+            take(*self._mru)
+        for cache_type in self._lru._ordering:
+            for model, tokens in reversed(self._lru._lrus[cache_type]):
+                if len(out) >= n:
+                    return out
+                take(model, tokens)
+        return out
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
@@ -1723,6 +1769,10 @@ class LRUPromptCache:
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
+
+        # Track the hottest entry for --prompt-cache-file persistence. The
+        # eviction loops below rebind `model`/`tokens`, so capture first.
+        self._mru = (model, list(tokens))
 
         # Ensure we match the constraints
         if len(self._lru) > self.max_size:

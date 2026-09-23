@@ -216,8 +216,8 @@ test("blocked preview inspection triggers exactly one bounded repair attempt", a
 
 test("clampBudgetOverrides bounds user-granted plan budgets (unit)", () => {
   // Absurd upper bound clamps to the ceiling.
-  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 9999 }), { maxAgentSteps: 24 });
-  assert.deepEqual(clampBudgetOverrides({ maxCommands: 100000 }), { maxCommands: 40 });
+  assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 9999 }), { maxAgentSteps: 64 });
+  assert.deepEqual(clampBudgetOverrides({ maxCommands: 100000 }), { maxCommands: 120 });
   // Zero/negative floors clamp to 1; both keys survive together.
   assert.deepEqual(clampBudgetOverrides({ maxAgentSteps: 0, maxCommands: -5 }), { maxAgentSteps: 1, maxCommands: 1 });
   // Valid passthrough is preserved untouched.
