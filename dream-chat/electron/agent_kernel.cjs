@@ -1,6 +1,8 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { classifyFailure, failureHint, resolveFailureClass } = require("./agent_contracts.cjs");
+const { appendJsonlLine, quarantineCorruptFile, writeJsonAtomic } = require("./durable_io.cjs");
 
 function nowIso() {
   return new Date().toISOString();
@@ -19,15 +21,15 @@ function readJson(filePath, fallback) {
 }
 
 function writeJson(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
-  fs.renameSync(tempPath, filePath);
+  // Temp + fsync + rename (durable_io): a crash mid-persist must not leave a
+  // truncated projection.json for the next boot to read.
+  writeJsonAtomic(filePath, value);
 }
 
 function appendJsonl(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf-8");
+  // fsync'd append: the projection journal is the durable event spine's
+  // companion — a line is on disk before persist() returns.
+  appendJsonlLine(filePath, value);
 }
 
 function defaultSources(repoRoot) {
@@ -113,8 +115,12 @@ function defaultSources(repoRoot) {
 }
 
 class AgentKernel {
-  constructor({ root, repoRoot, task }) {
+  constructor({ root, repoRoot, task, commandRegistry = null, onIntegrity = null }) {
     this.root = path.resolve(root);
+    // Optional registry handle — attached post-construction in production
+    // (the kernel is built before agentCommands exists) so failure
+    // observations can name a command's required inputHint fields.
+    this.commandRegistry = commandRegistry && typeof commandRegistry === "object" ? commandRegistry : null;
     this.repoRoot = path.resolve(repoRoot);
     this.workspaceId = `workspace-${digest(this.repoRoot).slice(0, 16)}`;
     this.workspaceRoot = path.join(this.root, "workspaces", this.workspaceId);
@@ -122,8 +128,17 @@ class AgentKernel {
     this.journalPath = path.join(this.workspaceRoot, "projection.jsonl");
     fs.mkdirSync(this.workspaceRoot, { recursive: true });
 
+    // Validate-on-read: a corrupt projection rebuilds from defaults instead
+    // of crashing the boot; the bad file is quarantined and the recovery is
+    // reported through onIntegrity so the host can journal it.
     const stored = readJson(this.statePath, null);
-    this.state = stored && stored.schema === "hemlock.agent.projection.v1"
+    const projectionUsable = stored && stored.schema === "hemlock.agent.projection.v1";
+    if (stored !== null && !projectionUsable && typeof onIntegrity === "function") {
+      try { onIntegrity({ file: this.statePath, label: "agent-projection", reason: "unexpected-schema", recovered: "defaults", quarantinePath: quarantineCorruptFile(this.statePath) }); } catch { /* reporting never breaks boot */ }
+    } else if (stored === null && fs.existsSync(this.statePath) && typeof onIntegrity === "function") {
+      try { onIntegrity({ file: this.statePath, label: "agent-projection", reason: "invalid-json", recovered: "defaults", quarantinePath: quarantineCorruptFile(this.statePath) }); } catch { /* reporting never breaks boot */ }
+    }
+    this.state = projectionUsable
       ? stored
       : {
         schema: "hemlock.agent.projection.v1",
@@ -190,6 +205,26 @@ class AgentKernel {
     return this.state.task;
   }
 
+  attachCommandRegistry(registry) {
+    this.commandRegistry = registry && typeof registry === "object" ? registry : this.commandRegistry;
+    return this.commandRegistry;
+  }
+
+  // Observation enrichment context: the operation that produced an
+  // observation records the command name; when no operation exists (the
+  // command threw before startOperation — budget/approval gates) the most
+  // recent in-flight action for the task is the next-best source.
+  observationContext(observation = {}) {
+    const operation = observation.operationId
+      ? this.state.operations.find((item) => item.id === observation.operationId)
+      : null;
+    const runningAction = !operation && observation.commandId == null
+      ? [...this.state.actions].reverse().find((item) => item.status === "running" || item.status === "validated")
+      : null;
+    const commandId = observation.commandId || operation?.command || runningAction?.commandId || null;
+    return { commandId, inputHint: commandId ? this.commandRegistry?.[commandId]?.inputHint || null : null };
+  }
+
   setQueueState(queue) {
     this.state.queue = queue && typeof queue === "object"
       ? JSON.parse(JSON.stringify(queue))
@@ -237,7 +272,7 @@ class AgentKernel {
     }
     const isTraining = capability === "train";
     const trainingUsed = Number(budget.trainingCyclesUsed || 0);
-    const trainingMaximum = Number(budget.maxTrainingCycles || 1);
+    const trainingMaximum = Number(budget.maxTrainingCycles ?? 1);
     if (isTraining && trainingUsed >= trainingMaximum) {
       const error = new Error(`Hemlock training-cycle budget exhausted (${trainingUsed}/${trainingMaximum}).`);
       error.code = "TRAINING_BUDGET_EXHAUSTED";
@@ -263,7 +298,7 @@ class AgentKernel {
       reversible: descriptor.reversible === true,
       approval: descriptor.approval || "none",
     };
-    this.state.operations = [...this.state.operations.filter((item) => item.status === "running" || item.id !== operationId), operation].slice(-80);
+    this.state.operations = [...this.state.operations.filter((item) => item.status === "running" || item.id !== operationId), operation].slice(-160);
     if (countable) this.state.task = {
       ...task,
       budget: {
@@ -327,7 +362,10 @@ class AgentKernel {
     if (!action?.id) throw new Error("A durable action needs an id.");
     const existing = this.state.actions.find((item) => item.id === action.id);
     if (existing) return existing;
-    this.state.actions = [...this.state.actions, { ...action }].slice(-120);
+    // Sized above the step/command budget ceilings (64 steps × retries) so a
+    // task's own action history cannot silently truncate mid-run — the
+    // anti-repeat guard and completion gates depend on it.
+    this.state.actions = [...this.state.actions, { ...action }].slice(-512);
     this.persist("action.proposed", { action });
     return action;
   }
@@ -348,6 +386,21 @@ class AgentKernel {
     if (["completed", "failed", "blocked", "cancelled", "rejected"].includes(action.status) && action.status !== statuses[transition]) return action;
     action.status = statuses[transition];
     Object.assign(action, patch);
+    // Failure teaching: the host attaches a next-step hint to terminal
+    // failure/block records so the action.faild / action.blockd journal
+    // payload carries it onto the durable spine — never model-claimed text.
+    if (["failed", "blocked"].includes(action.status) && !String(action.suggestion || "").trim()) {
+      const errorClass = resolveFailureClass(
+        action.failureCategory || action.errorClass || classifyFailure(null, { code: action.code, error: action.error }),
+        { message: action.error },
+      );
+      action.errorClass = action.errorClass || errorClass;
+      action.suggestion = failureHint(errorClass, {
+        message: action.error,
+        commandId: action.commandId,
+        inputHint: this.commandRegistry?.[action.commandId]?.inputHint,
+      });
+    }
     const stamp = nowIso();
     if (transition === "validate") action.validatedAt = stamp;
     if (transition === "start") action.startedAt = stamp;
@@ -360,9 +413,32 @@ class AgentKernel {
     if (!observation?.id) throw new Error("A durable observation needs an id.");
     const existing = this.state.observations.find((item) => item.id === observation.id);
     if (existing) return existing;
-    this.state.observations = [...this.state.observations, { ...observation }].slice(-120);
-    this.persist("observation.recorded", { observation });
-    return observation;
+    // Uniform action observations: {commandId, status, summary,
+    // evidenceRefs, suggestion?}. Older producers may omit commandId —
+    // recover it from the operation (or in-flight action) — and failed or
+    // blocked observations always get a host-authored next-step hint.
+    const enriched = { ...observation };
+    const context = this.observationContext(enriched);
+    if (!enriched.commandId) enriched.commandId = context.commandId;
+    if (enriched.status === "failed" || enriched.status === "blocked") {
+      const output = enriched.structuredOutput && typeof enriched.structuredOutput === "object" ? enriched.structuredOutput : {};
+      const errorClass = resolveFailureClass(
+        enriched.errorClass || classifyFailure(null, { ...output, error: enriched.error || output.error || output.stderr }),
+        { message: enriched.error || output.error || output.stderr || output.summary || enriched.summary },
+      );
+      enriched.errorClass = enriched.errorClass || errorClass;
+      if (!String(enriched.suggestion || "").trim()) {
+        enriched.suggestion = failureHint(errorClass, {
+          message: enriched.error || output.error || output.stderr || output.summary || enriched.summary,
+          commandId: enriched.commandId,
+          inputHint: context.inputHint || output.inputHint,
+          requiredFields: output.requiredFields || output.missingFields,
+        });
+      }
+    }
+    this.state.observations = [...this.state.observations, enriched].slice(-512);
+    this.persist("observation.recorded", { observation: enriched });
+    return enriched;
   }
 
   appendEpisodeEvent(taskId, event) {
@@ -384,12 +460,12 @@ class AgentKernel {
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
-    if (event.action) current.actions = [...current.actions, event.action].slice(-24);
-    if (event.observation) current.observations = [...current.observations, event.observation].slice(-24);
-    if (event.userCorrection) current.userCorrections = [...current.userCorrections, event.userCorrection].slice(-12);
-    if (event.verificationReceipt) current.verificationReceipts = [...current.verificationReceipts, event.verificationReceipt].slice(-12);
-    if (event.changeSetRef) current.changeSetRefs = [...current.changeSetRefs, event.changeSetRef].slice(-8);
-    if (event.candidateLesson) current.candidateLessons = [...current.candidateLessons, event.candidateLesson].slice(-8);
+    if (event.action) current.actions = [...current.actions, event.action].slice(-96);
+    if (event.observation) current.observations = [...current.observations, event.observation].slice(-96);
+    if (event.userCorrection) current.userCorrections = [...current.userCorrections, event.userCorrection].slice(-24);
+    if (event.verificationReceipt) current.verificationReceipts = [...current.verificationReceipts, event.verificationReceipt].slice(-24);
+    if (event.changeSetRef) current.changeSetRefs = [...current.changeSetRefs, event.changeSetRef].slice(-16);
+    if (event.candidateLesson) current.candidateLessons = [...current.candidateLessons, event.candidateLesson].slice(-16);
     if (event.outcome) current.outcome = event.outcome;
     current.updatedAt = nowIso();
     this.state.episodes = [...this.state.episodes.filter((item) => item.id !== id), current].slice(-40);
@@ -447,7 +523,7 @@ class AgentKernel {
       acceptedAt: null,
       dismissedAt: null,
     };
-    this.state.candidates = [...this.state.candidates, candidate].slice(-120);
+    this.state.candidates = [...this.state.candidates, candidate].slice(-240);
     this.persist("candidate.created", { candidate });
     return candidate;
   }

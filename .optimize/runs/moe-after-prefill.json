@@ -1,0 +1,11 @@
+{
+  "mode": "prefill",
+  "ttft_ms": 7821.998583000095,
+  "prefill_tps": 404.628045686257,
+  "prompt_tokens": 3165,
+  "cached_tokens": 0,
+  "reps": 3,
+  "url": "http://127.0.0.1:8081",
+  "model": null,
+  "ts": "2026-09-22T14:07:09"
+}

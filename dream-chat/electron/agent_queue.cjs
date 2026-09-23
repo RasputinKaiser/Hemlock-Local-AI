@@ -20,12 +20,19 @@ function isActiveTask(task) {
 
 function safePayload(payload = {}) {
   return {
-    text: String(payload.text || payload.objective || "").slice(0, 1000),
-    objective: String(payload.objective || payload.text || "").slice(0, 1000),
+    text: String(payload.text || payload.objective || "").slice(0, 4000),
+    objective: String(payload.objective || payload.text || "").slice(0, 4000),
     intent: payload.intent || null,
     mode: payload.mode || null,
     source: payload.source || "command-center",
     requestId: payload.requestId || null,
+    // Routing/autonomy fields are small scalars an intent needs to execute
+    // the way it was submitted — dropping them on session restore would
+    // silently retarget the queued intent to the default thread and lane.
+    threadId: payload.threadId || null,
+    workspaceRoot: payload.workspaceRoot || null,
+    autonomy: payload.autonomy || null,
+    fallbackLane: payload.fallbackLane || null,
   };
 }
 
@@ -72,16 +79,45 @@ class AgentIntentQueue {
     if (this.active || (task && isActiveTask(task))) {
       return this.enqueue(payload);
     }
+    // Entries already waiting (e.g. session-restored pending intents) own the
+    // lane: a fresh submission must queue behind them, not start ahead of
+    // older work. Enqueue, then nudge the drain so FIFO order survives.
+    if (this.pending.length) {
+      const result = this.enqueue(payload);
+      void this.drain();
+      return result;
+    }
     return this.start(payload);
   }
 
   enqueue(payload = {}) {
     // T10-LaneA: reject an identical objective that is already queued rather
-    // than stacking it behind itself. Only pending entries count — an active
-    // task can still be steered toward the same objective. FIFO order and
-    // durable state are untouched on a duplicate.
+    // than stacking it behind itself. FIFO order and durable state are
+    // untouched on a duplicate.
     const incoming = String(payload.objective || payload.text || "").trim().toLowerCase();
     if (incoming) {
+      // The running entry counts too: queueing a duplicate of in-flight work
+      // would re-execute the same intent right after it finishes.
+      const activeObjective = String(this.active?.payload?.objective || this.active?.payload?.text || this.activeTask()?.objective || "").trim().toLowerCase();
+      if (this.active && activeObjective === incoming) {
+        return Promise.resolve({
+          schema: "hemlock.agent.queue.result.v1",
+          status: "duplicate",
+          requestId: this.active.requestId,
+          queueEntry: { ...this.active, payload: safePayload(this.active.payload), position: 0 },
+          queue: this.snapshot(),
+          claimBoundary: "An identical objective is already running; the new request was rejected without queueing a second execution.",
+        });
+      }
+      if (!this.active && activeObjective === incoming && isActiveTask(this.activeTask())) {
+        return Promise.resolve({
+          schema: "hemlock.agent.queue.result.v1",
+          status: "duplicate",
+          requestId: this.activeTask()?.id || null,
+          queue: this.snapshot(),
+          claimBoundary: "An identical objective is already the active task; the new request was rejected without queueing a second execution.",
+        });
+      }
       const duplicateIndex = this.pending.findIndex((entry) => String(entry.payload.objective || entry.payload.text || "").trim().toLowerCase() === incoming);
       if (duplicateIndex >= 0) {
         const duplicate = this.pending[duplicateIndex];
@@ -164,12 +200,57 @@ class AgentIntentQueue {
     if (this.active || !this.pending.length || isActiveTask(this.activeTask())) return;
     const next = this.pending.shift();
     this.sync();
-    await this.start(next.payload, next);
+    try {
+      await this.start(next.payload, next);
+    } catch {
+      // start() already marked the entry failed and emitted task.queue.failed
+      // — the rejection is receipted. Swallow it here: drain() is called
+      // fire-and-forget (void) from start()'s finally and notifyTaskSettled(),
+      // so a propagated rejection surfaces as an unhandledRejection that
+      // kills the host. Keep draining: the next entry is independent work.
+      await this.drain();
+    }
   }
 
   async notifyTaskSettled() {
     if (this.active) return;
     await this.drain();
+  }
+
+  // Session persistence: pending intents are serialized into the session
+  // state file and restored on boot as "queued" — never auto-executed.
+  // Payloads stay bounded to the safe fields (same contract as snapshot()) so
+  // a stale snapshot cannot resurrect an oversized transcript.
+  persistablePending() {
+    return this.pending.map((entry) => ({ ...entry, payload: safePayload(entry.payload) }));
+  }
+
+  restorePending(entries = [], { restoredFromSessionId = null } = {}) {
+    const restored = [];
+    const seen = new Set(this.pending.map((entry) => String(entry.payload?.objective || entry.payload?.text || "").trim().toLowerCase()));
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry || typeof entry !== "object") continue;
+      const payload = entry.payload && typeof entry.payload === "object" ? safePayload(entry.payload) : {};
+      const objective = String(payload.objective || payload.text || "").trim();
+      if (!objective || seen.has(objective.toLowerCase())) continue;
+      seen.add(objective.toLowerCase());
+      restored.push({
+        schema: "hemlock.agent.queue.entry.v1",
+        id: String(entry.id || id("intent")),
+        requestId: String(entry.requestId || id("request")),
+        payload,
+        status: "queued",
+        queuedAt: entry.queuedAt || this.now(),
+        startedAt: null,
+        finishedAt: null,
+        error: null,
+        ...(restoredFromSessionId ? { restoredFromSessionId } : {}),
+      });
+    }
+    if (!restored.length) return restored;
+    this.pending.push(...restored);
+    this.sync();
+    return restored;
   }
 
   cancelQueued(requestId) {

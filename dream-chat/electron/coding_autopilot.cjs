@@ -3,13 +3,13 @@ const { digest } = require("./thread_manager.cjs");
 const REPAIR_SCHEMA = "hemlock.agent.repair.v1";
 
 class CodingAutopilot {
-  constructor({ inferRepair, apply, verify, rollback, emit = () => {}, maxAttempts = 2 } = {}) {
+  constructor({ inferRepair, apply, verify, rollback, emit = () => {}, maxAttempts = 4 } = {}) {
     this.inferRepair = inferRepair;
     this.apply = apply;
     this.verify = verify;
     this.rollback = rollback;
     this.emit = emit;
-    this.maxAttempts = Math.max(0, Number(maxAttempts || 2));
+    this.maxAttempts = Math.max(0, Number(maxAttempts || 4));
   }
 
   async run({ threadId, taskId, objective, baseChangeSetId = null, issues = [], context = {} } = {}) {

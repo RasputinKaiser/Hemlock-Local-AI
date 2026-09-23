@@ -7,6 +7,8 @@ const {
   parseModelReply,
   buildLiveToolUseReceipt,
   runLiveToolUseEval,
+  compareLiveRuns,
+  runAdapterComparison,
 } = require("./tool_use_live.cjs");
 
 const FIXTURES = require("../evals/tool-use/benchmark.json");
@@ -150,4 +152,95 @@ test("receipt carries a claimBoundary that never claims task completion", () => 
   assert.match(receipt.claimBoundary, /task completion is never claimed/i);
   assert.equal(receipt.taskCompletionRate, undefined);
   assert.equal(receipt.completed, undefined);
+});
+
+test("taskMatch distinguishes the right command from merely a valid one", async () => {
+  const inferenceFn = async ({ task }) => {
+    // Answer every task with its first expected command — or the mapped
+    // terminal kind for tasks whose sequence ends in a wait/block state.
+    const first = task.expectedActionSequence[0];
+    if (task.expectedTerminalState === "waiting_for_approval") return JSON.stringify({ kind: "ask_user", question: "approve?" });
+    return envelopeFor(first);
+  };
+  const runResult = await runLiveToolUseEval({ inferenceFn, limit: 4, maxMs: 60000 });
+  // First 4 tasks all expect completed + a specific first command.
+  assert.equal(runResult.results[0].taskMatch, true);
+  assert.equal(runResult.taskMatchRate, 1);
+  // An allowlisted-but-wrong command is a valid envelope yet a task miss
+  // (task 0 expects repo-map; file.search parses but doesn't match).
+  const wrong = await runLiveToolUseEval({ inferenceFn: async () => envelopeFor("file.search"), limit: 1, maxMs: 60000 });
+  assert.equal(wrong.results[0].validEnvelope, true);
+  assert.equal(wrong.results[0].taskMatch, false);
+  assert.equal(wrong.taskMatchRate, 0);
+});
+
+test("terminal kinds match only the expected terminal state", async () => {
+  const ask = async () => JSON.stringify({ kind: "ask_user", question: "ok?" });
+  // plan-approval expects waiting_for_approval → ask_user is the right call.
+  const planTask = FIXTURES.tasks.find((task) => task.id === "plan-approval");
+  const benchmark = { schema: "hemlock.agent.tool-use.benchmark.v1", tasks: [planTask] };
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tool-use-live-")), "benchmark.json");
+  fs.writeFileSync(tmp, JSON.stringify(benchmark));
+  const matched = await runLiveToolUseEval({ inferenceFn: ask, benchmarkPathOverride: tmp, maxMs: 60000 });
+  assert.equal(matched.results[0].taskMatch, true);
+  // repo-map expects completed — asking a question is the wrong terminal.
+  const single = { schema: "hemlock.agent.tool-use.benchmark.v1", tasks: [FIXTURES.tasks[0]] };
+  fs.writeFileSync(tmp, JSON.stringify(single));
+  const missed = await runLiveToolUseEval({ inferenceFn: ask, benchmarkPathOverride: tmp, maxMs: 60000 });
+  assert.equal(missed.results[0].taskMatch, false);
+});
+
+test("compareLiveRuns reports per-task transitions and a verdict", async () => {
+  const baseRun = {
+    lane: "tool-use-live:base",
+    respondedRate: 1,
+    validEnvelopeRate: 1,
+    taskMatchRate: 0.5,
+    results: [
+      { taskId: "a", responded: true, parseStatus: "parsed", commandId: "repo-map", validEnvelope: true, taskMatch: true },
+      { taskId: "b", responded: true, parseStatus: "parsed", commandId: "file.read", validEnvelope: true, taskMatch: false },
+    ],
+  };
+  const candidateRun = {
+    lane: "tool-use-live:candidate",
+    adapterPath: "/tmp/adapters",
+    respondedRate: 1,
+    validEnvelopeRate: 1,
+    taskMatchRate: 1,
+    results: [
+      { taskId: "a", responded: true, parseStatus: "parsed", commandId: "repo-map", validEnvelope: true, taskMatch: true },
+      { taskId: "b", responded: true, parseStatus: "parsed", commandId: "file.search", validEnvelope: true, taskMatch: true },
+    ],
+  };
+  const comparison = compareLiveRuns(baseRun, candidateRun);
+  assert.equal(comparison.schema, "hemlock.agent.tool-use.live-comparison.v1");
+  assert.equal(comparison.verdict, "improved");
+  assert.equal(comparison.deltas.taskMatchRate, 0.5);
+  assert.equal(comparison.candidateAdapterPath, "/tmp/adapters");
+  const regressed = compareLiveRuns(candidateRun, baseRun);
+  assert.equal(regressed.verdict, "regressed");
+  assert.equal(regressed.deltas.taskMatchRate, -0.5);
+  assert.match(comparison.claimBoundary, /promotion evidence, not proof/i);
+});
+
+test("runAdapterComparison runs base and candidate lanes through the same tasks", async () => {
+  const seen = [];
+  const inferenceFn = async ({ task, adapterPath }) => {
+    seen.push({ taskId: task.id, adapterPath });
+    // The adapter lane picks the expected command; the base lane picks a
+    // different allowlisted one.
+    return envelopeFor(adapterPath ? task.expectedActionSequence[0] : "repo-map");
+  };
+  const result = await runAdapterComparison({ inferenceFn, adapterPath: "/tmp/adapters", limit: 2, maxMs: 60000 });
+  assert.equal(result.base.results.length, 2);
+  assert.equal(result.candidate.results.length, 2);
+  assert.equal(seen.filter((call) => call.adapterPath === "/tmp/adapters").length, 2);
+  assert.equal(seen.filter((call) => call.adapterPath === "").length, 2);
+  // Both base picks land on "repo-map": task 0 matches, task 1 misses.
+  assert.equal(result.base.taskMatchRate, 0.5);
+  assert.equal(result.candidate.taskMatchRate, 1);
+  assert.equal(result.comparison.verdict, "improved");
 });

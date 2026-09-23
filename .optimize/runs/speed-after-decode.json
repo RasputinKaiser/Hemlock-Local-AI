@@ -1,0 +1,15 @@
+{
+  "mode": "decode",
+  "ttft_ms": 144.2245839999714,
+  "decode_tps": 63.008593365486384,
+  "completion_tokens": 128,
+  "prompt_tokens": 25,
+  "cached_tokens": 24,
+  "context_tokens": 0,
+  "last_text": "\n\nHere are the first six prime numbers, each with a brief explanation of why it is prime:\n\n1. **2** \u2013 The only even prime number, and it has no positive divisors other than 1 and itself.  \n2. **3** \u2013 It is not divisible by 2, so it is prime.  \n3. **5** \u2013",
+  "reps": 5,
+  "warmup": 1,
+  "url": "http://127.0.0.1:8081",
+  "model": null,
+  "ts": "2026-09-22T00:26:43"
+}

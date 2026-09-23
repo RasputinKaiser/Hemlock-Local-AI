@@ -4,9 +4,9 @@ import { APP_SHORTCUTS } from "../workspaceNavigation.js";
 import "./workspace-controls.css";
 
 const groups = [
-  { title: "Navigate", items: [["apps", "All apps / window overview", "⌘⇧O"], ["command", "Search commands", "⌘K"], ["windows", "Cycle open windows", "⌘`"], ["desktop", "Show desktop / restore windows", "⌘⌥D"], ["keyboard", "This shortcut guide", "F1"]] },
-  { title: "Arrange the active window", items: [["tileLeft", "Tile left", "⌘⌥←"], ["tileRight", "Tile right", "⌘⌥→"], ["maximize", "Fill workspace", "⌘⌥↑"], ["restore", "Restore size", "⌘⌥↓"], ["minimize", "Minimize", "⌘⌥M"], ["close", "Close window", "⌘⌥W"]] },
-  { title: "Conversation & controls", items: [["send", "Send a message", "Enter"], ["chat", "New line", "Shift+Enter"], ["connection", "Choose model", "⌘⇧M"], ["copy", "Copy with provenance", "Option-click Copy"], ["resetSize", "Resize a focused edge", "Arrows · Shift for larger steps"]] },
+  { title: "Navigate", items: [["apps", "All apps / window overview", "⌘⇧O"], ["command", "Search commands", "⌘K"], ["command", "Run a palette result", "⌘1–9"], ["windows", "Cycle open windows", "⌘`"], ["desktop", "Show desktop / restore windows", "⌘⌥D"], ["windows", "Move along the dock · window actions menu", "← → · Shift+F10"], ["keyboard", "This shortcut guide", "F1"]] },
+  { title: "Arrange the active window", items: [["tileLeft", "Tile left", "⌘⌥←"], ["tileRight", "Tile right", "⌘⌥→"], ["maximize", "Fill workspace", "⌘⌥↑"], ["restore", "Restore size", "⌘⌥↓"], ["maximize", "Double-click a title bar", "fill / restore"], ["minimize", "Minimize", "⌘⌥M"], ["close", "Close window", "⌘W"]] },
+  { title: "Conversation & controls", items: [["send", "Send a message", "Enter"], ["chat", "New line", "Shift+Enter"], ["search", "Filter the transcript", "⌘F"], ["connection", "Choose model", "⌘⇧M"], ["copy", "Copy with provenance", "Option-click Copy"], ["resetSize", "Resize a focused edge", "Arrows · Shift for larger steps"]] },
   { title: "Agent control", items: [["target", "Autonomy — Supervised · Guided · Autonomous", "composer bar"], ["pencil", "Redirect the active task", "steer: instruction"], ["play", "Start an autonomous bounded run", "campaign: goal"], ["pause", "Pause / resume at a step boundary", "active-step card"], ["pulse", "Scored action choice", "scored: cmd · margin"]] },
 ];
 

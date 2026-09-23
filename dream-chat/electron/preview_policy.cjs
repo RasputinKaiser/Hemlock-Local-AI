@@ -1,7 +1,7 @@
 const crypto = require("node:crypto");
 
 const PREVIEW_SCHEMA = "hemlock.agent.preview.v1";
-const DEFAULT_BUDGET = Object.freeze({ maxPreviewActions: 24, maxPreviewRetriesPerAction: 2, maxPreviewScreenshots: 8, maxPreviewWallClockMs: 300000 });
+const DEFAULT_BUDGET = Object.freeze({ maxPreviewActions: 64, maxPreviewRetriesPerAction: 4, maxPreviewScreenshots: 24, maxPreviewWallClockMs: 600000 });
 const REGISTERED_ACTIONS = new Set(["inspect", "accessibility", "resize", "click", "type", "key", "scroll", "hover", "focus", "wait", "screenshot", "pause", "stop"]);
 
 function digest(value) { return `sha256:${crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`; }
@@ -41,7 +41,7 @@ class PreviewSessionManager {
   }
   complete(sessionId, input = {}) {
     const session = this.get(sessionId);
-    const record = { schema: "hemlock.agent.preview.interaction.v1", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, target: input.target || null, input: input.input || null, preDigest: input.preDigest || null, postDigest: input.postDigest || null, result: input.result || "completed", consoleErrors: Array.isArray(input.consoleErrors) ? input.consoleErrors.slice(0, 20) : [], screenshotRef: input.screenshotRef || null, elapsedMs: Number(input.elapsedMs || 0), previewOnlyMutation: true, at: new Date(this.now()).toISOString() };
+    const record = { schema: "hemlock.agent.preview.interaction.v1", taskId: session.taskId, artifactId: session.artifactId, revision: session.revision, target: input.target || null, input: input.input || null, preDigest: input.preDigest || null, postDigest: input.postDigest || null, result: input.result || "completed", consoleErrors: Array.isArray(input.consoleErrors) ? input.consoleErrors.slice(0, 40) : [], screenshotRef: input.screenshotRef || null, elapsedMs: Number(input.elapsedMs || 0), previewOnlyMutation: true, at: new Date(this.now()).toISOString() };
     if (input.inspection) session.lastInspectionDigest = digest(JSON.stringify(input.inspection));
     this.emit("artifact.interaction.completed", record.result === "blocked" ? "blocked" : "passed", { session: { ...session }, interaction: record });
     return record;

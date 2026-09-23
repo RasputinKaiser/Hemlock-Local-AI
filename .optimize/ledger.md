@@ -1,39 +1,129 @@
-# Hemlock optimization ledger
+# Hemlock .optimize ledger
 
-This ledger records measured, behavior-preserving optimization passes. The
-repository was already dirty when this first baseline was created; existing
-user work remains un-staged and uncommitted.
+## 2026-09-22 — Maple decode/prefill speed episode (SPEED swarm agent + integration)
 
-## Run 1 — 2026-08-15 (full pass, dirty)
+Workspace: /Users/ianzvirbulis/Code/Hemlock (dirty tree, multi-agent pass).
+Baseline receipt: .optimize/runs/speed-baseline.json (2026-09-21, live maple-2bit-mlx :8081).
+After receipts: .optimize/runs/speed-after-{decode,prefill,score}.json (2026-09-22, same server config).
 
-- Applied: explicit Maple/Dream runtime launch command, fail-fast child readiness, single-flight launch handling, launch receipt tests, lazy closed/minimized surface rendering, and deferred provider CLI status checks.
-- Verification: 44 agent tests, 10 UI tests, production build, syntax, YAML, browser preview, and Electron startup passed.
-- Measured dev-loop medians from this machine:
-  - build `0.462s -> 0.403s`
-  - agent tests `0.389s -> 0.384s` (the after probe includes three new host/receipt tests)
-  - UI tests `0.284s -> 0.243s`
-  - syntax `0.111s -> 0.092s`
-- Interpretation: all probes stayed green, but no wall-clock result cleared the optimization acceptance threshold (>5% or >2s). No timed speedup is claimed. The renderer work is a structural reduction in hidden-surface construction, and the runtime work is stability-oriented.
-- Commits: baseline harness committed as `fb8e262`; application changes remain mixed with pre-existing user WIP and were not staged.
-- Next run: add a focused renderer/runtime benchmark so UI work can be accepted or rejected with a direct runtime measurement rather than build timing.
+Probes (dream-chat/scripts/maple_bench.py, live server, same flags both sides):
+- decode:    30.65 tok/s -> ~64 tok/s (median 58.9-67.8 across runs)  ~+2.0x
+- ttft:      392.7ms    -> ~140ms (short prompt, warm)               ~-60%
+- prefill:   182.6 t/s  -> ~419 t/s (3165-token prompt, cold)        ~+2.3x
+- score:     318ms/cand -> ~125ms/cand (/v1/score, 8 candidates)     ~-60%
+- kv-bits:   57.1 t/s exact vs 72.8 t/s kv-bits=8 at 2455-tok ctx    ~+27% (opt-in)
 
-## Run 2 — 2026-08-15 (Maple runtime pass, dirty)
+Changes: mlx_lm/models/maple.py — one shared (pos,eps) array per decode step
+instead of ~24 per-layer mx.array dispatches (float(offset) on an mx.array
+forced a GPU sync every layer of every token); fused qk norm+rope path
+retained. generate.py maybe_quantize_kv_cache — only true KVCache converts
+(RotatingKVCache.to_quantized raised NotImplementedError and aborted the
+Metal command buffer — observed server kill; sliding layers now safely skip).
+server.py --kv-bits/--quantized-kv-start plumbing; lora.py os._exit(0) GIL
+finalization fix. main.cjs serverArgs: HEMLOCK_KV_BITS (default 0=off),
+HEMLOCK_KV_QUANT_START (default 5000), kvBits runtime setting (next-launch).
 
-- Applied: Maple stream-frame coalescing at a 16 ms host-to-renderer boundary, synchronous terminal flushes, and child-process error/pre-readiness-exit receipts.
-- Verification: 47 agent tests, 10 UI tests, production build, syntax, YAML, diff check, and Electron desktop startup passed. Desktop startup was stopped cleanly; no Maple inference request was sent.
-- Maple health baseline: `.optimize/runs/20260815T-maple-baseline.json` measured `5.228s` to local `/health`; `.optimize/runs/20260815T-maple-after.json` measured `3.264s`. The faster after sample is recorded but not attributed because the one-shot model-load probe is cache/system-state sensitive.
-- Stream probe: 4,000 synthetic source deltas reduced to 2 IPC frames across two channels (`99.95%` fewer host-to-renderer sends); this is a dispatch-count result, not a claim about Maple generation throughput.
-- Full regression probe: build `0.366s`, agent tests `0.577s`, UI tests `0.301s`, syntax `0.118s`, Maple health `4.040s`, and stream dispatch `0.047s`; every probe passed.
-- Commits: application changes remain mixed with pre-existing user WIP and were not staged. The new measurement artifacts are present under `.optimize/` for the next focused pass.
-- Next run: if a true model-throughput claim is needed, add a bounded Maple inference benchmark only with explicit approval to invoke local inference; otherwise keep the IPC and launch receipts as the accepted host-side improvements.
+Gates: 50/50 test_server.py, 485/485 electron, 288/291 UI (3 skip), build clean.
+Identical greedy completion between exact and kv-quant configs on same prompt.
+Negative/deferred: n-gram speculative still incompatible with SWA-512 (unchanged);
+kv-bits opt-in, 8-bit recommended over 4.
 
-## Run 3 — 2026-08-15 (Maple agent reliability and artifact autopilot, dirty)
+## 2026-09-22 — PERF2 decode audit (continuation pass)
 
-- Applied: Explore/Build interaction mode, host-owned action compilation, artifact receipts, renderer preview-report handshake, static artifact verification, complete-source/patch repair inputs, bounded two-pass repair state, rollback, and retry/use-last-good UI actions.
-- Verification: 54 agent tests, 10 UI tests, production build, syntax, diff check, and the deterministic artifact autopilot fixture passed.
-- Deterministic fixture result: `completed=true`, `inferenceCalls=7`, `terminalInferenceCalls=0`, `repairCalls=2`, `repairAttempts=2`, `previewInspectionCalls=2`, `artifactRevisionCount=2`, `repositoryTouched=false`, `falseSuccess=false`.
-- Measured dev-loop medians from `.optimize/runs/20260815T171003.json`: build `0.367s`, agent tests `0.371s`, UI tests `0.235s`, syntax `0.087s`, Maple health `5.003s`, stream dispatch `0.036s`, artifact autopilot `0.183s`. All probes passed; no timed speedup is claimed because this pass is primarily a correctness/false-success reduction.
-- Commits: none; the repository contains pre-existing user WIP and the implementation remains unstaged/uncommitted.
-- Final affected-probe verification: `.optimize/runs/20260815T-final-verify.json`; build `0.364s`, agent tests `0.406s`, UI tests `0.241s`, syntax `0.089s`, artifact autopilot `0.177s`, all green. The agent-test sample moved `0.035s` on a sub-second probe, below the skill's absolute `2s` acceptance threshold, so it is not treated as a performance regression.
-- Final post-compatibility verification: `.optimize/runs/20260815T-final-verify-2.json`; build `0.428s`, agent tests `0.372s`, UI tests `0.236s`, syntax `0.090s`, artifact autopilot `0.174s`, all green. Build variance was `+0.064s` versus the prior affected run, below the absolute `2s` threshold; no timed speedup or regression is claimed.
-- Next run: exercise one real Electron preview report in the desktop runtime if a visual proof is needed; keep live Maple inference optional and measure it separately from deterministic host reliability.
+Receipts: .optimize/runs/perf2-before.json (72.12 tok/s decode on stale
+checkpoint maple.py), perf2-after.json (88.49 tok/s; post-sync reference
+run hit 90.78 tok/s — same code, run-to-run noise band ~3%).
+
+BIG finding — checkpoint/runtime skew: the live model loads
+~/Models/Hemlock/maple-2bit-mlx/maple.py (config.json model_file +
+--trust-remote-code), NOT the repo copy. The checkpoint file predated the
+prior optimization pass, so the shared (pos,eps) fix was dormant in live
+serving. Copying the repo file into the checkpoint moved decode
+72.1 -> ~90 tok/s with no repo diff. The checkpoint is a build artifact;
+the durable fix is regenerating it through the normal packaging flow.
+Backup of the pre-sync file: maple-2bit-mlx/maple.py.bak-perf2.
+
+Decode floor analysis (standalone, plain caches, flash-head):
+~1005 graph nodes/step, ~470 real kernels. eval = 11.6ms/step.
+Breakdown: MoE block 7.25ms (gather_qmm pair dominant), attention 2.55ms,
+rest ~1.7ms. CPU build 1.4ms standalone (~7ms server-side with batch
+caches). View nodes (reshape/slice) cost ~0.85us each — not the
+bottleneck. Per-kernel dispatch ~14-30us is.
+
+Attempted, measured, REVERTED:
+- Custom fused-expert Metal kernels (2-bit dequant gemv + swiglu + weighted
+  down, simdgroup-cooperative, register-staged x, uint4 loads): correct
+  (maxdiff 0.004) but ~0.7ms vs ~0.5ms eager gather_qmm chain per layer.
+  gather_qmm is already well-tuned; a naive scalar dequant-gemv cannot beat
+  it. Would need simdgroup_matrix (tensor-core) kernels — deferred.
+- mx.compile over the whole expert block: router kernel mutates a device
+  atomic counter (last-block-finish trick) — unsafe/incorrect inside a
+  compile trace (maxdiff 0.58). Compiling only switch_mlp+aggregate works
+  and is correct but measurably neutral — not retained.
+- mx.compile replay of non-fusible op chains only saves ~11% eval time;
+  whole-step compile is blocked by Python-int cache slice indices (would
+  recompile every step).
+
+Kept (neutral-to-small, zero-risk):
+- _add_rms_norm: dropped input reshapes (kernel reads flat anyway).
+- _qk_fused: consumes the flat fused qkv row, derives grid from head
+  counts; saves a slice+reshape per layer.
+- generate.py GenerationBatch._step: B==1 sampler fast path skips the
+  per-row slice+concatenate when the batch has one request.
+
+Sampler/logit audit: make_sampler(temp=0) already returns argmax lambda;
+sampling ~0.01ms — no win available. Cache deepcopy for score forks:
+~0.04ms per 8MB — not a hot spot. Prompt cache/trie path already skips
+re-prefill on hits.
+
+Gates: 50/50 test_server.py; py_compile clean on touched files.
+Greedy equivalence: temp-0 completion for a fixed prompt is IDENTICAL
+between the pre-perf2 checkpoint maple.py and the synced repo version.
+
+## moe3 — fused MoE decode kernels (retained)
+
+Replaced the single-token MoE path (gather_qmm up/gate + SwiGLU +
+gather_qmm down + score-weighted aggregate, ~6 dispatches/layer) with two
+custom Metal kernels in maple.py (`MapleSwitchGLU.fused_decode`):
+
+- `maple_moe_upgate`: all 8 selected experts' fused up+gate projection,
+  2-bit affine dequant in registers (grouped `s*sum(q*x)+b*sum(x)`),
+  packed uint4 activation reads, clamped SwiGLU -> expert intermediates.
+- `maple_moe_down`: 8 experts' down projection + router-score weighted
+  accumulation -> final (1,1,2048) output in one dispatch.
+- One-time `_matches` probe per layer vs the reference path; falls back to
+  gather_qmm on any mismatch/failure or non-decode shape.
+
+Correctness: fused=True on all 24 layers, maxdiff <= 0.03125 bf16,
+greedy (temp-0) completion IDENTICAL fused vs reference.
+
+Measured wins:
+- in-process A/B (alternating, same session): eager eval 15.29-15.37ms vs
+  fused 14.97-15.02ms -> ~0.35ms/step saved (~2.3%).
+- live A/B back-to-back on :8081 (checkpoint maple.py swapped, 8-rep
+  decode medians): reference 72.4 tok/s -> fused 75.7 tok/s (+3.3, ~4.6%);
+  ttft ~159ms both.
+- prefill unaffected (multi-token path untouched): 385.5 -> 404.6 tok/s.
+- score: 128.1 -> 124.2 ms/candidate.
+- standalone fused_decode 244us vs reference switch+agg 264-341us/layer.
+Receipts: .optimize/runs/moe-{before,after}-{decode,prefill,score}.json
+(+ an 8-rep fused decode taken pre-swap). prof_gpu: build 1.38ms,
+eval 15.22ms (thermally drifted session; A/B is the arbiter).
+
+Attempted, measured, REVERTED:
+- Generic dequant-GEMV (`maple_qgemv`) for attention qkv_proj/o_proj
+  M==1 calls. First version (1 row/simdgroup) lost to qmm (58 vs 45us);
+  x-amortized 4-rows/simdgroup version reached parity (~49 vs 47us qkv,
+  ~39 vs 33us o_proj) — never a win; MLX's tiled qmm already handles
+  these shapes. Reverted; no diff remains.
+- Earlier same-session fused-kernel draft (threadgroup-staged x, scalar
+  dequant): eval 15.09ms vs 13.27ms baseline — slower; reworked into the
+  register/uint4/grouped-affine version that was retained.
+
+Why the win is smaller than the 7.25ms MoE line suggests: gather_qmm's
+~250-340us/layer is only ~2-3x above the ~90us packed-weight read floor;
+dequant fma is the wall for scalar kernels, not dispatch overhead. A
+simdgroup_matrix path would still pay the same per-element unpack cost.
+
+Gates: tests/test_server.py 63/63; py_compile clean; repo and checkpoint
+maple.py byte-identical. Checkpoint backup: maple.py.bak-moe3.

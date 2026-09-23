@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { writeFileAtomic, writeJsonAtomic } = require("./durable_io.cjs");
 const { digest, workspaceFingerprint } = require("./thread_manager.cjs");
 
 const CHANGE_SET_SCHEMA = "hemlock.agent.change-set.v1";
@@ -23,10 +24,9 @@ function relativePath(value) {
 }
 
 function atomicWrite(filePath, content) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, content, "utf8");
-  fs.renameSync(temporary, filePath);
+  // Temp + fsync + rename (durable_io): workspace sources and change-set
+  // receipts are never observed half-written after a crash.
+  writeFileAtomic(filePath, content);
 }
 
 class CodingWorkspace {
@@ -113,8 +113,8 @@ class CodingWorkspace {
       };
       fs.mkdirSync(changeRoot, { recursive: true });
       const rollback = { schema: "hemlock.agent.change-set.rollback.v1", changeSetId, threadId, workspaceRoot: thread.workspaceRoot, before };
-      fs.writeFileSync(path.join(changeRoot, "rollback.json"), `${JSON.stringify(rollback, null, 2)}\n`, "utf8");
-      fs.writeFileSync(path.join(changeRoot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+      writeJsonAtomic(path.join(changeRoot, "rollback.json"), rollback);
+      writeJsonAtomic(path.join(changeRoot, "manifest.json"), manifest);
       this.emit("change-set.applied", "passed", { changeSet: manifest }, { evidenceRefs: [path.join(changeRoot, "manifest.json")] });
       return { ...manifest, evidenceRefs: [path.join(changeRoot, "manifest.json"), path.join(changeRoot, "rollback.json")] };
     } catch (error) {

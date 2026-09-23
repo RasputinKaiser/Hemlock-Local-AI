@@ -51,6 +51,19 @@ function classifyHealthFailure(error) {
   return "unknown";
 }
 
+// A directory with config+weights but no tokenizer still fails at load — the
+// AutoTokenizer raises before the first request is ever served. Catching it
+// here turns a confusing server 404 into a "missing tokenizer files" fix.
+const TOKENIZER_MARKERS = new Set([
+  "tokenizer.json",
+  "tokenizer.model",
+  "tokenizer_config.json",
+  "vocab.json",
+  "vocab.txt",
+  "merges.txt",
+  "special_tokens_map.json",
+]);
+
 // Given a checkpoint directory's entry names, return what is missing for it to
 // be a loadable MLX conversion, or null when it looks complete. main.cjs owns
 // the filesystem reads; this stays pure over the name list.
@@ -59,6 +72,9 @@ function missingCheckpointItem(fileNames) {
   if (!names.includes("config.json")) return "config.json";
   if (!names.some((name) => typeof name === "string" && name.endsWith(".safetensors"))) {
     return "safetensors weights";
+  }
+  if (!names.some((name) => typeof name === "string" && (TOKENIZER_MARKERS.has(name) || name.startsWith("tokenizer")))) {
+    return "tokenizer files";
   }
   return null;
 }

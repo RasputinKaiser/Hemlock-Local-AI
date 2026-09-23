@@ -121,10 +121,101 @@ test("telemetry surfaces only real usage fields", () => {
   assert.equal(telemetryFor([]), null);
 });
 
+test("a live experiment summons the other residents to gather", () => {
+  const bound = bindGrove([
+    event("experiment.started", "running", { experimentId: "exp-g", experiment: "orbit" }),
+    event("experiment.completed", "passed", { experimentId: "exp-g", experiment: "orbit" }),
+  ], { now: NOW });
+  for (const id of ["lfm25", "dspark", "qwen-draft"]) {
+    const slot = bound.activity.get(id);
+    assert.ok(slot.pulses.some((pulse) => pulse.kind === "gather"), `${id} gathered`);
+    assert.equal(slot.gathered, true);
+    assert.equal(slot.level, 0, "gathering does not fake activity");
+  }
+  assert.ok(!bound.activity.get("maple").pulses.some((pulse) => pulse.kind === "gather"), "maple runs the rig, not the audience");
+});
+
+test("a failed experiment summons nobody", () => {
+  const bound = bindGrove([event("experiment.started", "failed", { experimentId: "exp-b", experiment: "orbit" })], { now: NOW });
+  for (const id of ["lfm25", "dspark", "qwen-draft"]) {
+    assert.ok(!bound.activity.get(id).pulses.some((pulse) => pulse.kind === "gather"));
+    assert.equal(bound.activity.get(id).gathered, false);
+  }
+});
+
+test("stale gather pulses decay inside the gather window", () => {
+  const bound = bindGrove([
+    event("experiment.completed", "passed", { experimentId: "exp-old", experiment: "orbit" }, at("2026-09-20T10:00:00Z")),
+  ], { now: NOW });
+  assert.equal(bound.activity.get("lfm25").gathered, false, "an old spine does not summon anyone");
+});
+
+test("ambience tracks dream heat, fresh failures, and event bustle", () => {
+  const quiet = bindGrove([], { now: NOW });
+  assert.deepEqual(quiet.ambience, { dream: 0, alert: 0, bustle: 0 });
+
+  const dreaming = bindGrove([event("dream.started", "running")], { now: NOW });
+  assert.ok(dreaming.ambience.dream > 0.9, "a live dream lights the aurora");
+
+  const cooled = bindGrove([event("dream.started", "running", {}, at("2026-09-20T08:00:00Z"))], { now: NOW });
+  assert.equal(cooled.ambience.dream, 0, "dream heat decays to nothing");
+
+  const settled = bindGrove([event("dream.adapter.completed", "passed")], { now: NOW });
+  assert.ok(settled.ambience.dream > 0.4 && settled.ambience.dream < 0.9, "a finished dream leaves afterglow");
+
+  const failing = bindGrove([
+    event("inference.failed", "failed", { provider: "maple" }),
+    event("command.failed", "failed", { provider: "maple" }),
+  ], { now: NOW });
+  assert.ok(failing.ambience.alert >= 0.5);
+
+  const busy = bindGrove(
+    Array.from({ length: 9 }, (_, i) => event("inference.started", "running", { provider: "maple" }, at(`2026-09-20T11:59:5${i}Z`))),
+    { now: NOW }
+  );
+  assert.equal(busy.ambience.bustle, 1, "a hot spine reads as bustle");
+});
+
+test("binding rows report gather status", () => {
+  const rows = bindingRows([event("experiment.started", "running", { experimentId: "e1", experiment: "spring" })], { now: NOW });
+  assert.equal(rows.find((row) => row.id === "lfm25").gathered, true);
+  assert.equal(rows.find((row) => row.id === "maple").gathered, false);
+});
+
 test("binding rows keep every claim inspectable", () => {
   const rows = bindingRows([event("inference.completed", "passed", { provider: "maple" })], { now: NOW });
   const maple = rows.find((row) => row.id === "maple");
   assert.equal(maple.lastEvent.type, "inference.completed");
   assert.ok(maple.directory.includes("Models/Hemlock"));
   assert.ok(rows.every((row) => row.activity >= 0 && row.activity <= 1));
+});
+
+test("world.placed events land a persistent marker and a place pulse on maple", () => {
+  const marker = { id: "marker-1", kind: "sign", label: "Pendulum clearing", position: { x: 3, z: -2 } };
+  const bound = bindGrove([event("world.placed", "placed", { marker })], { now: NOW });
+  assert.equal(bound.markers.length, 1);
+  assert.equal(bound.markers[0].id, "marker-1");
+  assert.equal(bound.markers[0].label, "Pendulum clearing");
+  const maple = bound.activity.get("maple");
+  assert.equal(maple.lastType, "world.placed");
+  assert.ok(maple.pulses.some((pulse) => pulse.kind === "place"));
+  assert.equal(bound.boundCount, 1, "a placed marker is real bound activity");
+});
+
+test("persisted markers survive a quiet session and events update by id", () => {
+  const stored = [{ id: "marker-a", kind: "monument", label: "Old stone", position: { x: 8, z: 8 } }];
+  const quiet = bindGrove([], { now: NOW, markers: stored });
+  assert.equal(quiet.markers.length, 1, "the durable store feeds the scene without events");
+  assert.equal(quiet.boundCount, 0, "stored markers do not fabricate activity");
+
+  const restated = { id: "marker-a", kind: "monument", label: "Renamed stone", position: { x: 9, z: 9 } };
+  const bound = bindGrove([event("world.placed", "placed", { marker: restated })], { now: NOW, markers: stored });
+  assert.equal(bound.markers.length, 1, "same id never duplicates");
+  assert.equal(bound.markers[0].label, "Renamed stone", "the event payload wins");
+});
+
+test("a failed world.placed does not fabricate a marker", () => {
+  const bound = bindGrove([event("world.placed", "failed", { marker: { id: "ghost", kind: "marker", label: "Ghost" } })], { now: NOW });
+  assert.equal(bound.markers.length, 0);
+  assert.equal(bound.activity.get("maple").pulses.at(-1)?.kind, "ember");
 });

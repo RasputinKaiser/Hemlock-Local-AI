@@ -6,7 +6,7 @@ const fs = require("node:fs");
 // Crash-loop policy (T7.5-R1). Pure policy tests here; the wiring in main.cjs
 // is guarded by source assertions at the bottom (main.cjs has no test export
 // seam — see maple_notify.test.cjs for the same pattern).
-const { recordCrash, shouldRespawn } = require(path.resolve(__dirname, "crash_policy.cjs"));
+const { recordCrash, sanitizeCrashHistory, shouldRespawn } = require(path.resolve(__dirname, "crash_policy.cjs"));
 
 const WINDOW = 600000;
 
@@ -68,6 +68,19 @@ test("recordCrash tolerates null/garbage input histories", () => {
   assert.deepEqual(recordCrash(["x", NaN], now), [now]);
 });
 
+test("sanitizeCrashHistory prunes invalid and out-of-window entries for a persisted load", () => {
+  const now = 1_000_000;
+  const persisted = [now - WINDOW - 1, now - 5000, "x", NaN, null, now - 100];
+  assert.deepEqual(sanitizeCrashHistory(persisted, { now }), [now - 5000, now - 100]);
+});
+
+test("sanitizeCrashHistory fails open on garbage input", () => {
+  assert.deepEqual(sanitizeCrashHistory(null), []);
+  assert.deepEqual(sanitizeCrashHistory(undefined), []);
+  assert.deepEqual(sanitizeCrashHistory("nope"), []);
+  assert.deepEqual(sanitizeCrashHistory(42), []);
+});
+
 // --- Wiring guards (source-level, main.cjs has no export seam) ---
 
 test("main.cjs wires crash recording into the child exit handler and gates restarts", () => {
@@ -82,4 +95,15 @@ test("main.cjs wires crash recording into the child exit handler and gates resta
   assert.match(src, /crashLooped:\s*true,\s*crashLoopReason:\s*verdict\.reason/);
   // ...and a user-initiated maple.launch resets the budget.
   assert.match(src, /launchMapleRuntime\(\{\s*resetCrashLoop:\s*true\s*\}\)/);
+});
+
+test("main.cjs persists the crash budget so it survives an app restart", () => {
+  const src = fs.readFileSync(path.resolve(__dirname, "main.cjs"), "utf8");
+  // History is stored in the session's maple-runtime.json companion file...
+  assert.match(src, /maple-runtime\.json/, "missing the maple-runtime.json persistence path");
+  // ...loaded (window-pruned) from the previous session at boot...
+  assert.match(src, /sanitizeCrashHistory\(readJsonFile\(previousMapleRuntimeStatePath/, "boot must load the previous session's crash history");
+  // ...and saved on every change: crash recorded and budget reset.
+  assert.match(src, /handleUnexpectedMapleExit\(\)\s*\{[\s\S]*?recordCrash\(mapleCrashTimestamps[\s\S]*?persistMapleRuntimeState\(\)/, "recording a crash must persist it");
+  assert.match(src, /mapleCrashTimestamps\s*=\s*\[\];\s*\n\s*persistMapleRuntimeState\(\)/, "resetCrashLoop must persist the cleared budget");
 });

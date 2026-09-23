@@ -2,11 +2,17 @@
 
 import argparse
 import copy
+import glob
 import json
 import logging
+import math
+import os
 import pickle
 import platform
+import signal
 import socket
+import sys
+import threading
 import time
 import uuid
 import warnings
@@ -41,7 +47,13 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
+from mlx.utils import tree_flatten
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -150,6 +162,241 @@ def process_message_content(messages):
                         func["arguments"] = json.loads(args)
 
 
+_DECIDE_MAX_QUESTIONS = 32
+_DECIDE_MAX_OPTIONS = 255
+
+# Request-surface resource guards. A request body beyond this bound is a 413,
+# and a generated response beyond _MAX_TOKENS_LIMIT is a 400 — neither should
+# be allowed to pin the generation thread or the GPU.
+_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+_MAX_TOKENS_LIMIT = 131072
+
+# `assistant_prefix` is appended to the templated chat prompt so the model
+# continues a partially-written assistant turn. Keep it small: it exists to
+# force an envelope (e.g. `{"command":`), not to inject content.
+_ASSISTANT_PREFIX_MAX_TOKENS = 64
+
+# Persist the hottest prompt-cache entry to --prompt-cache-file after every
+# Nth cache insert.
+_PROMPT_CACHE_SAVE_INTERVAL = 32
+
+# How many prompt-cache entries --prompt-cache-file persists per save.
+# HEMLOCK_PROMPT_CACHE_SLOTS tunes it; <= 1 selects the legacy single-entry
+# file (one safetensors at the exact --prompt-cache-file path).
+_PROMPT_CACHE_DEFAULT_SLOTS = 4
+
+# Sentinel pushed into the requests queue when a caller needs the prompt
+# cache saved. The KV arrays were produced on the generation thread's Metal
+# stream, so the save must run there — evaluating them on another thread
+# fails with "There is no Stream(gpu, 0) in current thread".
+_PROMPT_CACHE_SAVE_REQUEST = "__hemlock_save_prompt_cache__"
+
+
+def _decide_desc(value):
+    """Criteria descriptions: strings verbatim, other JSON values rendered."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _serialize_state(state):
+    """Render a JSON-ish state object/array as stable labeled text.
+
+    Dicts render `key:` lines with keys sorted (deterministic across calls
+    so identical states share a prompt-cache prefix); nested values are
+    indented and arrays use `[i]` labels. Scalars get their JSON rendering.
+    """
+    if isinstance(state, str):
+        return state
+    if not isinstance(state, (dict, list)):
+        return json.dumps(state, ensure_ascii=False, sort_keys=True)
+
+    lines = []
+
+    def emit(label, value, indent):
+        pad = "  " * indent
+        if isinstance(value, dict):
+            if not value:
+                lines.append(f"{pad}{label}: {{}}")
+                return
+            lines.append(f"{pad}{label}:")
+            for k in sorted(value, key=str):
+                emit(str(k), value[k], indent + 1)
+        elif isinstance(value, list):
+            if not value:
+                lines.append(f"{pad}{label}: []")
+                return
+            lines.append(f"{pad}{label}:")
+            for i, item in enumerate(value):
+                emit(f"[{i}]", item, indent + 1)
+        elif isinstance(value, str):
+            lines.append(f"{pad}{label}: {value}")
+        else:
+            lines.append(
+                f"{pad}{label}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}"
+            )
+
+    if isinstance(state, dict):
+        for k in sorted(state, key=str):
+            emit(str(k), state[k], 0)
+    else:
+        for i, item in enumerate(state):
+            emit(f"[{i}]", item, 0)
+    return "\n".join(lines)
+
+
+def _parse_decide_question(qid, spec):
+    """Validate one decide question and normalize its options.
+
+    Every option becomes {key, desc, label, resp_key, continuation}:
+    `key`/`desc` fill the ``<opt> {key}: {desc}`` line, `label` is the
+    teacher-forced text, `resp_key` is the key under `probabilities` in
+    the response, and `continuation` is what gets committed if the option
+    wins (defaults to the label).
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"question {qid!r} must be an object")
+    qtype = spec.get("type")
+    if qtype not in ("noul", "choice", "score"):
+        raise ValueError(
+            f"question {qid!r} has invalid type {qtype!r}; "
+            "expected 'noul', 'choice', or 'score'"
+        )
+    instructions = spec.get("instructions", "")
+    if not isinstance(instructions, str):
+        raise ValueError(f"question {qid!r} 'instructions' must be a string")
+    criteria = spec.get("criteria")
+
+    if qtype == "noul":
+        if criteria is not None and not isinstance(criteria, dict):
+            raise ValueError(f"question {qid!r} 'criteria' must be an object")
+        criteria = criteria or {}
+        options = [
+            {
+                "key": "yes",
+                "desc": _decide_desc(criteria.get("true")),
+                "label": "yes",
+                "resp_key": "true",
+                "continuation": "yes",
+            },
+            {
+                "key": "no",
+                "desc": _decide_desc(criteria.get("false")),
+                "label": "no",
+                "resp_key": "false",
+                "continuation": "no",
+            },
+        ]
+    elif qtype == "choice":
+        if not isinstance(criteria, dict) or not criteria:
+            raise ValueError(
+                f"question {qid!r} needs a non-empty 'criteria' object of options"
+            )
+        if len(criteria) > _DECIDE_MAX_OPTIONS:
+            raise ValueError(
+                f"question {qid!r} has more than {_DECIDE_MAX_OPTIONS} options"
+            )
+        options = []
+        for raw_key, crit in criteria.items():
+            key = str(raw_key)
+            if not key:
+                raise ValueError(f"question {qid!r} has an empty option key")
+            if crit is None:
+                desc, label, continuation = "", key, None
+            elif isinstance(crit, str):
+                desc, label, continuation = crit, key, None
+            elif isinstance(crit, dict):
+                desc = _decide_desc(crit.get("description"))
+                label = crit.get("label")
+                label = key if label is None else str(label)
+                continuation = crit.get("continuation")
+            else:
+                raise ValueError(
+                    f"question {qid!r} option {key!r} must be null, a string, "
+                    "or an object"
+                )
+            if not label:
+                raise ValueError(
+                    f"question {qid!r} option {key!r} has an empty label"
+                )
+            options.append(
+                {
+                    "key": key,
+                    "desc": desc or label,
+                    "label": label,
+                    "resp_key": key,
+                    "continuation": label
+                    if continuation is None
+                    else str(continuation),
+                }
+            )
+    else:  # score
+        if not isinstance(criteria, list) or not (
+            2 <= len(criteria) <= _DECIDE_MAX_OPTIONS
+        ):
+            raise ValueError(
+                f"question {qid!r} needs a 'criteria' array of "
+                f"2-{_DECIDE_MAX_OPTIONS} level descriptions"
+            )
+        options = [
+            {
+                "key": str(i),
+                "desc": _decide_desc(level),
+                "label": str(i),
+                "resp_key": str(i),
+                "continuation": str(i),
+            }
+            for i, level in enumerate(criteria)
+        ]
+    return {"type": qtype, "instructions": instructions, "options": options}
+
+
+def _decide_answer(question, probs, logprobs):
+    """Shape the per-question answer object for a decide response."""
+    options = question["options"]
+    qtype = question["type"]
+    if qtype == "noul":
+        # Options are fixed: index 0 is "yes" (reported as "true").
+        return {
+            "type": "noul",
+            "noul": probs[0],
+            "probabilities": {"true": probs[0], "false": probs[1]},
+        }
+    if qtype == "choice":
+        k = len(probs)
+        win = max(range(k), key=lambda i: probs[i])
+        # Margin over the uniform prior, normalized to [0, 1]: 0 when the
+        # distribution is uniform, 1 when it is a point mass.
+        confidence = (
+            1.0 if k == 1 else (probs[win] - 1.0 / k) / (1.0 - 1.0 / k)
+        )
+        return {
+            "type": "choice",
+            "choice": options[win]["resp_key"],
+            "confidence": confidence,
+            "probabilities": {
+                o["resp_key"]: p for o, p in zip(options, probs)
+            },
+            "logprobs": {
+                o["resp_key"]: lp for o, lp in zip(options, logprobs)
+            },
+        }
+    # score: expected level index; confidence is 1 - normalized entropy
+    # (0 at a uniform distribution, 1 at a point mass).
+    k = len(probs)
+    expected = sum(i * p for i, p in enumerate(probs))
+    entropy = -sum(p * math.log(p) for p in probs if p > 0)
+    return {
+        "type": "score",
+        "score": expected,
+        "confidence": 1.0 - entropy / math.log(k),
+        "legend": {o["resp_key"]: o["desc"] for o in options},
+        "probabilities": {o["resp_key"]: p for o, p in zip(options, probs)},
+    }
+
+
 @dataclass
 class ModelDescription:
     model: str
@@ -208,6 +455,24 @@ class CompletionRequest:
 
     prompt_suffix: Optional[str] = None
     candidates: Optional[List[str]] = None
+    # /v1/score only: teacher-force the winning candidate into the prompt
+    # cache under key prompt+candidate+eos so the next request continues the
+    # sequence as a strict prefix (continuous KV session across agent steps).
+    commit: bool = False
+
+    # /v1/decide only: `state` is the evaluated content and `questions` the
+    # normalized question set (see _parse_decide_question). `commit` +
+    # `commit_question` teacher-force the winning option's continuation into
+    # the prompt cache under prompt+continuation+eos, like /v1/score.
+    state: Any = None
+    questions: Optional[Dict[str, Any]] = None
+    commit_question: Optional[str] = None
+
+    # /v1/chat/completions only: encoded (no special tokens) and appended to
+    # the prompt right after the generation prompt, so the model continues a
+    # partially-written assistant turn. The raw text is prepended to the
+    # returned content so callers see the complete envelope.
+    assistant_prefix: Optional[str] = None
 
 
 @dataclass
@@ -303,6 +568,17 @@ class ModelProvider:
         self._model_map["default_model"] = self.cli_args.model
         self._adapter_map["default_model"] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
+        # Requests that name the default model by its resolved path (rather
+        # than the "default_model" alias) must resolve to the same
+        # (model, adapter, draft) key — otherwise omitting `adapters` silently
+        # drops the launch-time adapter and flips model_key, paying a full
+        # reload on every alternating request.
+        if self.cli_args.model is not None:
+            self._model_map.setdefault(self.cli_args.model, self.cli_args.model)
+            self._adapter_map.setdefault(self.cli_args.model, self.cli_args.adapter_path)
+            self._draft_model_map.setdefault(
+                self.cli_args.model, self.cli_args.draft_model
+            )
 
         # Build the tokenizer config for later use in load
         self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
@@ -388,7 +664,10 @@ class ModelProvider:
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         model_path = self._model_map.get(model_path, model_path)
-        adapter_path = self._adapter_map.get(model_path, adapter_path)
+        if adapter_path is None:
+            # `adapters` omitted means "the configured default", not "no
+            # adapter": an explicit empty string still selects the base model.
+            adapter_path = self._adapter_map.get(model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
@@ -447,12 +726,18 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._prefills_since_save = 0
+        self._cache_save_interval = _PROMPT_CACHE_SAVE_INTERVAL
+        self._cache_save_done = threading.Event()
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
-    def stop_and_join(self):
+    def stop_and_join(self, timeout=None):
         self._stop = True
-        self._generation_thread.join()
+        # Bounded join: a generation thread blocked on an empty requests queue
+        # never wakes to observe _stop, and an unbounded join during teardown
+        # hits the same PyThreadState_Get finalization crash fixed in lora.py.
+        self._generation_thread.join(timeout=timeout)
 
     def join(self):
         self._generation_thread.join()
@@ -467,6 +752,342 @@ class ResponseGenerator:
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
+
+    def _prompt_cache_file_path(self):
+        """The --prompt-cache-file path, or None when unset/disabled."""
+        if os.environ.get("HEMLOCK_NO_CACHE_FILE"):
+            return None
+        return getattr(self.model_provider.cli_args, "prompt_cache_file", None)
+
+    def _expected_model_key(self):
+        """The model_key the default model will have once loaded.
+
+        Mirrors `ModelProvider.load`: the default model resolves to
+        (cli model, cli adapter, cli draft)."""
+        if self.model_provider.model_key is not None:
+            return self.model_provider.model_key
+        args = self.model_provider.cli_args
+        return (
+            args.model,
+            getattr(args, "adapter_path", None),
+            getattr(args, "draft_model", None),
+        )
+
+    def _insert_prompt_cache(self, model_key, tokens, cache, **kwargs):
+        """insert_cache + periodic --prompt-cache-file persistence."""
+        self.prompt_cache.insert_cache(model_key, tokens, cache, **kwargs)
+        self._prefills_since_save += 1
+        if self._prefills_since_save >= self._cache_save_interval:
+            self._prefills_since_save = 0
+            self.save_prompt_cache_file()
+
+    def _prompt_cache_slots(self):
+        """HEMLOCK_PROMPT_CACHE_SLOTS: entries persisted per save.
+
+        ``<= 1`` selects the legacy single-entry file."""
+        try:
+            return int(os.environ.get("HEMLOCK_PROMPT_CACHE_SLOTS", ""))
+        except ValueError:
+            return _PROMPT_CACHE_DEFAULT_SLOTS
+
+    def _recent_cache_entries(self, limit):
+        """Up to ``limit`` most-recent prompt-cache entries, hottest first.
+
+        ``[(model_key, key_tokens, cache), ...]``. Prefers the trie-aware
+        ``recent_entries`` (LRUPromptCache) and falls back to ``mru_entry``
+        for cache shims that only expose the hottest entry."""
+        recent = getattr(self.prompt_cache, "recent_entries", None)
+        if recent is not None:
+            return recent(limit)
+        mru = getattr(self.prompt_cache, "mru_entry", None)
+        if mru is None:
+            return []
+        entry = mru()
+        return [entry] if entry is not None else []
+
+    def _write_prompt_cache_entry(self, path, entry, saved_at=None):
+        """Write one ``(model_key, key_tokens, cache)`` entry to ``path``.
+
+        Write-tmp-then-rename keeps the on-disk file whole on crash.
+        Returns True on success."""
+        model_key, key_tokens, cache = entry
+        metadata = {
+            "model_key": json.dumps(list(model_key)),
+            "key_tokens": json.dumps(list(key_tokens)),
+            "saved_at": str(saved_at or time.time()),
+        }
+        # mx.save_safetensors appends ".safetensors" to any name that lacks
+        # it, so the tmp name must already carry the extension.
+        tmp_path = f"{path}.{os.getpid()}.tmp.safetensors"
+        try:
+            save_prompt_cache(tmp_path, cache, metadata)
+            os.replace(tmp_path, path)
+            logging.debug(
+                f"Saved prompt cache ({len(key_tokens)} tokens) to {path}"
+            )
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to save prompt cache to {path}: {e}")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False
+
+    def _write_prompt_cache_manifest(self, path, entries):
+        """Multi-entry format: ``{path}.<index>.safetensors`` per entry plus
+        an atomic ``{path}.manifest.json`` index.
+
+        The manifest is written last — it is the commit point, so a crash
+        mid-save leaves entry files the loader never references."""
+        saved_at = time.time()
+        manifest_entries = []
+        for index, entry in enumerate(entries):
+            entry_path = f"{path}.{index}.safetensors"
+            # A failed entry write is skipped rather than committed to the
+            # manifest pointing at a missing file.
+            if not self._write_prompt_cache_entry(entry_path, entry, saved_at):
+                continue
+            model_key, key_tokens, _cache = entry
+            manifest_entries.append(
+                {
+                    "index": index,
+                    "model_key": list(model_key),
+                    "key_tokens": list(key_tokens),
+                    "saved_at": saved_at,
+                    "file": os.path.basename(entry_path),
+                }
+            )
+        if not manifest_entries:
+            return
+        manifest = {
+            "schema": "hemlock.prompt-cache-manifest.v1",
+            "saved_at": saved_at,
+            "entries": manifest_entries,
+        }
+        manifest_path = f"{path}.manifest.json"
+        tmp_path = f"{manifest_path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f)
+            os.replace(tmp_path, manifest_path)
+            logging.debug(
+                f"Saved {len(manifest_entries)} prompt cache entries "
+                f"to {manifest_path}"
+            )
+        except Exception as e:
+            logging.warning(
+                f"Failed to write prompt cache manifest {manifest_path}: {e}"
+            )
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return
+        # Drop entry files from earlier saves that this manifest no longer
+        # references so slots do not accumulate on disk.
+        keep = {item["file"] for item in manifest_entries}
+        for stale in glob.glob(f"{glob.escape(path)}.*.safetensors"):
+            if os.path.basename(stale) not in keep:
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+
+    def save_prompt_cache_file(self):
+        """Persist the hottest prompt-cache entries to --prompt-cache-file.
+
+        With HEMLOCK_PROMPT_CACHE_SLOTS > 1 (default 4) the K most-recent
+        entries are written as ``{path}.<index>.safetensors`` plus a
+        manifest; otherwise the legacy single-entry file holds the MRU
+        entry's cache state plus {model_key, key_tokens, saved_at}
+        metadata."""
+        path = self._prompt_cache_file_path()
+        if path is None:
+            return
+        slots = self._prompt_cache_slots()
+        entries = self._recent_cache_entries(max(1, slots))
+        if not entries:
+            return
+        if slots <= 1:
+            self._write_prompt_cache_entry(path, entries[0])
+            return
+        self._write_prompt_cache_manifest(path, entries[:slots])
+
+    def save_prompt_cache_file_async(self, wait_timeout=8.0):
+        """Ask the generation thread to persist the prompt cache.
+
+        The KV arrays were produced on that thread's Metal stream; saving
+        them from any other thread fails with "no Stream(gpu, 0)". Returns
+        after the save completes or wait_timeout elapses — the tmp+rename
+        write makes an interrupted save harmless."""
+        if self._prompt_cache_file_path() is None or self._stop:
+            return
+        self._cache_save_done.clear()
+        self.requests.put((None, _PROMPT_CACHE_SAVE_REQUEST, None))
+        self._cache_save_done.wait(timeout=wait_timeout)
+
+    def _load_prompt_cache_entry(self, path, model_key, item):
+        """Load one manifest-listed entry; returns 1 when installed, else 0.
+
+        Per-entry failures (missing file, stale model_key, malformed
+        key_tokens) skip only that entry — a partial warm is still a warm."""
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError, AttributeError):
+            index = None
+        file_name = item.get("file") if isinstance(item, dict) else None
+        if isinstance(file_name, str) and file_name:
+            # Basename only: the manifest stays a directory-local index and
+            # can never point the loader outside the cache directory.
+            entry_path = os.path.join(
+                os.path.dirname(path) or ".", os.path.basename(file_name)
+            )
+        elif index is not None:
+            entry_path = f"{path}.{index}.safetensors"
+        else:
+            logging.warning(
+                f"Prompt cache manifest entry {item!r} has no usable file "
+                "or index; skipping it."
+            )
+            return 0
+        try:
+            cache, metadata = load_prompt_cache(entry_path, return_metadata=True)
+            # mx.load is lazy: the arrays only materialize on first eval,
+            # which would happen on the generation thread — it has no cpu
+            # stream bound and dies with "no Stream(cpu, 1)". Materialize
+            # here, on the loading thread, before the cache crosses over.
+            mx.eval(*[v for _, v in tree_flatten([c.state for c in cache])])
+            saved_key = json.loads(metadata.get("model_key") or "null")
+            if saved_key != list(model_key):
+                logging.warning(
+                    f"Prompt cache entry {entry_path} was saved for model "
+                    f"{saved_key}, not {list(model_key)}; skipping it."
+                )
+                return 0
+            key_tokens = json.loads(metadata.get("key_tokens") or "null")
+            if not (
+                isinstance(key_tokens, list)
+                and all(isinstance(t, int) for t in key_tokens)
+            ):
+                logging.warning(
+                    f"Prompt cache entry {entry_path} has malformed "
+                    "key_tokens; skipping it."
+                )
+                return 0
+        except Exception as e:
+            logging.warning(
+                f"Could not load prompt cache entry {entry_path} ({e}); "
+                "skipping it."
+            )
+            return 0
+        try:
+            self.prompt_cache.insert_cache(model_key, key_tokens, cache)
+        except Exception as e:
+            logging.warning(
+                f"Could not install prompt cache entry {entry_path} ({e}); "
+                "skipping it."
+            )
+            return 0
+        return 1
+
+    def _load_prompt_cache_manifest(self, path, manifest_path):
+        """Load every valid entry listed in a multi-entry manifest.
+
+        Returns True when the manifest parsed — even if every entry then
+        failed (entry files are validated individually) — and False when
+        the manifest itself is unusable, so the caller can fall back to
+        the legacy single-entry file."""
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            entries = manifest.get("entries")
+            if not isinstance(entries, list):
+                raise ValueError("manifest has no entries list")
+        except Exception as e:
+            logging.warning(
+                f"Prompt cache manifest {manifest_path} is unreadable "
+                f"({e}); falling back to the single-file cache."
+            )
+            return False
+        model_key = self._expected_model_key()
+        limit = getattr(self.prompt_cache, "max_size", None)
+        if not isinstance(limit, int) or limit <= 0:
+            limit = len(entries)
+        # Oldest first: insertions become the LRU order, and a prefix entry
+        # inserted after a longer one is not immediately popped as a
+        # redundant prefix by insert_cache.
+        loaded = 0
+        for item in reversed(entries):
+            if loaded >= limit:
+                break
+            loaded += self._load_prompt_cache_entry(path, model_key, item)
+        if loaded:
+            logging.info(
+                f"Loaded {loaded} prompt cache entries from {manifest_path}"
+            )
+        return True
+
+    def load_prompt_cache_file(self):
+        """Warm the prompt cache from --prompt-cache-file at startup.
+
+        Multi-entry manifests (``{path}.manifest.json``) load each listed
+        entry; a missing/corrupt manifest or a legacy single-entry file
+        uses the single-file path. Any inconsistency — unreadable file,
+        stale model_key, malformed key_tokens — logs a warning and
+        cold-starts; never raises."""
+        path = self._prompt_cache_file_path()
+        if path is None:
+            return
+        manifest_path = f"{path}.manifest.json"
+        if self._prompt_cache_slots() > 1 and os.path.exists(manifest_path):
+            if self._load_prompt_cache_manifest(path, manifest_path):
+                return
+            # Manifest unusable: fall through so a legacy single-entry
+            # file still warms what it can.
+        if not os.path.exists(path):
+            return
+        model_key = self._expected_model_key()
+        try:
+            cache, metadata = load_prompt_cache(path, return_metadata=True)
+            # mx.load is lazy: the arrays only materialize on first eval,
+            # which would happen on the generation thread — it has no cpu
+            # stream bound and dies with "no Stream(cpu, 1)". Materialize
+            # here, on the loading thread, before the cache crosses over.
+            mx.eval(*[v for _, v in tree_flatten([c.state for c in cache])])
+            saved_key = json.loads(metadata.get("model_key") or "null")
+            if saved_key != list(model_key):
+                logging.warning(
+                    f"Prompt cache file {path} was saved for model "
+                    f"{saved_key}, not {list(model_key)}; cold-starting."
+                )
+                return
+            key_tokens = json.loads(metadata.get("key_tokens") or "null")
+            if not (
+                isinstance(key_tokens, list)
+                and all(isinstance(t, int) for t in key_tokens)
+            ):
+                logging.warning(
+                    f"Prompt cache file {path} has malformed key_tokens; "
+                    "cold-starting."
+                )
+                return
+        except Exception as e:
+            logging.warning(
+                f"Could not load prompt cache file {path} ({e}); cold-starting."
+            )
+            return
+        try:
+            self.prompt_cache.insert_cache(model_key, key_tokens, cache)
+        except Exception as e:
+            logging.warning(
+                f"Could not install prompt cache from {path} ({e}); "
+                "cold-starting."
+            )
+            return
+        logging.info(
+            f"Loaded prompt cache from {path}: {len(key_tokens)} tokens"
+        )
 
     def _next_request(self, timeout=None):
         request = None
@@ -512,6 +1133,53 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
+    @staticmethod
+    def _append_assistant_prefix(tokenizer, request, prompt):
+        """Append `assistant_prefix` tokens so generation continues a
+        partially-written assistant turn. The tokens become part of the
+        prompt, so they join the prompt-cache key like any other prefix."""
+        prefix = getattr(request, "assistant_prefix", None)
+        if prefix is None:
+            return prompt
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        if len(prefix_tokens) > _ASSISTANT_PREFIX_MAX_TOKENS:
+            raise ValueError(
+                f"'assistant_prefix' encodes to {len(prefix_tokens)} tokens; "
+                f"the maximum is {_ASSISTANT_PREFIX_MAX_TOKENS}"
+            )
+        return prompt + prefix_tokens
+
+    def _prompt_token_limit(self):
+        """Effective prompt ceiling in tokens.
+
+        An explicit ``--max-prompt-tokens`` cap wins when configured;
+        otherwise the loaded model's ``max_position_embeddings`` bounds the
+        prompt (RoPE models cannot serve positions past it — a longer prompt
+        degrades or OOMs the generation thread instead of answering).
+        Unknowable means unbounded, not crash.
+        """
+        explicit = getattr(self.cli_args, "max_prompt_tokens", None)
+        model_limit = getattr(
+            getattr(self.model_provider.model, "args", None),
+            "max_position_embeddings",
+            None,
+        )
+        limits = []
+        for value in (explicit, model_limit):
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                limits.append(int(value))
+        return min(limits) if limits else None
+
+    def _check_prompt_tokens(self, tokens, label="prompt"):
+        limit = self._prompt_token_limit()
+        if limit is not None and len(tokens) > limit:
+            raise ValueError(
+                f"{label} is {len(tokens)} tokens, which exceeds the "
+                f"maximum of {limit} tokens this server can serve"
+            )
+
     def _tokenize(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
 
@@ -554,11 +1222,26 @@ class ResponseGenerator:
                     add_generation_prompt=True,
                     **template_kwargs,
                 )
+                # Appended before segmentation so the prefix lands inside the
+                # last ("assistant") segment and the prompt-cache key.
+                prompt = self._append_assistant_prefix(
+                    tokenizer, request, prompt
+                )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
+                prompt = self._append_assistant_prefix(
+                    tokenizer, request, prompt
+                )
+                self._check_prompt_tokens(prompt)
                 return prompt, [prompt], ["assistant"], "normal"
         else:
+            if getattr(request, "assistant_prefix", None) is not None:
+                raise ValueError(
+                    "'assistant_prefix' requires a chat request ('messages'), "
+                    "not a raw 'prompt'"
+                )
             prompt = tokenizer.encode(request.prompt)
+            self._check_prompt_tokens(prompt)
             return prompt, [prompt], ["assistant"], "normal"
 
         # If we are here it means we have a chat request so we need to search
@@ -574,6 +1257,7 @@ class ResponseGenerator:
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
+            self._check_prompt_tokens(prompt)
             return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
@@ -620,6 +1304,7 @@ class ResponseGenerator:
             segments = [prompt]
             segment_types = ["assistant"]
 
+        self._check_prompt_tokens(prompt)
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
@@ -693,6 +1378,12 @@ class ResponseGenerator:
 
             # We got a request
             if request is not None:
+                # Cache-save sentinel: run the save on this thread, whose
+                # Metal stream produced the KV arrays.
+                if request[1] == _PROMPT_CACHE_SAVE_REQUEST:
+                    self.save_prompt_cache_file()
+                    self._cache_save_done.set()
+                    continue
                 rqueue, request, args = request
 
                 # Scoring requests never join a generation batch: they run
@@ -710,6 +1401,24 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
                     self._serve_score((rqueue, request, args))
+                    continue
+
+                # Decide requests reuse the scoring machinery (cache-aware
+                # prefill plus teacher-forced option scoring on forked
+                # caches) and likewise never join a generation batch.
+                if getattr(request, "questions", None) is not None:
+                    if batch_generator is not None:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+                    try:
+                        self.model_provider.load(
+                            args.model.model, args.model.adapter, args.model.draft
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
+                    self._serve_decide((rqueue, request, args))
                     continue
 
                 # Can it be added to the current batch?
@@ -772,6 +1481,7 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "want_logprobs": bool(args.logprobs or args.top_logprobs > 0),
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -855,7 +1565,7 @@ class ResponseGenerator:
                     ]
                     caches = batch_generator.extract_cache(eos_ids)
                     for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
+                        self._insert_prompt_cache(
                             self.model_provider.model_key,
                             cache_key[:],
                             cache,
@@ -882,7 +1592,11 @@ class ResponseGenerator:
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                (
+                                    r.logprobs[r.token].item()
+                                    if result["want_logprobs"]
+                                    else 0.0
+                                ),
                                 r.finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -894,7 +1608,7 @@ class ResponseGenerator:
 
                         if r.finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
+                            self._insert_prompt_cache(
                                 current_model_key,
                                 r.all_tokens[:],
                                 r.prompt_cache,
@@ -952,6 +1666,9 @@ class ResponseGenerator:
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
+            # gen.logprob costs a GPU->CPU readback per token; only the
+            # OpenAI `logprobs` field consumes it, so skip when unrequested.
+            want_logprobs = bool(args.logprobs or args.top_logprobs > 0)
 
             # Load the KV cache
             self._log_cache_stats()
@@ -1005,7 +1722,11 @@ class ResponseGenerator:
                     Response(
                         gen.text,
                         gen.token,
-                        0.0 if gen.logprobs is None else gen.logprobs[gen.token].item(),
+                        (
+                            0.0
+                            if gen.logprobs is None or not want_logprobs
+                            else gen.logprobs[gen.token].item()
+                        ),
                         finish_reason,
                         ()
                         if gen.logprobs is None
@@ -1027,12 +1748,147 @@ class ResponseGenerator:
             rqueue.put(None)
 
             # Save the KV cache again
-            self.prompt_cache.insert_cache(
+            self._insert_prompt_cache(
                 self.model_provider.model_key, cache_key, cache
             )
 
         except Exception as e:
             rqueue.put(e)
+
+    @staticmethod
+    def _seam_extend(tokenizer, prefix, text):
+        """Tokens for `text` appended after the token sequence `prefix`.
+
+        BPE merges can cross the boundary (the rendered text would tokenize
+        the seam fused). Re-encode the whole text when the round-trip is
+        exact so the result stays a strict token prefix of a later rendered
+        prompt that replays this continuation; otherwise fall back to a
+        naive concatenation.
+        """
+        fused = tokenizer.encode(
+            tokenizer.decode(prefix) + text, add_special_tokens=False
+        )
+        if fused[: len(prefix)] == prefix:
+            return fused
+        return prefix + tokenizer.encode(text, add_special_tokens=False)
+
+    def _prefill_tokens(self, model, tokens, keep_logits=False):
+        """Prompt-cache-aware prefill of a token sequence.
+
+        Returns (cache, last_logprobs, cached_count): `cache` covers all of
+        `tokens` and `cached_count` is how many leading tokens were served
+        from the LRU prompt cache. With `keep_logits` the fetch covers all
+        but the last token, so the final position is always forwarded and
+        its normalized logprobs are returned — they score the first token
+        of any teacher-forced continuation.
+        """
+        if not tokens:
+            return make_prompt_cache(model), None, 0
+        if keep_logits:
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, tokens[:-1]
+            )
+            cached_count = len(tokens) - 1 - len(rest)
+        else:
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key, tokens
+            )
+            cached_count = len(tokens) - len(rest)
+        if cache is None:
+            cache = make_prompt_cache(model)
+
+        # Prefill the uncached remainder exactly like chunked prefill,
+        # keeping the last-position logprobs when requested.
+        step_size = self.cli_args.prefill_step_size or 2048
+        logits = None
+        for i in range(cached_count, len(tokens), step_size):
+            logits = model(mx.array(tokens[i : i + step_size])[None], cache=cache)
+            mx.eval([c.state for c in cache])
+        last_logprobs = None
+        if logits is not None:
+            last_logprobs = logits[:, -1, :] - mx.logsumexp(
+                logits[:, -1, :].astype(mx.float32), axis=-1, keepdims=True
+            )
+            mx.eval(last_logprobs)
+            del logits
+        return cache, last_logprobs, cached_count
+
+    def _score_continuations(self, model, tokenizer, cache, last_logprobs, texts):
+        """Teacher-forced total logprob of each text against `cache`.
+
+        `last_logprobs` are the normalized logprobs at the last prefilled
+        position and score each continuation's first token; the rest are
+        forwarded on a fresh deepcopy per continuation so the shared cache
+        is never mutated by the appends. Returns one dict per text with the
+        token list and total `logprob` (None when the text encodes to no
+        tokens).
+        """
+        results = []
+        for text in texts:
+            cand = tokenizer.encode(text, add_special_tokens=False)
+            if not cand:
+                results.append({"text": text, "tokens": [], "logprob": None})
+                continue
+            c_cache = copy.deepcopy(cache)
+            score = last_logprobs[0, cand[0]]
+            if len(cand) > 1:
+                inp = mx.array(cand[:-1])[None]
+                cand_logits = model(inp, cache=c_cache)
+                log_probs = cand_logits.astype(mx.float32) - mx.logsumexp(
+                    cand_logits.astype(mx.float32), axis=-1, keepdims=True
+                )
+                targets = mx.array(cand[1:])[None, :, mx.newaxis]
+                score = score + mx.take_along_axis(
+                    log_probs, targets, axis=-1
+                ).sum()
+            mx.eval(score)
+            del c_cache
+            results.append(
+                {"text": text, "tokens": cand, "logprob": float(score.item())}
+            )
+        return results
+
+    def _commit_continuation(
+        self, model, tokenizer, prompt, committed_text, base_cache
+    ):
+        """Teacher-force `committed_text` + <|im_end|> onto a deepcopy of
+        `base_cache` (which must cover exactly `prompt`) and store it in the
+        prompt cache, so a follow-up request that replays this step as an
+        assistant turn starts from a strict-prefix cache hit instead of
+        re-prefilling. Returns the committed token key."""
+        step_size = self.cli_args.prefill_step_size or 2048
+        # Tokenize the continuation in context so the committed key stays a
+        # strict token prefix of the replayed turn.
+        fused = tokenizer.encode(
+            tokenizer.decode(prompt) + committed_text + "<|im_end|>",
+            add_special_tokens=False,
+        )
+        if fused[: len(prompt)] == prompt:
+            commit_tokens = fused[len(prompt) :]
+            commit_cache = copy.deepcopy(base_cache)
+            for i in range(0, len(commit_tokens), step_size):
+                model(
+                    mx.array(commit_tokens[i : i + step_size])[None],
+                    cache=commit_cache,
+                )
+            mx.eval([c.state for c in commit_cache])
+            cache_key = prompt + commit_tokens
+        else:
+            # BPE merged across the prompt/continuation boundary: the replayed
+            # turn tokenizes as `fused`, so a key built from
+            # prompt+encode(continuation) would never be hit. Rotating caches
+            # can't rewind, so rebuild the state by prefilling `fused` fresh —
+            # a bounded one-off cost paid only on seam merges.
+            commit_cache = make_prompt_cache(model)
+            for i in range(0, len(fused), step_size):
+                model(mx.array(fused[i : i + step_size])[None], cache=commit_cache)
+            mx.eval([c.state for c in commit_cache])
+            cache_key = fused
+        self._insert_prompt_cache(
+            self.model_provider.model_key, cache_key, commit_cache
+        )
+        del commit_cache
+        return cache_key
 
     def _serve_score(self, request):
         """Teacher-forced logprob scoring of candidate continuations.
@@ -1051,82 +1907,53 @@ class ResponseGenerator:
 
             prompt, _, _, _ = self._tokenize(tokenizer, request, args)
             if request.prompt_suffix:
-                prompt = prompt + tokenizer.encode(
-                    request.prompt_suffix, add_special_tokens=False
+                prompt = self._seam_extend(
+                    tokenizer, prompt, request.prompt_suffix
                 )
+            self._check_prompt_tokens(prompt)
             if not prompt:
                 rqueue.put(ValueError("score request has an empty prompt"))
                 return
 
             self._log_cache_stats()
-            # Fetch the cache for all but the last prompt token, so the
-            # final token is always forwarded and its logits (which score
-            # the first candidate token) are available even on an exact
-            # prefix hit.
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                model_key, prompt[:-1]
+            cache, last_logprobs, prompt_cache_count = self._prefill_tokens(
+                model, prompt, keep_logits=True
             )
-            prompt_cache_count = len(prompt) - 1 - len(rest)
-            if cache is None:
-                cache = make_prompt_cache(model)
-            to_feed = prompt[prompt_cache_count:]
-
-            # Prefill the uncached remainder exactly like chunked prefill,
-            # keeping the last-position logprobs for the first candidate
-            # token.
-            step_size = self.cli_args.prefill_step_size or 2048
-            logits = None
-            for i in range(0, len(to_feed), step_size):
-                logits = model(mx.array(to_feed[i : i + step_size])[None], cache=cache)
-                mx.eval([c.state for c in cache])
-            last_logprobs = logits[:, -1, :] - mx.logsumexp(
-                logits[:, -1, :].astype(mx.float32), axis=-1, keepdims=True
-            )
-            mx.eval(last_logprobs)
-            del logits
 
             results = []
-            for text in request.candidates:
-                cand = tokenizer.encode(text, add_special_tokens=False)
-                if not cand:
-                    results.append(
-                        {
-                            "index": len(results),
-                            "text": text,
-                            "logprob": None,
-                            "avgLogprob": None,
-                            "tokens": 0,
-                        }
-                    )
-                    continue
-                # A fresh deepcopy per candidate: the shared prefilled cache
-                # is never mutated by candidate appends.
-                c_cache = copy.deepcopy(cache)
-                score = last_logprobs[0, cand[0]]
-                if len(cand) > 1:
-                    inp = mx.array(cand[:-1])[None]
-                    cand_logits = model(inp, cache=c_cache)
-                    log_probs = cand_logits.astype(mx.float32) - mx.logsumexp(
-                        cand_logits.astype(mx.float32), axis=-1, keepdims=True
-                    )
-                    targets = mx.array(cand[1:])[None, :, mx.newaxis]
-                    score = score + mx.take_along_axis(
-                        log_probs, targets, axis=-1
-                    ).sum()
-                mx.eval(score)
-                del c_cache
-                total = float(score.item())
+            for r in self._score_continuations(
+                model, tokenizer, cache, last_logprobs, request.candidates
+            ):
+                total = r["logprob"]
                 results.append(
                     {
                         "index": len(results),
-                        "text": text,
+                        "text": r["text"],
                         "logprob": total,
-                        "avgLogprob": total / len(cand),
-                        "tokens": len(cand),
+                        "avgLogprob": (
+                            None if total is None else total / len(r["tokens"])
+                        ),
+                        "tokens": len(r["tokens"]),
                     }
                 )
 
-            self.prompt_cache.insert_cache(model_key, prompt, cache)
+            self._insert_prompt_cache(model_key, prompt, cache)
+
+            # Optionally commit the winning continuation under
+            # prompt+candidate+eos so a follow-up request that replays this
+            # step as an assistant turn starts from a strict-prefix cache hit
+            # instead of re-prefilling.
+            committed_index = None
+            committed_text = None
+            if request.commit:
+                valid = [r for r in results if r["avgLogprob"] is not None]
+                if valid:
+                    best = max(valid, key=lambda r: r["avgLogprob"])
+                    committed_index = best["index"]
+                    committed_text = request.candidates[committed_index]
+                    self._commit_continuation(
+                        model, tokenizer, prompt, committed_text, cache
+                    )
 
             rqueue.put(
                 {
@@ -1134,6 +1961,173 @@ class ResponseGenerator:
                     "promptTokens": len(prompt),
                     "cachedTokens": prompt_cache_count,
                     "candidates": results,
+                    "committedIndex": committed_index,
+                    "committedText": committed_text,
+                }
+            )
+            rqueue.put(None)
+        except Exception as e:
+            rqueue.put(e)
+
+    def _serve_decide(self, request):
+        """Kev-style packed decision request.
+
+        The state is prefilled once on top of the (prompt-cache aware) base
+        prompt. Each question then forks the state cache, appends a
+        ``\\n<q> {instructions}\\n<opt> {key}: {desc}…\\n<decide>`` block and
+        teacher-forces every option's label — first token from the
+        decide-position logits, the rest forwarded on a per-option
+        deepcopy. Questions never see each other: isolation is by cache
+        fork, not attention mask, which also suits Maple's rotating
+        (untrimmable) KV cache.
+        """
+        rqueue, request, args = request
+        try:
+            started = time.time()
+            model = self.model_provider.model
+            tokenizer = self.model_provider.tokenizer
+            model_key = self.model_provider.model_key
+
+            prompt, _, _, _ = self._tokenize(tokenizer, request, args)
+            if request.prompt_suffix:
+                prompt = self._seam_extend(
+                    tokenizer, prompt, request.prompt_suffix
+                )
+            if not prompt:
+                rqueue.put(ValueError("decide request has an empty prompt"))
+                return
+
+            state_text = _serialize_state(request.state)
+            state_seq = (
+                self._seam_extend(tokenizer, prompt, state_text)
+                if state_text
+                else list(prompt)
+            )
+            self._check_prompt_tokens(state_seq, "decide state")
+
+            self._log_cache_stats()
+            state_cache, rest = self.prompt_cache.fetch_nearest_cache(
+                model_key, state_seq
+            )
+            state_cached = len(state_seq) - len(rest)
+            if state_cache is None:
+                state_cache = make_prompt_cache(model)
+
+            step_size = self.cli_args.prefill_step_size or 2048
+            # Feed the uncached tail, pausing at the prompt/state boundary
+            # to snapshot a prompt-level cache (it backs the `prompt` LRU
+            # entry and the optional commit). A prefix hit landing inside
+            # the state region can't be rewound to the boundary — rotating
+            # caches only ever feed forward.
+            prompt_snapshot = None
+            boundaries = (
+                (state_cached, len(prompt), len(state_seq))
+                if state_cached <= len(prompt)
+                else (state_cached, len(state_seq))
+            )
+            for a, b in zip(boundaries, boundaries[1:]):
+                for i in range(a, b, step_size):
+                    # Clamp to the stage end so the prompt-level snapshot
+                    # covers exactly `prompt`, never a token of state.
+                    model(
+                        mx.array(state_seq[i : min(i + step_size, b)])[None],
+                        cache=state_cache,
+                    )
+                    mx.eval([c.state for c in state_cache])
+                if b == len(prompt):
+                    prompt_snapshot = copy.deepcopy(state_cache)
+                    self._insert_prompt_cache(
+                        model_key, prompt, prompt_snapshot
+                    )
+            self._insert_prompt_cache(model_key, state_seq, state_cache)
+
+            answers = {}
+            probs_by_qid = {}
+            decision_tokens = 0
+            for qid, q in request.questions.items():
+                block = f"\n<q> {q['instructions']}"
+                for opt in q["options"]:
+                    block += f"\n<opt> {opt['key']}: {opt['desc']}"
+                block += "\n<decide>"
+                q_tokens = self._seam_extend(tokenizer, state_seq, block)[
+                    len(state_seq) :
+                ]
+
+                q_cache = copy.deepcopy(state_cache)
+                logits = None
+                for i in range(0, len(q_tokens), step_size):
+                    logits = model(
+                        mx.array(q_tokens[i : i + step_size])[None],
+                        cache=q_cache,
+                    )
+                    mx.eval([c.state for c in q_cache])
+                decision_tokens += len(q_tokens)
+                last_logprobs = logits[:, -1, :] - mx.logsumexp(
+                    logits[:, -1, :].astype(mx.float32), axis=-1, keepdims=True
+                )
+                mx.eval(last_logprobs)
+                del logits
+
+                scored = self._score_continuations(
+                    model,
+                    tokenizer,
+                    q_cache,
+                    last_logprobs,
+                    [o["label"] for o in q["options"]],
+                )
+                del q_cache
+                # Forwarded tokens only: each option's first token is scored
+                # from the decide-position logits.
+                decision_tokens += sum(
+                    max(0, len(s["tokens"]) - 1) for s in scored
+                )
+                logprobs = [s["logprob"] for s in scored]
+                if any(lp is None for lp in logprobs):
+                    raise ValueError(
+                        f"question {qid!r} has an option label that encodes "
+                        "to no tokens"
+                    )
+                top = max(logprobs)
+                exps = [math.exp(lp - top) for lp in logprobs]
+                norm = sum(exps)
+                probs = [e / norm for e in exps]
+                probs_by_qid[qid] = probs
+                answers[qid] = _decide_answer(q, probs, logprobs)
+
+            committed_question = None
+            committed_key = None
+            committed_text = None
+            if request.commit:
+                cq = request.commit_question
+                opts = request.questions[cq]["options"]
+                probs = probs_by_qid[cq]
+                win = max(range(len(opts)), key=lambda i: probs[i])
+                committed_question = cq
+                committed_key = opts[win]["key"]
+                committed_text = opts[win]["continuation"]
+                base_cache = prompt_snapshot
+                if base_cache is None:
+                    # The prefix hit landed inside the state region — build
+                    # a fresh prompt-level cache for the commit base.
+                    base_cache, _, _ = self._prefill_tokens(model, prompt)
+                cache_key = self._commit_continuation(
+                    model, tokenizer, prompt, committed_text, base_cache
+                )
+                decision_tokens += len(cache_key) - len(prompt)
+
+            rqueue.put(
+                {
+                    "schema": "hemlock.decide.v1",
+                    "answers": answers,
+                    "usage": {
+                        "promptTokens": len(state_seq),
+                        "cachedTokens": state_cached,
+                        "decisionTokens": decision_tokens,
+                    },
+                    "committedQuestion": committed_question,
+                    "committedKey": committed_key,
+                    "committedText": committed_text,
+                    "latencyMs": int(round((time.time() - started) * 1000)),
                 }
             )
             rqueue.put(None)
@@ -1200,6 +2194,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
+    def _respond_error(self, status_code: int, message: str):
+        """Send a JSON error body for a request that fails validation."""
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": message}).encode())
+
     def _set_completion_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
@@ -1224,6 +2224,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
             "/v1/score": self.handle_score_request,
+            "/v1/decide": self.handle_decide_request,
         }
 
         if self.path not in request_factories:
@@ -1244,22 +2245,27 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(content_length)
         except ValueError:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
+            self._respond_error(400, "Invalid Content-Length header")
+            return
+        if content_length < 0:
+            self._respond_error(400, "Invalid Content-Length header")
+            return
+        if content_length > _MAX_REQUEST_BODY_BYTES:
+            self._respond_error(
+                413,
+                f"Request body exceeds the {_MAX_REQUEST_BODY_BYTES}-byte limit",
             )
             return
         raw_body = self.rfile.read(content_length)
         try:
-            self.body = json.loads(raw_body.decode())
+            self.body = json.loads(raw_body.decode("utf-8"))
+        except UnicodeDecodeError as e:
+            logging.error(f"UnicodeDecodeError: {e}")
+            self._respond_error(400, f"Request body is not valid UTF-8: {e}")
+            return
         except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-            )
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body[:200]!r}")
+            self._respond_error(400, f"Invalid JSON in request body: {e}")
             return
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -1289,14 +2295,18 @@ class APIHandler(BaseHTTPRequestHandler):
             if hasattr(self.response_generator.cli_args, "ngram_draft")
             else False,
         )
-        self.ngram_window = int(
-            self.body.get(
-                "ngram_window",
-                self.response_generator.cli_args.ngram_window
-                if hasattr(self.response_generator.cli_args, "ngram_window")
-                else 1024,
+        try:
+            self.ngram_window = int(
+                self.body.get(
+                    "ngram_window",
+                    self.response_generator.cli_args.ngram_window
+                    if hasattr(self.response_generator.cli_args, "ngram_window")
+                    else 1024,
+                )
             )
-        )
+        except (TypeError, ValueError):
+            self._respond_error(400, "'ngram_window' must be an integer")
+            return
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -1322,25 +2332,75 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except (TypeError, ValueError) as e:
+            self._respond_error(400, str(e))
+            return
+        if self.stream_options is not None and not isinstance(
+            self.stream_options, dict
+        ):
+            self._respond_error(400, "'stream_options' must be an object")
+            return
+        if self.chat_template_kwargs is not None and not isinstance(
+            self.chat_template_kwargs, dict
+        ):
+            self._respond_error(400, "'chat_template_kwargs' must be an object")
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
         stop_words = stop_words or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
+        if not isinstance(stop_words, list) or not all(
+            isinstance(word, str) for word in stop_words
+        ):
+            self._respond_error(400, "'stop' must be a string or a list of strings")
+            return
 
         # Create the completion request
         try:
             request = request_factories[self.path]()
-        except (AssertionError, ValueError) as e:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+        except (AssertionError, TypeError, ValueError) as e:
+            self._respond_error(400, str(e))
             return
-        if request.candidates is not None:
-            self.handle_score(request, stop_words)
-        else:
-            self.handle_completion(request, stop_words)
+        # Score and decide requests share the same single-shot JSON
+        # response path.
+        try:
+            if request.candidates is not None or request.questions is not None:
+                self.handle_score(request, stop_words)
+            else:
+                self.handle_completion(request, stop_words)
+        except (BrokenPipeError, ConnectionResetError):
+            raise  # the client left; there is no error response to send
+        except Exception as e:
+            # Last-resort honesty: an unexpected failure must still produce a
+            # 5xx JSON body when the response headers have not been committed.
+            logging.error(f"Unhandled request failure: {e}", exc_info=True)
+            if getattr(self, "_headers_buffer", None):
+                try:
+                    # Drop any staged status line before writing the real one.
+                    self._headers_buffer.clear()
+                    self._set_completion_headers(500)
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps({"error": f"Internal server error: {e}"}).encode()
+                    )
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+    @staticmethod
+    def _valid_messages(messages) -> bool:
+        """A chat `messages` payload the chat template can actually consume:
+        a non-empty list of objects, each carrying a string role."""
+        return (
+            isinstance(messages, list)
+            and len(messages) > 0
+            and all(
+                isinstance(message, dict) and isinstance(message.get("role"), str)
+                for message in messages
+            )
+        )
 
     def _validate(
         self,
@@ -1354,12 +2414,23 @@ class APIHandler(BaseHTTPRequestHandler):
         value = getattr(self, name)
         if optional and value is None:
             return
+        # bool is a subclass of int — JSON true/false is not a number here.
+        if isinstance(value, bool) and expected_type != bool:
+            try:
+                allowed = tuple(et.__name__ for et in expected_type)
+            except TypeError:
+                allowed = expected_type.__name__
+            raise ValueError(f"{name} must be of type {allowed}")
         if not isinstance(value, expected_type):
             try:
                 allowed = tuple(et.__name__ for et in expected_type)
             except TypeError:
                 allowed = expected_type.__name__
             raise ValueError(f"{name} must be of type {allowed}")
+        # JSON parses NaN/Infinity literals into floats; neither is a sane
+        # sampling parameter and both pass < / > comparisons silently.
+        if isinstance(value, (int, float)) and not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
         if whitelist is not None and value in whitelist:
             return
         if min_val is not None and value < min_val:
@@ -1370,7 +2441,8 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate("ngram_draft", bool)
+        self._validate("max_tokens", int, min_val=0, max_val=_MAX_TOKENS_LIMIT)
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -1394,8 +2466,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
-            except ValueError:
+            except (TypeError, ValueError):
                 raise ValueError("logit_bias must be a dict of int to float")
+            if not all(math.isfinite(v) for v in self.logit_bias.values()):
+                raise ValueError("logit_bias values must be finite numbers")
 
     def generate_response(
         self,
@@ -1565,7 +2639,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            # Request-shape problems (e.g. an oversized assistant_prefix
+            # caught in _tokenize) are 400s; load failures stay 404s.
+            self._set_completion_headers(
+                400 if isinstance(e, ValueError) else 404
+            )
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
@@ -1592,7 +2670,10 @@ class APIHandler(BaseHTTPRequestHandler):
         made_tool_call = False
         tool_text = ""
         tool_calls = []
-        text = ""
+        # The assistant prefix was already committed to the prompt; echo it
+        # back so `content` shows the complete assistant turn (streaming
+        # emits it with the first chunk, non-streaming in the message).
+        text = request.assistant_prefix or ""
         tokens = []
         token_logprobs = []
         top_tokens = []
@@ -1745,6 +2826,30 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         body = self.body
         assert "messages" in body, "Request did not contain messages"
+        if not self._valid_messages(body["messages"]):
+            raise ValueError(
+                "'messages' must be a non-empty list of objects, "
+                "each with a string 'role'"
+            )
+
+        assistant_prefix = body.get("assistant_prefix")
+        if assistant_prefix is not None:
+            if not isinstance(assistant_prefix, str):
+                raise ValueError("'assistant_prefix' must be a string")
+            # Cheap early 400 when the tokenizer is already loaded; the
+            # same bound is re-checked in _tokenize regardless.
+            tokenizer = getattr(
+                self.response_generator.model_provider, "tokenizer", None
+            )
+            if tokenizer is not None:
+                n_prefix = len(
+                    tokenizer.encode(assistant_prefix, add_special_tokens=False)
+                )
+                if n_prefix > _ASSISTANT_PREFIX_MAX_TOKENS:
+                    raise ValueError(
+                        f"'assistant_prefix' encodes to {n_prefix} tokens; "
+                        f"the maximum is {_ASSISTANT_PREFIX_MAX_TOKENS}"
+                    )
 
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -1756,6 +2861,7 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+            assistant_prefix=assistant_prefix,
         )
 
     def handle_score_request(self) -> CompletionRequest:
@@ -1764,6 +2870,10 @@ class APIHandler(BaseHTTPRequestHandler):
         continuations whose conditional logprobs are compared host-side.
         """
         body = self.body
+        if body.get("assistant_prefix") is not None:
+            raise ValueError(
+                "'assistant_prefix' is only supported on /v1/chat/completions"
+            )
         candidates = body.get("candidates")
         if (
             not isinstance(candidates, list)
@@ -1773,6 +2883,19 @@ class APIHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError(
                 "score requests need a non-empty 'candidates' list of strings (max 256)"
+            )
+        # A score with no state to score against is a client error, not a
+        # generation job — fail fast instead of prefilling an empty prompt.
+        if "prompt" in body and not isinstance(body["prompt"], str):
+            raise ValueError("'prompt' must be a string")
+        if "messages" in body and not self._valid_messages(body["messages"]):
+            raise ValueError(
+                "'messages' must be a non-empty list of objects, "
+                "each with a string 'role'"
+            )
+        if not body.get("prompt") and not body.get("messages"):
+            raise ValueError(
+                "score requests need a non-empty 'prompt' or 'messages' state"
             )
         self.request_id = f"score-{uuid.uuid4()}"
         self.object_type = "score.result"
@@ -1784,8 +2907,68 @@ class APIHandler(BaseHTTPRequestHandler):
             body.get("role_mapping"),
             body.get("prompt_suffix"),
             candidates,
+            bool(body.get("commit")),
         )
         return request
+
+    def handle_decide_request(self) -> CompletionRequest:
+        """Build a kev-style packed decision request: a `state` plus a set
+        of typed `questions` answered by teacher-forced option-label
+        scoring on forks of the prefilled state cache."""
+        body = self.body
+        if body.get("assistant_prefix") is not None:
+            raise ValueError(
+                "'assistant_prefix' is only supported on /v1/chat/completions"
+            )
+        questions = body.get("questions")
+        if not isinstance(questions, dict) or not questions:
+            raise ValueError(
+                "decide requests need a non-empty 'questions' object"
+            )
+        if len(questions) > _DECIDE_MAX_QUESTIONS:
+            raise ValueError(
+                f"decide requests support at most {_DECIDE_MAX_QUESTIONS} "
+                "questions"
+            )
+        normalized = {}
+        for qid, spec in questions.items():
+            normalized[str(qid)] = _parse_decide_question(qid, spec)
+
+        state = body.get("state", "")
+        if not isinstance(state, (str, dict, list)):
+            raise ValueError("'state' must be a string, object, or array")
+        if "prompt" in body and not isinstance(body["prompt"], str):
+            raise ValueError("'prompt' must be a string")
+        if "messages" in body and not self._valid_messages(body["messages"]):
+            raise ValueError(
+                "'messages' must be a non-empty list of objects, "
+                "each with a string 'role'"
+            )
+
+        commit = bool(body.get("commit"))
+        commit_question = body.get("commitQuestion", body.get("commit_question"))
+        if commit_question is not None:
+            commit_question = str(commit_question)
+            if commit_question not in normalized:
+                raise ValueError("'commitQuestion' must name a question")
+            commit = True
+        elif commit:
+            raise ValueError("'commit' requires a 'commitQuestion'")
+
+        self.request_id = f"decide-{uuid.uuid4()}"
+        self.object_type = "decide.result"
+        return CompletionRequest(
+            "chat" if "messages" in body else "text",
+            body.get("prompt", ""),
+            body.get("messages") or [],
+            None,
+            body.get("role_mapping"),
+            prompt_suffix=body.get("prompt_suffix"),
+            state=state,
+            questions=normalized,
+            commit=commit,
+            commit_question=commit_question,
+        )
 
     def handle_score(self, request: CompletionRequest, stop_words: List[str]):
         """Run candidate scoring and return the result as a single JSON body."""
@@ -1854,7 +3037,14 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
+        if self.body.get("assistant_prefix") is not None:
+            raise ValueError(
+                "'assistant_prefix' is only supported on /v1/chat/completions; "
+                "raw 'prompt' requests cannot take an assistant prefix"
+            )
         assert "prompt" in self.body, "Request did not contain a prompt"
+        if not isinstance(self.body["prompt"], str):
+            raise ValueError("'prompt' must be a string")
         return CompletionRequest(
             "text",
             self.body["prompt"],
@@ -1974,8 +3164,58 @@ def _run_http_server(
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
+        # Save BEFORE touching teardown: worker-thread finalization during
+        # httpd.shutdown()/join can trip the PyThreadState_Get crash class
+        # (same as lora.py), and the file must exist before any of that runs.
+        # The save rides the request queue so it executes on the generation
+        # thread — the KV arrays' Metal stream only exists there.
+        response_generator.save_prompt_cache_file_async()
         httpd.shutdown()
-        response_generator.stop_and_join()
+        # Signal the generation thread and STOP — do not join. Any blocking
+        # join here reliably trips PyThreadState_Get as Metal/MLX worker
+        # threads lose their thread state during teardown (the lora.py crash
+        # class). os._exit below reaps everything anyway.
+        response_generator._stop = True
+        # Skip interpreter finalization entirely — Metal/MLX worker threads
+        # calling into Python during teardown is what crashes shutdown.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+
+class _NullPromptCache:
+    """Drop-in replacement for LRUPromptCache that stores nothing.
+
+    HEMLOCK_NO_PREFIX_CACHE=1 selects this so every request cold-prefills —
+    a debug/bisect switch for prefix-cache behavior.
+    """
+
+    def __len__(self):
+        return 0
+
+    @property
+    def nbytes(self):
+        return 0
+
+    def fetch_nearest_cache(self, model, tokens):
+        return None, tokens
+
+    def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        del prompt_cache
+
+    def mru_entry(self):
+        return None
+
+    def recent_entries(self, n):
+        return []
+
+    def trim_to(self, **kwargs):
+        pass
+
+    def stats_by_type(self):
+        return {}
 
 
 def run(
@@ -1986,9 +3226,32 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    if os.environ.get("HEMLOCK_NO_PREFIX_CACHE"):
+        logging.info(
+            "HEMLOCK_NO_PREFIX_CACHE set: prompt prefix cache disabled, "
+            "every request cold-prefills."
+        )
+        prompt_cache = _NullPromptCache()
+    else:
+        prompt_cache = LRUPromptCache(
+            model_provider.cli_args.prompt_cache_size,
+            model_provider.cli_args.prompt_cache_bytes or (1 << 63),
+        )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
+    response_generator.load_prompt_cache_file()
     if group.rank() == 0:
+        # SIGTERM normally kills the process outright; turn it into the
+        # KeyboardInterrupt path so the prompt cache is persisted on the
+        # way out. SIGINT already raises KeyboardInterrupt.
+        if (
+            threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        ):
+
+            def _sigterm(signum, frame):
+                raise KeyboardInterrupt()
+
+            signal.signal(signal.SIGTERM, _sigterm)
         _run_http_server(host, port, response_generator)
     else:
         response_generator.join()
@@ -2139,11 +3402,12 @@ def main():
         "--kv-bits",
         type=int,
         default=None,
-        help="Number of bits for KV cache quantization (default: no quantization). 4-bit saves ~75% KV memory.",
+        help="Number of bits for KV cache quantization, 2-8 (default: no quantization). 4-bit saves ~75% KV memory.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
+        choices=(32, 64, 128),
         default=64,
         help="Group size for KV cache quantization (default: 64)",
     )
@@ -2152,6 +3416,14 @@ def main():
         type=int,
         default=5000,
         help="Step at which to start quantizing the KV cache (default: 5000)",
+    )
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="Reject requests whose prompt exceeds this many tokens with a "
+        "4xx instead of attempting prefill (default: the model's "
+        "max_position_embeddings when known, else unbounded)",
     )
     parser.add_argument(
         "--prompt-cache-size",
@@ -2163,6 +3435,17 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-file",
+        type=str,
+        default=None,
+        help=(
+            "Persist the hottest prompt-cache entry to this safetensors file "
+            "on shutdown and every 32nd prefill, and warm the cache from it "
+            "on startup when it was saved for the same model+adapter. "
+            "HEMLOCK_NO_CACHE_FILE=1 disables."
+        ),
     )
     parser.add_argument(
         "--pipeline",
@@ -2177,6 +3460,20 @@ def main():
         "decode, approximate token stream. Omit to follow the checkpoint config.",
     )
     args = parser.parse_args()
+    if args.kv_bits is not None and not 2 <= args.kv_bits <= 8:
+        parser.error("--kv-bits must be between 2 and 8")
+    if args.quantized_kv_start < 0:
+        parser.error("--quantized-kv-start must be >= 0")
+    if args.max_prompt_tokens is not None and args.max_prompt_tokens <= 0:
+        parser.error("--max-prompt-tokens must be > 0")
+    if args.prefill_step_size <= 0:
+        parser.error("--prefill-step-size must be > 0")
+    if args.prompt_concurrency <= 0 or args.decode_concurrency <= 0:
+        parser.error("--prompt-concurrency and --decode-concurrency must be > 0")
+    if args.prompt_cache_bytes is not None and args.prompt_cache_bytes < 0:
+        parser.error("--prompt-cache-bytes must be >= 0")
+    if args.prompt_cache_size < 0:
+        parser.error("--prompt-cache-size must be >= 0")
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)

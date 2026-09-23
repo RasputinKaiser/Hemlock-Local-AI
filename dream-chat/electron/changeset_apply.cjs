@@ -1,15 +1,15 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const { readJsonFile, writeFileAtomic } = require("./durable_io.cjs");
 const { CHANGE_SET_SCHEMA, fileDigest, relativePath } = require("./coding_workspace.cjs");
 const { sourceDigest } = require("./artifact_registry.cjs");
 
 const APPLY_SCHEMA = "hemlock.agent.change-set.apply.v1";
 
 function atomicWrite(filePath, content) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, content, "utf8");
-  fs.renameSync(temporary, filePath);
+  // Temp + fsync + rename (durable_io): applied sources and apply receipts
+  // are never observed half-written after a crash.
+  writeFileAtomic(filePath, content);
 }
 
 // Honest bounded diff metric: trim the shared prefix/suffix lines, count what
@@ -81,7 +81,10 @@ class ChangeSetApplier {
   }
 
   readJson(filePath) {
-    try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { return null; }
+    // Corrupt manifests are quarantined (never deleted) so a broken change
+    // set reports "not found" honestly instead of silently pretending the
+    // evidence never existed.
+    return readJsonFile(filePath, null, { label: "changeset-manifest" });
   }
 
   // Staleness: the change set's own digest must match its staged source, and

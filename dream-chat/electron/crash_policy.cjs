@@ -26,6 +26,16 @@ function recordCrash(timestamps, now, { windowMs = DEFAULT_WINDOW_MS } = {}) {
   return [...kept, now];
 }
 
+// Load-time sanitize for a persisted crash history (maple-runtime.json):
+// keep only valid timestamps inside the current window — anything else is
+// dead weight from a previous session.
+function sanitizeCrashHistory(timestamps, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS } = {}) {
+  const currentTime = isValidTimestamp(now) ? now : Date.now();
+  const cutoff = currentTime - windowMs;
+  return (Array.isArray(timestamps) ? timestamps : [])
+    .filter((t) => isValidTimestamp(t) && t >= cutoff);
+}
+
 function shouldRespawn({
   crashTimestamps,
   now,
@@ -51,5 +61,6 @@ module.exports = {
   DEFAULT_MAX_CRASHES,
   DEFAULT_WINDOW_MS,
   recordCrash,
+  sanitizeCrashHistory,
   shouldRespawn,
 };

@@ -23,3 +23,28 @@ export function groupEvidence(receipts) {
     })
     .sort((a, b) => timestampOf(b.latest) - timestampOf(a.latest));
 }
+
+// Which window can show the underlying evidence for an event or receipt?
+// Receipts deep-links out only when the match is unambiguous — an unmatched
+// ref returns null and the row stays in Receipts, which is itself evidence.
+export const RECEIPT_TARGET_LABELS = {
+  grove: "Grove",
+  dream: "Dream Lab",
+  sips: "SIPS Control",
+  activity: "Activity",
+  memory: "Memory Garden",
+  artifact: "Artifact Studio",
+};
+
+export function receiptTargetWindow(input) {
+  const { type = "", refs = [] } = input || {};
+  const haystack = `${type} ${(Array.isArray(refs) ? refs : [refs]).join(" ")}`.toLowerCase();
+  if (!haystack.trim()) return null;
+  if (/experiment|world\.|world_|grove|physics/.test(haystack)) return "grove";
+  if (/dream|adapter|training|graft|checkpoint/.test(haystack)) return "dream";
+  if (/sips|selfloop|self-loop/.test(haystack)) return "sips";
+  if (/shell|exec|console|command/.test(haystack)) return "activity";
+  if (/memory|lesson|recall/.test(haystack)) return "memory";
+  if (/artifact|preview|change[-_]?set/.test(haystack)) return "artifact";
+  return null;
+}

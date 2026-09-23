@@ -1,0 +1,46 @@
+{
+  "label": "speed-baseline",
+  "rev": "8a5b0c8 (dirty tree: 149 pre-existing modifications)",
+  "server": "maple-2bit-mlx :8081 --flash-head --temp 0.7 --top-p 0.95 --top-k 20 prefill-step 1024 conc 1/1 (checkpoint maple.py)",
+  "note": "clean re-baseline; first pass was polluted by concurrent local mlx profiling processes (decode read ~30 t/s, prefill ~183 t/s)",
+  "probes": {
+    "decode": {
+      "mode": "decode",
+      "ttft_ms": 202.50670798122883,
+      "decode_tps": 66.9823186475278,
+      "completion_tokens": 128,
+      "prompt_tokens": 25,
+      "cached_tokens": 24,
+      "context_tokens": 0,
+      "last_text": "\n\nHere are the first six prime numbers, each with a brief explanation of why it is prime:\n\n1. **2** \u2013 The only even prime number, and it has no positive divisors other than 1 and itself.  \n2. **3** \u2013 It is not divisible by 2, so it is prime.  \n3. **5** \u2013",
+      "reps": 5,
+      "warmup": 1,
+      "url": "http://127.0.0.1:8081",
+      "model": null,
+      "ts": "2026-09-21T14:54:27"
+    },
+    "prefill": {
+      "mode": "prefill",
+      "ttft_ms": 6924.981500022113,
+      "prefill_tps": 457.0409321656517,
+      "prompt_tokens": 3165,
+      "cached_tokens": 0,
+      "reps": 3,
+      "url": "http://127.0.0.1:8081",
+      "model": null,
+      "ts": "2026-09-21T14:54:54"
+    },
+    "score": {
+      "mode": "score",
+      "total_ms": 921.3034159038216,
+      "per_candidate_ms": 115.1629269879777,
+      "prompt_tokens": 40,
+      "cached_tokens": 38,
+      "candidates": 8,
+      "reps": 3,
+      "url": "http://127.0.0.1:8081",
+      "model": null,
+      "ts": "2026-09-21T14:54:57"
+    }
+  }
+}

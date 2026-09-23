@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { groupEvidence } from "./evidenceLedger.js";
+import { groupEvidence, receiptTargetWindow } from "./evidenceLedger.js";
 
 test("groups receipts by type prefix, newest item first, with counts", () => {
   const receipts = [
@@ -32,4 +32,19 @@ test("tolerates empty and malformed input", () => {
   assert.deepEqual(groupEvidence([]), []);
   assert.deepEqual(groupEvidence(null), []);
   assert.deepEqual(groupEvidence([null, undefined]), []);
+});
+
+test("receiptTargetWindow deep-links to the window that owns the evidence", () => {
+  assert.equal(receiptTargetWindow({ type: "experiment.completed", refs: ["/tmp/experiment-dataset.jsonl"] }), "grove");
+  assert.equal(receiptTargetWindow({ type: "dream.completed", refs: ["/tmp/dream-run/receipt.json"] }), "dream");
+  assert.equal(receiptTargetWindow({ type: "sips.cycle.completed", refs: ["/tmp/sips/cycle/receipt.json"] }), "sips");
+  assert.equal(receiptTargetWindow({ type: "shell.exec.completed", refs: ["/tmp/exec.json"] }), "activity");
+  assert.equal(receiptTargetWindow({ type: "memory.promoted", refs: [] }), "memory");
+  assert.equal(receiptTargetWindow({ type: "artifact.revision.created", refs: ["/tmp/artifacts/a"] }), "artifact");
+});
+
+test("receiptTargetWindow returns null when nothing matches unambiguously", () => {
+  assert.equal(receiptTargetWindow({ type: "session.started", refs: [] }), null);
+  assert.equal(receiptTargetWindow({}), null);
+  assert.equal(receiptTargetWindow(null), null);
 });

@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("mapleDesktop", {
   confirmDialog: (options = {}) => ipcRenderer.invoke("dialog:confirm", options),
   notify: ({ title, body } = {}) => ipcRenderer.invoke("notification:show", { title, body }),
   windowsList: () => ipcRenderer.invoke("windows:list"),
+  reportRendererError: (payload = {}) => ipcRenderer.invoke("hemlock:renderer-error", payload),
   providers: {
     status: () => ipcRenderer.invoke("providers:status"),
     login: (provider) => ipcRenderer.invoke("providers:login", provider),
@@ -169,6 +170,7 @@ contextBridge.exposeInMainWorld("hemlockAgent", {
   confirmDialog: (options = {}) => ipcRenderer.invoke("dialog:confirm", options),
   notify: ({ title, body } = {}) => ipcRenderer.invoke("notification:show", { title, body }),
   windowsList: () => ipcRenderer.invoke("windows:list"),
+  reportRendererError: (payload = {}) => ipcRenderer.invoke("hemlock:renderer-error", payload),
   providers: {
     status: () => ipcRenderer.invoke("providers:status"),
     login: (provider) => ipcRenderer.invoke("providers:login", provider),

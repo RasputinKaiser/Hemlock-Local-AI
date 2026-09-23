@@ -1,0 +1,12 @@
+{
+  "mode": "score",
+  "total_ms": 1009.1129170000386,
+  "per_candidate_ms": 126.13911462500482,
+  "prompt_tokens": 40,
+  "cached_tokens": 38,
+  "candidates": 8,
+  "reps": 3,
+  "url": "http://127.0.0.1:8081",
+  "model": null,
+  "ts": "2026-09-22T00:27:10"
+}

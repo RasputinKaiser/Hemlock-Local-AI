@@ -1,0 +1,79 @@
+/* Chat window styles — owned by ChatWindow.jsx; rules migrate from styles.css in follow-up work. */
+
+/* Transcript floor: at least ~160px of reading height. The grid template gains
+   a named [search] row and the transcript minimum relaxes 180px → 160px; when
+   the window is shorter than the floor plus fixed chrome, ChatWindow marks the
+   surface .is-floor-squeezed and the optional rails yield (auto-collapse). */
+.chat-surface { grid-template-rows: [thread] auto [search] auto [error] auto [suggestions] auto [activity] auto [compare] auto [transcript] minmax(160px, 1fr) [question] auto [plan] auto [composer] auto [inspector] auto [status] auto; }
+.chat-surface > .chat-scroll { min-height: 160px; }
+.chat-surface.is-floor-squeezed .chat-help-disclosure,
+.chat-surface.is-floor-squeezed .composer-details { display: none; }
+
+/* Transcript filter bar — host chrome, DM Mono, never styled as model output. */
+.chat-surface > .chat-search-bar { grid-column: 1 / -1; grid-row: search; }
+.chat-search-bar { display: flex; align-items: center; gap: 8px; margin: 0; padding: 6px var(--chat-gutter); border-bottom: 1px solid var(--paper-line); background: var(--surface-soft); color: var(--muted-ink); font: 10px/1.4 "DM Mono", monospace; }
+.chat-search-bar > svg { flex: 0 0 auto; color: #466b54; }
+.chat-search-bar input { flex: 1 1 auto; min-width: 0; min-height: 26px; padding: 2px 8px; border: 1px solid var(--surface-border); border-radius: 7px; background: var(--paper); color: var(--ink); font: 12px/1.4 "DM Sans", sans-serif; }
+.chat-search-kinds { display: inline-flex; gap: 2px; flex: 0 0 auto; }
+.chat-search-kinds button { min-height: 24px; padding: 0 8px; border: 1px solid var(--surface-border); border-radius: 999px; background: transparent; color: var(--muted-ink); font: 500 9px/1 "DM Mono", monospace; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.chat-search-kinds button.is-selected { border-color: #809775; background: rgba(128, 151, 117, .16); color: var(--ink); }
+.chat-search-count { flex: 0 0 auto; white-space: nowrap; }
+.chat-search-bar > button[aria-label="Close transcript filter"] { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; min-height: 26px; padding: 0; border: 0; background: transparent; color: var(--muted-ink); cursor: pointer; }
+.chat-search-bar > button[aria-label="Close transcript filter"]:hover { color: var(--ink); }
+
+mark.search-hit { padding: 0 1px; border-radius: 2px; background: rgba(223, 180, 95, .42); color: inherit; }
+
+/* First-unread divider: a dashed line with DM Mono chrome text, pinned at the
+   first message that arrived after the user scrolled away from the bottom. */
+.unread-divider { display: flex; align-items: center; gap: 10px; margin: 2px 0 18px; color: #7d6529; font: 500 9px/1 "DM Mono", monospace; letter-spacing: .08em; text-transform: uppercase; }
+.unread-divider::before, .unread-divider::after { content: ""; flex: 1 1 auto; border-top: 1px dashed #d9b85f; }
+
+/* Transcript windowing: rows above the mounted window collapse into this
+   dashed pill; each click extends the window upward by TRANSCRIPT_WINDOW. */
+.chat-show-earlier { display: block; margin: 0 auto 14px; padding: 6px 14px; border: 1px dashed #d9b85f; border-radius: 999px; background: transparent; color: #7d6529; font: 500 9px/1 "DM Mono", monospace; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
+.chat-show-earlier:hover { background: rgba(217, 184, 95, .14); color: var(--ink); }
+
+/* Raw-output toggle for assistant rows: the recorded channel payload verbatim
+   in a labeled pre — chrome, not model output styling. */
+.raw-output-view { margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--surface-border); border-radius: 8px; background: #f4f1e6; color: var(--muted-ink); font: 11px/1.5 "DM Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow-y: auto; }
+.understory .raw-output-view { background: #18211e; }
+
+/* Placeholder/repaired authoring evidence on host receipt rows. */
+.fallback-chip { padding: 1px 7px; border: 1px solid #d9b85f; border-radius: 999px; background: rgba(223, 180, 95, .16); color: #7d6529; font: 500 9px/1.6 "DM Mono", monospace; letter-spacing: .04em; white-space: nowrap; }
+.host-event-honesty { display: flex; align-items: flex-start; gap: 6px; margin: 2px 0 8px; color: #7d6529; font: 10px/1.5 "DM Mono", monospace; }
+.host-event-honesty > svg { flex: 0 0 auto; margin-top: 2px; }
+
+/* Blocked-task recovery: a primary action row pinned above the composer. The
+   composer grid shifts down one track so the row always renders first. */
+.chat-composer-area > .blocked-recovery { grid-column: 1 / -1; grid-row: 1; }
+.chat-composer-area > .interaction-mode-bar { grid-row: 2; }
+.chat-composer-area > .chat-compose { grid-row: 3; }
+.chat-composer-area > .compose-hint { grid-row: 4; }
+.chat-composer-area > .composer-details { grid-row: 4; }
+.chat-composer-area > .composer-details[open] { grid-column: 1 / -1; grid-row: 5; }
+.blocked-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 7px 10px; border: 1px solid #d9b85f; border-radius: 8px; background: rgba(223, 180, 95, .12); color: var(--ink); font-size: 11px; }
+.blocked-recovery > svg { flex: 0 0 auto; color: #7d6529; }
+.blocked-recovery-copy { flex: 1 1 auto; min-width: 160px; font: 10px/1.5 "DM Mono", monospace; color: var(--muted-ink); }
+.blocked-recovery-copy strong { color: var(--ink); }
+.blocked-recovery-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.blocked-recovery-actions button { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 0 10px; border: 1px solid var(--surface-border); border-radius: 7px; background: var(--surface); color: var(--ink); font: 500 10px/1 "DM Mono", monospace; cursor: pointer; }
+.blocked-recovery-actions button.primary-action { border-color: #466b54; background: #2e4e38; color: #f7f4eb; }
+.blocked-recovery-actions button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Prefix hint + slash-command notices ride the existing compose-hint row as
+   full-width chrome lines. */
+.compose-hint > .prefix-hint, .compose-hint > .slash-notice { flex: 1 1 100%; display: flex; align-items: baseline; gap: 6px; }
+.prefix-hint code { padding: 0 5px; border: 1px solid var(--surface-border); border-radius: 4px; background: var(--surface-soft); color: #466b54; font: 600 10px/1.5 "DM Mono", monospace; }
+.slash-notice.is-warn { color: #944b2f; }
+.slash-notice.is-info { color: var(--muted-ink); }
+
+/* Context-status chip in the status bar — links to Settings. */
+.context-stale-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border: 1px solid #d9b85f; border-radius: 999px; background: rgba(223, 180, 95, .14); color: #7d6529; font: 500 9px/1.6 "DM Mono", monospace; cursor: pointer; }
+.context-stale-chip:hover { background: rgba(223, 180, 95, .28); }
+
+/* Friendly error alert: the plain-language line plus a Details disclosure that
+   keeps the exact host message one click away (and copyable). */
+.runtime-alert .error-friendly-line { flex: 1 1 auto; }
+.runtime-alert .error-details { flex: 1 1 100%; font: 10px/1.4 "DM Mono", monospace; }
+.runtime-alert .error-details summary { cursor: pointer; color: #944b2f; }
+.runtime-alert .error-details pre { margin: 6px 0; padding: 8px 10px; border: 1px solid #ecc3ae; border-radius: 7px; background: rgba(255, 255, 255, .5); color: #7a3f26; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 140px; overflow-y: auto; }

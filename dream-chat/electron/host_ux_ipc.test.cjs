@@ -256,5 +256,79 @@ test("preload exposes confirmDialog, notify, and windowsList on both surfaces", 
     assert.equal((await surface.confirmDialog({ message: "hi" })).channel, "dialog:confirm");
     assert.deepEqual((await surface.notify({ title: "t", body: "b" })).args, [{ title: "t", body: "b" }]);
     assert.equal((await surface.windowsList()).channel, "windows:list");
+    assert.equal((await surface.reportRendererError({ component: "X", message: "m" })).channel, "hemlock:renderer-error");
   }
+});
+
+test("agent.self returns an honest task/budget/queue snapshot through the command path", async () => {
+  const command = ipcHandlers.get("agent:command");
+  const result = await command({}, { action: "agent.self" });
+  assert.equal(result.schema, "hemlock.agent.self.v1");
+  assert.equal(result.status, "ok");
+  assert.equal(typeof result.task.id, "string");
+  assert.ok(result.task.status && result.task.phase !== undefined);
+  for (const key of ["agentStepsUsed", "maxAgentSteps", "commandsUsed", "maxCommands"]) {
+    assert.equal(typeof result.budget[key], "number", `budget.${key} is a real number`);
+  }
+  assert.equal(typeof result.queue.pending, "number");
+  assert.ok(Array.isArray(result.pendingApprovals));
+  assert.equal(typeof result.server.processReady, "boolean");
+  assert.equal(typeof result.counts.artifacts, "number");
+  assert.equal(typeof result.counts.memories.promoted, "number");
+  assert.equal(typeof result.counts.memories.candidate, "number");
+  assert.equal(typeof result.counts.experimentFindings, "number");
+  assert.ok(Array.isArray(result.recentReceipts));
+});
+
+test("world.state reads durable world records without inventing them", async () => {
+  const command = ipcHandlers.get("agent:command");
+  const result = await command({}, { action: "world.state" });
+  assert.equal(result.schema, "hemlock.world.state.v1");
+  assert.equal(result.status, "read");
+  assert.equal(typeof result.landmarks.experimentReceipts, "number");
+  assert.equal(typeof result.landmarks.markers, "number");
+  assert.ok(Array.isArray(result.experiments));
+  assert.equal(typeof result.dataset.rows, "number");
+  assert.ok(Array.isArray(result.markers));
+  assert.equal(typeof result.ambience.dream, "number");
+});
+
+test("world.place persists a durable marker, validates input, and dedupes by label", async () => {
+  const command = ipcHandlers.get("agent:command");
+  await assert.rejects(() => command({}, { action: "world.place", kind: "tower", label: "Bad" }), /marker, monument, or sign/);
+  await assert.rejects(() => command({}, { action: "world.place", kind: "marker" }), /needs a label/);
+
+  const placed = await command({}, { action: "world.place", kind: "sign", label: "Test clearing", note: "first stone" });
+  assert.equal(placed.status, "placed");
+  assert.equal(placed.marker.kind, "sign");
+  assert.equal(placed.marker.label, "Test clearing");
+  assert.ok(placed.marker.id);
+  assert.ok(Number.isFinite(placed.marker.position.x) && Number.isFinite(placed.marker.position.z), "omitted position gets a seeded spot");
+  assert.equal(placed.marker.seededPosition, true);
+
+  const again = await command({}, { action: "world.place", kind: "sign", label: "Test clearing" });
+  assert.equal(again.status, "existing", "same label returns the standing marker");
+  assert.equal(again.marker.id, placed.marker.id);
+
+  const state = await command({}, { action: "world.state" });
+  assert.ok(state.markers.some((marker) => marker.id === placed.marker.id), "world.state reflects the durable store");
+});
+
+test("hemlock:renderer-error receipts a bounded crash report and dedupes repeats", async () => {
+  const handler = ipcHandlers.get("hemlock:renderer-error");
+  assert.equal(typeof handler, "function", "renderer error channel is registered");
+
+  const report = { component: "GroveSurface", message: "mesh exploded", stack: "x".repeat(9000), windowId: "grove" };
+  const first = await handler({}, report);
+  assert.equal(first.status, "recorded");
+  assert.ok(first.eventId);
+
+  const repeat = await handler({}, report);
+  assert.equal(repeat.status, "deduped", "identical report inside 60s does not multiply receipts");
+
+  const other = await handler({}, { component: "GroveSurface", message: "different crash", windowId: "grove" });
+  assert.equal(other.status, "recorded");
+
+  const malformed = await handler({}, { component: { weird: true }, message: null });
+  assert.ok(["recorded", "deduped"].includes(malformed.status), "malformed payloads never throw the host");
 });

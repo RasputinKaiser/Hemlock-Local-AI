@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { quarantineCorruptFile, writeFileAtomic, writeJsonAtomic } = require("./durable_io.cjs");
 
 const ARTIFACT_SCHEMA = "hemlock.agent.artifact.v1";
 const VALID_KINDS = new Set(["html", "javascript", "css", "svg", "image", "text", "ascii", "markdown", "json", "audio", "video", "binary"]);
@@ -65,6 +66,7 @@ class ArtifactRegistry {
     this.workspaceRoot = path.join(this.root, "workspaces", this.workspaceId, "tasks");
     this.onEvent = onEvent;
     this.changeSet = changeSet;
+    this._integrityNoted = new Set();
   }
 
   taskRoot(taskId) { return path.join(this.workspaceRoot, safeSegment(taskId, "task ID")); }
@@ -89,8 +91,33 @@ class ArtifactRegistry {
     }
     return artifacts.sort((a, b) => String(a.timestamps?.updatedAt).localeCompare(String(b.timestamps?.updatedAt)));
   }
-  readJson(filePath, fallback) { try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { return fallback; } }
-  writeJson(filePath, value) { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8"); }
+  // A manifest that exists but does not parse is quarantined (never deleted)
+  // and journaled once per file — the reader then sees "not found", which is
+  // honest: the artifact's manifest is gone either way.
+  readJson(filePath, fallback) {
+    let text;
+    try {
+      text = fs.readFileSync(filePath, "utf8");
+    } catch {
+      return fallback;
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      const quarantinePath = quarantineCorruptFile(filePath);
+      const key = `${filePath}|invalid-json`;
+      if (!this._integrityNoted.has(key)) {
+        this._integrityNoted.add(key);
+        this.emit("integrity.recovered", "degraded", { file: filePath, label: "artifact-manifest", reason: "invalid-json", error: String(error?.message || error).slice(0, 300), recovered: "defaults", quarantinePath }, [filePath]);
+      }
+      return fallback;
+    }
+  }
+  // Temp + fsync + rename: a crash mid-write must not leave a truncated
+  // manifest that read() then reports as "Artifact was not found".
+  writeJson(filePath, value) {
+    writeJsonAtomic(filePath, value);
+  }
   emit(type, status, payload, evidenceRefs = []) { this.onEvent(type, status, payload, evidenceRefs); }
 
   create(input = {}) {
@@ -150,17 +177,21 @@ class ArtifactRegistry {
   update(input = {}) {
     const artifact = this.read(input.taskId, input.artifactId);
     const source = input.source != null ? stableSource(input.source) : Array.isArray(input.patches) ? applyPatches(artifact.source, input.patches) : stableSource(artifact.source);
-    const revision = artifact.revision + 1;
+    // artifact.revision can lag the highest recorded revision after a
+    // restore() rewind; numbering from the max keeps revision ids monotonic
+    // and prevents a new revision from overwriting an existing rN directory.
+    const revision = Math.max(Number(artifact.revision) || 0, ...(artifact.revisions || []).map((item) => Number(item.revision) || 0)) + 1;
     const revisionId = `r${revision}`;
     const revisionRoot = path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", revisionId);
     for (const [relative, content] of Object.entries(source)) {
       const target = path.join(revisionRoot, relative);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, content, "utf8");
+      // Atomic like the manifest: a torn revision file under a committed
+      // manifest would serve truncated source while claiming a full revision.
+      writeFileAtomic(target, content);
     }
     const entrypoint = safeRelativePath(input.entrypoint || artifact.entrypoint);
     const record = { id: revisionId, revision, parent: artifact.revision ? `r${artifact.revision}` : null, digest: sourceDigest(source), createdAt: nowIso(), source, status: input.status || "drafting", entrypoint };
-    const next = { ...artifact, entrypoint, status: VALID_STATUSES.has(input.status) ? input.status : "drafting", revision, digest: record.digest, source, timestamps: { ...artifact.timestamps, updatedAt: record.createdAt }, revisions: [...artifact.revisions, record], evidence: [...artifact.evidence, ...(Array.isArray(input.evidence) ? input.evidence : [])].slice(-80) };
+    const next = { ...artifact, entrypoint, status: VALID_STATUSES.has(input.status) ? input.status : "drafting", revision, digest: record.digest, source, timestamps: { ...artifact.timestamps, updatedAt: record.createdAt }, revisions: [...(artifact.revisions || []), record], evidence: [...(artifact.evidence || []), ...(Array.isArray(input.evidence) ? input.evidence : [])].slice(-80) };
     this.writeJson(this.manifestPath(input.taskId, input.artifactId), next);
     this.emit("artifact.revision.created", "drafting", { artifact: next, revision: record }, [this.manifestPath(input.taskId, input.artifactId), path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", revisionId)]);
     return next;
@@ -169,9 +200,9 @@ class ArtifactRegistry {
   restore(input = {}) {
     const artifact = this.read(input.taskId, input.artifactId);
     const revision = Number(input.revision);
-    const record = artifact.revisions.find((item) => item.revision === revision);
+    const record = (artifact.revisions || []).find((item) => item.revision === revision);
     if (!record) throw new Error(`Artifact revision was not found: r${revision}`);
-    const next = { ...artifact, entrypoint: record.entrypoint || artifact.entrypoint, status: "ready", revision: record.revision, digest: record.digest, source: record.source, timestamps: { ...artifact.timestamps, updatedAt: nowIso() }, evidence: [...artifact.evidence, { type: "artifact.revision.restored", revision }].slice(-80) };
+    const next = { ...artifact, entrypoint: record.entrypoint || artifact.entrypoint, status: "ready", revision: record.revision, digest: record.digest, source: record.source, timestamps: { ...artifact.timestamps, updatedAt: nowIso() }, evidence: [...(artifact.evidence || []), { type: "artifact.revision.restored", revision }].slice(-80) };
     this.writeJson(this.manifestPath(input.taskId, input.artifactId), next);
     const evidenceRefs = [this.manifestPath(input.taskId, input.artifactId), path.join(this.artifactRoot(input.taskId, input.artifactId), "revisions", `r${revision}`)];
     this.emit("artifact.revision.restored", "passed", { artifact: next, revision }, evidenceRefs);
@@ -180,13 +211,13 @@ class ArtifactRegistry {
 
   inspect(input = {}) {
     const artifact = this.read(input.taskId, input.artifactId);
-    return { schema: "hemlock.agent.artifact.inspection.v1", status: "ready", artifact, source: artifact.source, revision: artifact.revisions.at(-1) || null, evidenceRefs: [this.manifestPath(input.taskId, input.artifactId)] };
+    return { schema: "hemlock.agent.artifact.inspection.v1", status: "ready", artifact, source: artifact.source, revision: (artifact.revisions || []).at(-1) || null, evidenceRefs: [this.manifestPath(input.taskId, input.artifactId)] };
   }
 
   compare(input = {}) {
     const artifact = this.read(input.taskId, input.artifactId);
-    const from = artifact.revisions.find((item) => item.revision === Number(input.from));
-    const to = artifact.revisions.find((item) => item.revision === Number(input.to)) || artifact.revisions.at(-1);
+    const from = (artifact.revisions || []).find((item) => item.revision === Number(input.from));
+    const to = (artifact.revisions || []).find((item) => item.revision === Number(input.to)) || (artifact.revisions || []).at(-1);
     if (!from || !to) throw new Error("Both artifact revisions are required for comparison.");
     const files = [...new Set([...Object.keys(from.source), ...Object.keys(to.source)])].sort().map((file) => ({ file, before: from.source[file] ?? null, after: to.source[file] ?? null }));
     return { schema: "hemlock.agent.artifact.compare.v1", status: "ready", artifactId: artifact.id, from: from.revision, to: to.revision, files, digest: digest(JSON.stringify(files)), evidenceRefs: [this.manifestPath(input.taskId, input.artifactId)] };

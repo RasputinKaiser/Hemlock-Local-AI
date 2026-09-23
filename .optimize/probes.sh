@@ -1,7 +1,4 @@
-build | 3 | cd dream-chat && npm run build
-agent-tests | 3 | cd dream-chat && npm run test:agent
-ui-tests | 3 | cd dream-chat && npm run test:ui
-syntax | 3 | node --check dream-chat/electron/main.cjs && node --check dream-chat/electron/preload.cjs && node --check dream-chat/electron/provider_adapters.cjs
-maple-health | 1 | zsh .optimize/maple_health_probe.sh
-maple-stream-dispatch | 3 | node .optimize/maple_stream_dispatch_probe.cjs
-artifact-autopilot | 3 | cd dream-chat && npm run test:e2e:artifact-autopilot
+# label | repetitions | command
+# Maple speed probes run against a dedicated server on 127.0.0.1:8081.
+maple-decode-tps | 3 | python3 dream-chat/scripts/maple_bench.py --url http://127.0.0.1:8081 --mode decode
+maple-prefill-ttft | 3 | python3 dream-chat/scripts/maple_bench.py --url http://127.0.0.1:8081 --mode prefill

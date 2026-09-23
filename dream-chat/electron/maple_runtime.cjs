@@ -1,8 +1,8 @@
 const MAPLE_LAUNCH_SCHEMA = "hemlock.maple.launch.v1";
 const { classifyInferenceError } = require("./error_taxonomy.cjs");
 
-const DEFAULT_CONVERSATION_MESSAGE_LIMIT = 16;
-const DEFAULT_CONVERSATION_CHAR_LIMIT = 24000;
+const DEFAULT_CONVERSATION_MESSAGE_LIMIT = 32;
+const DEFAULT_CONVERSATION_CHAR_LIMIT = 48000;
 
 function normalizeInferenceMessage(message) {
   const role = ["system", "user", "assistant"].includes(String(message?.role)) ? String(message.role) : null;

@@ -70,10 +70,15 @@ const BINDINGS = [
   { match: /^sips\./, effect: "sips" },
   { match: /^(action|command|operation)\./, effect: "work" },
   { match: /^(task|plan)\./, effect: "task" },
+  { match: /^world\./, effect: "world" },
 ];
 
 const HOT_MS = 90000; // how long an entity stays lit after its last real event
 const WIND_MS = 45000;
+const GATHER_MS = 40000; // how long residents stay gathered after a lab event
+const DREAM_GLOW_MS = 12 * 60 * 1000; // dream heat decays over ~12 minutes
+const ALERT_MS = 5 * 60 * 1000; // failures tint the sky briefly
+const BUSTLE_MS = 2 * 60 * 1000; // recent-event window for grove bustle
 
 function providerOf(event) {
   return String(event?.payload?.provider || event?.payload?.metadata?.provider || event?.provider || "maple").toLowerCase();
@@ -112,15 +117,26 @@ export function telemetryFor(events) {
 
 // Reduce the event spine into scene state. Pure and bounded: callers can render
 // this without a scene, and tests can assert exactly what the world believes.
-export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = {}) {
+export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now(), markers: persistedMarkers = [] } = {}) {
   const activity = new Map(roster.map((entry) => [entry.id, { level: 0, lastType: null, lastAt: null, pulses: [] }]));
   const blooms = [];
   const grafts = new Map();
   const replays = [];
+  // Persistent world markers: the durable marker store seeds the scene before
+  // the session spine replays, and fresh world.placed events update by id so a
+  // restated marker never duplicates its mesh.
+  const markersById = new Map();
+  for (const marker of persistedMarkers || []) {
+    if (marker?.id) markersById.set(marker.id, marker);
+  }
   let wind = 0;
   let windAt = null;
   let ember = null;
   let boundCount = 0;
+  let dreamHeat = 0;
+  let dreamAt = null;
+  let recentFailures = 0;
+  let recentBound = 0;
 
   for (const event of events || []) {
     const effect = effectOf(event);
@@ -129,6 +145,8 @@ export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = 
     const failed = event.status === "failed" || event.status === "blocked" || String(event.type).includes("failed") || String(event.type).includes("blocked");
     const entity = effect === "memory" ? null : entityFor(event, roster);
     boundCount += 1;
+    if (now - at < BUSTLE_MS) recentBound += 1;
+    if (failed && now - at < ALERT_MS) recentFailures += 1;
 
     if (effect === "infer" || effect === "work" || effect === "task") {
       if (!entity) continue;
@@ -145,6 +163,12 @@ export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = 
       slot.lastType = event.type;
       slot.lastAt = at;
       slot.level = Math.max(slot.level, now - at < HOT_MS ? 1 : 0.25);
+      // Dream heat drives the aurora — latest dream event wins, then cools.
+      if (dreamAt === null || at >= dreamAt) {
+        dreamAt = at;
+        const type = String(event.type);
+        dreamHeat = failed ? 0.15 : /started|running|progress|fus/i.test(type) ? 1 : 0.55;
+      }
       if (String(event.type).includes("detached")) {
         grafts.delete("maple");
       } else if (String(event.type).includes("adapter") || String(event.type).includes("completed") || String(event.type).includes("candidate") || String(event.type).includes("fused")) {
@@ -162,6 +186,14 @@ export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = 
       // experiment.started is Maple actively working — the scene walks the
       // figure to the bench on this pulse, not just the outcome flash.
       if (event.type === "experiment.started" && !failed) slot.pulses.push({ kind: "lab-work", at, type: event.type });
+      // A real lab event draws the rest of the grove in to watch. The gather
+      // pulse is bound to the recorded experiment, not invented for ambience.
+      if ((event.type === "experiment.started" || event.type === "experiment.completed") && !failed) {
+        for (const other of roster) {
+          if (other.id === "maple") continue;
+          activity.get(other.id)?.pulses.push({ kind: "gather", at, type: event.type });
+        }
+      }
       if (event.type === "experiment.completed" && !failed) {
         slot.pulses.push({ kind: "lab-flash", at, type: event.type });
         // The measured trail rides the event payload so the scene can replay
@@ -186,11 +218,30 @@ export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = 
     } else if (effect === "sips") {
       if (now - at < WIND_MS) wind = Math.min(1, wind + 0.34);
       windAt = at;
+    } else if (effect === "world") {
+      // world.placed is Maple's own world edit: it lights Maple briefly and
+      // writes a persistent marker into scene state. The marker record rides
+      // the event payload verbatim — the scene renders exactly what was placed.
+      const slot = activity.get("maple");
+      slot.lastType = event.type;
+      slot.lastAt = at;
+      slot.level = Math.max(slot.level, now - at < HOT_MS ? 0.6 : 0.2);
+      if (event.type === "world.placed" && !failed) {
+        const marker = event.payload?.marker;
+        if (marker?.id) markersById.set(marker.id, marker);
+        slot.pulses.push({ kind: "place", at, type: event.type });
+      }
+      if (failed) slot.pulses.push({ kind: "ember", at, type: event.type });
     }
     if (failed && effect !== "memory") ember = { at, type: event.type, entityId: entity?.id || null };
   }
 
-  for (const slot of activity.values()) slot.pulses = slot.pulses.slice(-6);
+  for (const slot of activity.values()) {
+    slot.pulses = slot.pulses.slice(-6);
+    // A resident counts as gathered only while the lab event is fresh — stale
+    // pulses from an old spine don't summon anyone.
+    slot.gathered = slot.pulses.some((pulse) => pulse.kind === "gather" && now - pulse.at < GATHER_MS);
+  }
 
   return {
     activity,
@@ -200,7 +251,14 @@ export function bindGrove(events, { roster = GROVE_ROSTER, now = Date.now() } = 
     ember,
     boundCount,
     experiments: replays.slice(-6),
+    markers: [...markersById.values()].slice(-48),
     telemetry: telemetryFor(events),
+    // Ambient sky state — still derived from the event spine, never the clock.
+    ambience: {
+      dream: dreamAt === null ? 0 : dreamHeat * Math.max(0, 1 - (now - dreamAt) / DREAM_GLOW_MS),
+      alert: Math.min(1, recentFailures / 2),
+      bustle: Math.min(1, recentBound / 8),
+    },
   };
 }
 
@@ -219,6 +277,7 @@ export function bindingRows(events, { roster = GROVE_ROSTER, now = Date.now() } 
       dtype: entry.dtype,
       activity: slot?.level || 0,
       lastEvent: last,
+      gathered: Boolean(slot?.gathered),
       graft: bound.grafts.get(entry.id) || null,
     };
   });

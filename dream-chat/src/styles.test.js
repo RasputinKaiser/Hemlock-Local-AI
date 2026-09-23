@@ -4,7 +4,12 @@ import test from "node:test";
 import postcss from "postcss";
 
 const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
-const mainSource = readFileSync(new URL("./main.jsx", import.meta.url), "utf8");
+// Window renderers now live in windows/*.jsx and take App state through a
+// ctx bag; strip the ctx. prefix so markup contracts stay file-agnostic.
+const mainSource = ["./main.jsx", "./windows/shared.jsx", "./windows/ChatWindow.jsx", "./windows/ArtifactStudio.jsx", "./windows/CommandCenter.jsx", "./windows/UtilityWindows.jsx"]
+  .map((file) => readFileSync(new URL(file, import.meta.url), "utf8"))
+  .join("\n")
+  .replaceAll("ctx.", "");
 const css = postcss.parse(styles);
 
 // Inspect declarations, not an obsolete matching substring anywhere in the
@@ -137,7 +142,7 @@ test("Chat keeps live model output visible and does not call stale evidence pass
 test("Hotfix: live stream renders below the transcript and the plan card owns its own grid slot", () => {
   // Reading-order invariant: streamed output follows sent messages, never precedes them.
   const streamAt = mainSource.indexOf('{liveStreams.length > 0 && <section className="chat-live-stream"');
-  const transcriptAt = mainSource.indexOf("{messages.map((message, messageIndex) =>");
+  const transcriptAt = mainSource.indexOf("{messages.slice(windowStart).map(");
   const jumpAt = mainSource.indexOf('className="chat-jump-latest"');
   assert.ok(streamAt > -1 && transcriptAt > -1 && jumpAt > -1);
   assert.ok(streamAt > transcriptAt && streamAt < jumpAt, "live stream must sit between messages.map and the jump-to-latest/thinking block");

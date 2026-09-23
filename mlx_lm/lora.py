@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import re
+import sys
 import types
 import warnings
 from pathlib import Path
@@ -389,6 +390,14 @@ def main():
         if args.get(k, None) is None:
             args[k] = v
     run(types.SimpleNamespace(**args))
+    # Metal compile workers and tokenizer threads can outlive main() and call
+    # back into a finalizing interpreter ("PyThreadState_Get ... GIL is
+    # released"), which turns a completed run into SIGABRT/exit 134 — Hemlock
+    # counted successful Dream trainings as failures because of it. All work
+    # is done once run() returns, so skip interpreter teardown entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

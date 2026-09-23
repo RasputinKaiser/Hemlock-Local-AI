@@ -12,7 +12,7 @@
 // candidates are unverified seeds. Assumption: a record with no status field at
 // all is not provably promoted, so it is excluded (conservative by design).
 
-const MAX_BLOCK_CHARS = 1200;
+const MAX_BLOCK_CHARS = 2400;
 
 function isPromotedRecord(record) {
   return Boolean(record) && typeof record === "object" && record.status === "active";

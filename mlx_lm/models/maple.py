@@ -17,7 +17,7 @@ from mlx_lm.models.base import (
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchLinear
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
 # SwiGLU clamp for the MoE experts only (the dense MapleMLP is unclamped);
 # part of the trained forward pass, not an optional guard.
@@ -127,11 +127,13 @@ _add_rms_kernels = {}
 
 
 def _add_rms_norm(h, r, w, eps):
+    # The kernel indexes its inputs flat; the (1, 1, D) decode activations are
+    # already contiguous, so no reshapes are needed on the inputs.
     kernel = _add_rms_kernels.get(eps)
     if kernel is None:
         kernel = _add_rms_kernels[eps] = _make_add_rms_norm_kernel(eps)
     return kernel(
-        inputs=[h.reshape(-1), r.reshape(-1), w],
+        inputs=[h, r, w],
         template=[("T_", h.dtype), ("DIM", h.shape[-1])],
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -295,6 +297,7 @@ class MapleAttention(nn.Module):
         self._rope_base = args.rope_theta
         self._qk_w = None
         self._inv_freq = None
+        self._eps_arr = None
         self._fused_qk = None  # None = unprobed, then True/False
 
         # Maple applies RoPE only on sliding-window layers; full-attention
@@ -310,7 +313,7 @@ class MapleAttention(nn.Module):
                 max_position_embeddings=args.max_position_embeddings,
             )
 
-    def _qk_fused(self, qk, offset):
+    def _qk_fused(self, qk, offset, pos_eps=None):
         """Both norms and both rope applications in one dispatch."""
         if self._qk_w is None:
             n_q = self.num_attention_heads
@@ -332,11 +335,26 @@ class MapleAttention(nn.Module):
                 )
             else:
                 self._inv_freq = mx.ones((1,), dtype=mx.float32)
-            mx.eval(self._qk_w, self._inv_freq)
+            self._eps_arr = mx.array([self._eps], dtype=mx.float32)
+            mx.eval(self._qk_w, self._inv_freq, self._eps_arr)
 
         # cache.offset is a Python int for a plain cache but an mx.array for
-        # the batched caches; coerce so the pos/eps pair is always uniform.
-        pos_eps = mx.array([float(offset), self._eps], dtype=mx.float32)
+        # the batched caches; float() on it would force a GPU sync every
+        # layer of every decode token, so feed the on-device value through
+        # when it is already an array. The decode loop passes a shared
+        # pos_eps since every layer's cache holds the same offset.
+        if pos_eps is None:
+            if isinstance(offset, mx.array):
+                pos_eps = mx.concatenate(
+                    [mx.reshape(offset, (-1,))[:1].astype(mx.float32), self._eps_arr]
+                )
+            else:
+                pos_eps = mx.array([float(offset), self._eps], dtype=mx.float32)
+        # `qk` may be the flat fused qkv row (the kernel reads only the first
+        # (n_q + n_kv) * head_dim elements); the output keeps the per-head
+        # layout the callers expect.
+        n_heads = self.num_attention_heads + self.num_key_value_heads
+        out_shape = (n_heads, self.head_dim)
         return _qk_norm_rope_kernel(
             inputs=[qk, self._qk_w, self._inv_freq, pos_eps],
             template=[
@@ -344,9 +362,9 @@ class MapleAttention(nn.Module):
                 ("HEAD_DIM", self.head_dim),
                 ("ROPE_DIM", self.rope.dims if self.use_rope else 0),
             ],
-            grid=(32, qk.shape[0], 1),
+            grid=(32, n_heads, 1),
             threadgroup=(32, 1, 1),
-            output_shapes=[qk.shape],
+            output_shapes=[out_shape],
             output_dtypes=[qk.dtype],
         )[0]
 
@@ -366,6 +384,7 @@ class MapleAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        pos_eps: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -375,18 +394,27 @@ class MapleAttention(nn.Module):
             n_q = self.num_attention_heads
             n_kv = self.num_key_value_heads
             qk_size = (n_q + n_kv) * self.head_dim
-            qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
+            flat = qkv.reshape(-1)
             if self._fused_qk is None:
                 # A nonzero position, so a broken rotation cannot pass.
                 self._fused_qk = _matches(
-                    lambda: (self._qk_fused(qk, 7),),
-                    lambda: (self._qk_reference(qk, 7),),
+                    lambda: (self._qk_fused(flat, 7),),
+                    lambda: (
+                        self._qk_reference(
+                            flat[:qk_size].reshape(n_q + n_kv, self.head_dim), 7
+                        ),
+                    ),
                 )
             offset = cache.offset if cache is not None else 0
-            out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
+            if self._fused_qk:
+                out = self._qk_fused(flat, offset, pos_eps)
+            else:
+                out = self._qk_reference(
+                    flat[:qk_size].reshape(n_q + n_kv, self.head_dim), offset
+                )
             queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
             keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-            values = qkv.reshape(-1)[qk_size:].reshape(1, n_kv, 1, self.head_dim)
+            values = flat[qk_size:].reshape(1, n_kv, 1, self.head_dim)
         else:
             q_size = self.num_attention_heads * self.head_dim
             kv_size = self.num_key_value_heads * self.head_dim
@@ -697,6 +725,177 @@ def aggregate_expert_outputs(expert_outputs, scores):
     )
 
 
+_MOE_DEQ_HEADER = """
+    inline float2 bf2(uint u) {
+        bfloat2 v = as_type<bfloat2>(u);
+        return float2((float)v.x, (float)v.y);
+    }
+"""
+
+
+def _make_moe_upgate_kernel():
+    """Decode MoE phase 1: dequant-GEMV for the fused up+gate projection
+    plus the clamped SwiGLU, one dispatch for all K selected experts.
+
+    mx.gather_qmm at M=1 is tile-shaped for GEMM (~18GB/s on M1). This is
+    a pure GEMV: one simdgroup per intermediate output, uint4 x loads
+    (bfloat2 unpack), and the affine dequant applied per lane-word —
+    (q*s + b)*x per element equals s*(q.x) + b*(1.x) over each lane's
+    own words, so no cross-lane or threadgroup sharing is needed.
+    fp32 accumulation.
+    """
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint tgid = threadgroup_position_in_grid.y;
+        uint sg = tid / 32u;
+        uint lane = tid % 32u;
+
+        constexpr uint D = DIM;          // hidden size
+        constexpr uint M = MDIM;         // expert intermediate size
+        constexpr uint WPR = D / 16u;    // packed words per weight row
+        constexpr uint WPL = WPR / 32u;  // packed words per lane
+        constexpr uint NG = D / GSIZE;   // quant groups per row
+        constexpr uint OPT = 16u;        // outputs per threadgroup
+
+        uint e_slot = tgid / (M / OPT);
+        uint blk = tgid % (M / OPT);
+        uint e = (uint)inds[e_slot];
+        const device uint4* x4 = (const device uint4*)x;
+
+        for (uint o = 0u; o < OPT / 8u; ++o) {
+            uint i = blk * OPT + o * 8u + sg;
+            ulong up_row = (ulong)e * (2u * M) + i;
+            const device uint* wu = w + up_row * WPR;
+            const device uint* wg = wu + (ulong)M * WPR;
+            ulong sbu = up_row * NG;
+            ulong sbg = sbu + (ulong)M * NG;
+            float cu = 0.0f, cg = 0.0f;
+            // lane covers WPL consecutive words starting at lane*WPL; the
+            // caller guarantees they sit inside one quant group.
+            uint g = (lane * WPL) / (GSIZE / 16u);
+            float s_u = (float)sc[sbu + g];
+            float b_u = (float)bi[sbu + g];
+            float s_g = (float)sc[sbg + g];
+            float b_g = (float)bi[sbg + g];
+            for (uint t = 0u; t < WPL; ++t) {
+                uint widx = lane * WPL + t;
+                uint4 xa = x4[widx * 2u];
+                uint4 xb = x4[widx * 2u + 1u];
+                float xv[16];
+                xv[0] = bf2(xa.x).x;  xv[1] = bf2(xa.x).y;
+                xv[2] = bf2(xa.y).x;  xv[3] = bf2(xa.y).y;
+                xv[4] = bf2(xa.z).x;  xv[5] = bf2(xa.z).y;
+                xv[6] = bf2(xa.w).x;  xv[7] = bf2(xa.w).y;
+                xv[8] = bf2(xb.x).x;  xv[9] = bf2(xb.x).y;
+                xv[10] = bf2(xb.y).x; xv[11] = bf2(xb.y).y;
+                xv[12] = bf2(xb.z).x; xv[13] = bf2(xb.z).y;
+                xv[14] = bf2(xb.w).x; xv[15] = bf2(xb.w).y;
+                float qu = 0.0f, qg = 0.0f, xs = 0.0f;
+                uint pu = wu[widx];
+                uint pg = wg[widx];
+                for (uint c = 0u; c < 16u; ++c) {
+                    xs += xv[c];
+                    qu += (float)(pu & 3u) * xv[c]; pu >>= 2u;
+                    qg += (float)(pg & 3u) * xv[c]; pg >>= 2u;
+                }
+                cu += s_u * qu + b_u * xs;
+                cg += s_g * qg + b_g * xs;
+            }
+            float accu = simd_sum(cu);
+            float accg = simd_sum(cg);
+            if (lane == 0u) {
+                float gv = metal::min(accg, 7.0f);
+                float uv = metal::clamp(accu, -7.0f, 7.0f);
+                float sig = 1.0f / (1.0f + metal::exp(-gv));
+                h[e_slot * M + i] = (T_)(gv * sig * uv);
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="maple_moe_upgate",
+        input_names=["x", "w", "sc", "bi", "inds"],
+        output_names=["h"],
+        source=source,
+        header=_MOE_DEQ_HEADER,
+    )
+
+
+def _make_moe_down_kernel():
+    """Decode MoE phase 2: dequant-GEMV for the down projection with the
+    router-score weighted sum over experts folded in — writes the finished
+    (D,) output directly, so the separate aggregate pass disappears.
+
+    One threadgroup covers ROWS output rows across all K experts: sg =
+    expert slot, each lane owns one packed word of the row and applies
+    that word's own group scale/bias (word-local affine — no shuffles),
+    per-row partials cross simdgroups via threadgroup memory.
+    """
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint tgid = threadgroup_position_in_grid.y;
+        uint sg = tid / 32u;   // expert slot (K == 8 simdgroups)
+        uint lane = tid % 32u;
+
+        constexpr uint K = KEXP;       // experts per token
+        constexpr uint D = DIM;        // hidden size (output rows)
+        constexpr uint M = MDIM;       // expert intermediate size
+        constexpr uint WPR = M / 16u;  // packed words per weight row
+        constexpr uint NG = M / GSIZE;
+        constexpr uint ROWS = 8u;      // output rows per threadgroup
+
+        uint j0 = tgid * ROWS;
+        uint e = (uint)inds[sg];
+        const device uint4* h4 = (const device uint4*)(h + sg * M);
+        threadgroup float pe[ROWS][K];
+        for (uint r = 0u; r < ROWS; ++r) {
+            uint j = j0 + r;
+            ulong row = (ulong)e * D + j;
+            ulong sb = row * NG;
+            float contrib = 0.0f;
+            for (uint widx = lane; widx < WPR; widx += 32u) {
+                uint p = w[row * WPR + widx];
+                uint4 ha = h4[widx * 2u];
+                uint4 hb = h4[widx * 2u + 1u];
+                float hv[16];
+                hv[0] = bf2(ha.x).x;  hv[1] = bf2(ha.x).y;
+                hv[2] = bf2(ha.y).x;  hv[3] = bf2(ha.y).y;
+                hv[4] = bf2(ha.z).x;  hv[5] = bf2(ha.z).y;
+                hv[6] = bf2(ha.w).x;  hv[7] = bf2(ha.w).y;
+                hv[8] = bf2(hb.x).x;  hv[9] = bf2(hb.x).y;
+                hv[10] = bf2(hb.y).x; hv[11] = bf2(hb.y).y;
+                hv[12] = bf2(hb.z).x; hv[13] = bf2(hb.z).y;
+                hv[14] = bf2(hb.w).x; hv[15] = bf2(hb.w).y;
+                float ql = 0.0f, hs = 0.0f;
+                for (uint c = 0u; c < 16u; ++c) {
+                    hs += hv[c];
+                    ql += (float)(p & 3u) * hv[c]; p >>= 2u;
+                }
+                uint g = widx / (GSIZE / 16u);
+                contrib += ql * (float)sc[sb + g] + hs * (float)bi[sb + g];
+            }
+            float acc = simd_sum(contrib);
+            if (lane == 0u) pe[r][sg] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < ROWS) {
+            float o = 0.0f;
+            for (uint kk = 0u; kk < K; ++kk) o += pe[tid][kk] * scores[kk];
+            out[j0 + tid] = (T_)o;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="maple_moe_down",
+        input_names=["h", "w", "sc", "bi", "inds", "scores"],
+        output_names=["out"],
+        source=source,
+        header=_MOE_DEQ_HEADER,
+    )
+
+
+_moe_upgate_kernel = _make_moe_upgate_kernel()
+_moe_down_kernel = _make_moe_down_kernel()
+
+
 class MapleSwitchGLU(nn.Module):
     """SwitchGLU with the up and gate projections fused into one gather
     matmul; sanitize() concatenates the checkpoint's split tensors."""
@@ -707,6 +906,87 @@ class MapleSwitchGLU(nn.Module):
             input_dims, 2 * hidden_dims, num_experts, bias=bias
         )
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+        self._fused_decode = None  # None = unprobed, then True/False
+
+    def _decode_kernels(self, x, indices, scores):
+        """Single-token expert pass in two dispatches: dequant-GEMV +
+        SwiGLU, then dequant-GEMV + score-weighted aggregate."""
+        ug, dn = self.up_gate_proj, self.down_proj
+        inds = indices.reshape(-1)
+        if inds.dtype != mx.int32:
+            inds = inds.astype(mx.int32)
+        scores = scores.reshape(-1)
+        if scores.dtype != mx.float32:
+            scores = scores.astype(mx.float32)
+        K = inds.size
+        D = ug.input_dims
+        M = dn.input_dims
+        gs = ug.group_size
+        xf = x.reshape(-1)
+        h = _moe_upgate_kernel(
+            inputs=[xf, ug.weight, ug.scales, ug.biases, inds],
+            template=[("T_", x.dtype), ("DIM", D), ("MDIM", M), ("GSIZE", gs)],
+            grid=(256, (K * M) // 16, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(K * M,)],
+            output_dtypes=[x.dtype],
+        )[0]
+        out = _moe_down_kernel(
+            inputs=[h, dn.weight, dn.scales, dn.biases, inds, scores],
+            template=[
+                ("T_", x.dtype),
+                ("KEXP", K),
+                ("DIM", D),
+                ("MDIM", M),
+                ("GSIZE", dn.group_size),
+            ],
+            grid=(256, D // 8, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(D,)],
+            output_dtypes=[x.dtype],
+        )[0]
+        return out.reshape(x.shape)
+
+    def _decode_reference(self, x, indices, scores):
+        y = aggregate_expert_outputs(self(x, indices), scores)
+        return y
+
+    def fused_decode(self, x, indices, scores):
+        """Whole single-token expert block (projections + aggregate)."""
+        ug, dn = self.up_gate_proj, self.down_proj
+        usable = (
+            isinstance(ug, QuantizedSwitchLinear)
+            and isinstance(dn, QuantizedSwitchLinear)
+            and "bias" not in ug
+            and "bias" not in dn
+            and ug.mode == "affine"
+            and dn.mode == "affine"
+            and indices.size == 8
+            and x.size == ug.input_dims
+            # bf16 activations only: the kernels unpack x/h via bfloat2.
+            and x.dtype == mx.bfloat16
+            # Kernel layout constraints: 32 lanes tile each row's packed
+            # words (WPL = WPR/32), and each lane's WPL-word slice must sit
+            # inside a single quant group (GPW % WPL == 0).
+            and ug.input_dims % 512 == 0
+            and dn.input_dims % 16 == 0
+            and ug.input_dims % 8 == 0
+            and ug.group_size % 16 == 0
+            and dn.group_size % 16 == 0
+            and ug.input_dims % ug.group_size == 0
+            and dn.input_dims % dn.group_size == 0
+            and (ug.group_size // 16) % (ug.input_dims // 512) == 0
+        )
+        if not usable:
+            return self._decode_reference(x, indices, scores)
+        if self._fused_decode is None:
+            self._fused_decode = _matches(
+                lambda: (self._decode_kernels(x, indices, scores),),
+                lambda: (self._decode_reference(x, indices, scores),),
+            )
+        if self._fused_decode:
+            return self._decode_kernels(x, indices, scores)
+        return self._decode_reference(x, indices, scores)
 
     def __call__(self, x, indices):
         x = mx.expand_dims(x, (-2, -3))
@@ -740,9 +1020,10 @@ class MapleSparseMoeBlock(nn.Module):
             args.num_experts,
             bias=args.use_bias,
         )
-
     def __call__(self, x):
         inds, scores = self.gate(x)
+        if x.size == x.shape[-1]:
+            return self.switch_mlp.fused_decode(x, inds, scores)
         y = self.switch_mlp(x, inds)
         return aggregate_expert_outputs(y, scores)
 
@@ -809,12 +1090,30 @@ class MapleModel(nn.Module):
         if self._zero is None:
             self._zero = mx.zeros(h.shape, h.dtype)
             mx.eval(self._zero)
+        # One shared (pos, eps) array per decode step: every layer's cache
+        # holds the same offset, so building it per layer was ~24 redundant
+        # dispatches per token.
+        offset = 0
+        for c in cache:
+            if c is not None:
+                offset = c.offset
+                break
+        eps = self.layers[0].self_attn._eps
+        if isinstance(offset, mx.array):
+            pos_eps = mx.concatenate(
+                [
+                    mx.reshape(offset, (-1,))[:1].astype(mx.float32),
+                    mx.array([eps], dtype=mx.float32),
+                ]
+            )
+        else:
+            pos_eps = mx.array([float(offset), eps], dtype=mx.float32)
         r = self._zero  # x + 0 is exact in bf16
         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
             mask = full_mask if layer_type == "full_attention" else swa_mask
             ln = layer.input_layernorm
             h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
-            r = layer.self_attn(hn, mask, c)
+            r = layer.self_attn(hn, mask, c, pos_eps=pos_eps)
             ln = layer.post_attention_layernorm
             h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
             r = layer.mlp(hn)

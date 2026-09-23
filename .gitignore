@@ -147,3 +147,9 @@ state.yaml-moved-backup-*
 adapters-*/
 dream-chat/node_modules/
 dream-chat/dist/
+
+# Generated artifacts / scratch
+.media/
+video-showcase/
+work/
+.hermes/
