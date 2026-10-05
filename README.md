@@ -10,6 +10,17 @@ Electron main owns command allowlisting, scoped paths, budgets, receipts, and
 kill controls. Maple supplies plans, action selection, and claims. Everything
 the agent does lands in a durable, inspectable projection — no hidden state.
 
+[Setup and troubleshooting](docs/getting-started.md) ·
+[Workspace controls](docs/gui-workspace.md) ·
+[Contributing](CONTRIBUTING.md)
+
+**Installation status:** this repository is a source checkout, including an
+Electron launcher and a fork of mlx-lm. `Hemlock.app` launches the adjacent
+checkout; it is not a self-contained installer. Live Maple inference, Metal
+kernels, and training need Apple Silicon verification. The upstream-derived
+GitHub test jobs currently skip this fork, so a green workflow does not
+establish those results.
+
 ## The agent loop
 
 An intent becomes a durable plan; Maple then proposes one structured JSON
@@ -94,22 +105,38 @@ plans.
 
 ## Run it
 
-Requires Apple Silicon and [uv](https://docs.astral.sh/uv/).
+Requires macOS on Apple Silicon, [uv](https://docs.astral.sh/uv/), and native
+arm64 Node.js with npm. The setup script creates a Python 3.12 virtual
+environment; the Electron frontend has a separate locked install.
 
 ```sh
 git clone https://github.com/RasputinKaiser/Hemlock-Local-AI.git
 cd Hemlock-Local-AI
-./setup.sh && source .venv/bin/activate
+./setup.sh
+source .venv/bin/activate
+# Ensure the model-download CLI is available in this environment:
+uv pip install huggingface_hub
 hf download deepgrove/maple-2bit-mlx --local-dir maple-2bit-mlx
+cd dream-chat
+npm ci
+npm run build
+cd ..
 ```
 
-Then double-click `Hemlock.app`, or:
+Keep `Hemlock.app` beside `dream-chat/` and `scripts/`, then double-click it,
+or run `./"Launch Hemlock.command"` from the repository root. The launcher
+uses the built UI and starts the local model server. It may terminate an
+existing `mlx_lm` listener on port 8080; stop any intentional server first.
+
+For frontend development with hot reload, run this from the repository root:
 
 ```sh
-cd dream-chat && npm install && npm run desktop
+./scripts/launch-hemlock.zsh --repo-root "$PWD" --dev
 ```
 
-CLI without the app:
+[Model/interpreter overrides, launch logs, and first-run checks](docs/getting-started.md).
+
+CLI without the app, from the repository root with `.venv` active:
 
 ```sh
 python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens -1 \
@@ -118,15 +145,33 @@ python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens 
 
 ## Verification
 
+From the repository root:
+
 ```sh
 cd dream-chat
 npm run test:agent      # host harness: orchestrator, queue, contracts, receipts,
                       # durable-io recovery, session restore, real-main soak
 npm run test:ui         # renderer projection tests
 npm run verify:agent    # all of the above + production build
-node scripts/gui-electron-smoke.mjs   # real-Electron end-to-end checks
-python -m pytest mlx_lm/tests/test_server.py   # inference server incl. kernels
 ```
+
+The optional real-Electron smoke requires Playwright in addition to the built
+UI; see [workspace verification](docs/gui-workspace.md#verification) for its
+setup and isolated data directory. It does not establish live-model behavior.
+
+Python inference tests are separate. From the repository root with `.venv`
+active:
+
+```sh
+uv pip install requests
+python -m unittest discover -s tests -p 'test_server.py'
+```
+
+This suite uses MLX and loads a Hugging Face test model, so it needs compatible
+hardware and model/network access. It is not the Maple kernel suite; see
+[`tests/test_maple_kernels.py`](tests/test_maple_kernels.py) for that separate
+check. List the actual commands and results in a PR, including any checks that
+were not run.
 
 Maple is a 20B-A1B ternary MoE — 24 layers, 256 experts, top-8, 512-token
 sliding window on 3 of 4 layers, 2-bit packed `{-α, 0, +α}` weights.
