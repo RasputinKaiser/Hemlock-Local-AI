@@ -25,7 +25,7 @@ establish those results.
 
 An intent becomes a durable plan; Maple then proposes one structured JSON
 action at a time — or a `{"actions":[...]}` batch envelope executed step by
-step. The host validates it against a registry of 116 allowlisted commands,
+step. The host validates it against the live allowlisted command registry,
 executes one bounded operation, records an observation with evidence
 references, and asks for the next step. Prose is never executed.
 
